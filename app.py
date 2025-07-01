@@ -88,8 +88,6 @@ with st.sidebar:
         "NZD_CHF", "NZD_JPY", "CAD_CHF", "CAD_JPY", "CHF_JPY"
     ])))
     
-    # --- CHANGEMENT ICI ---
-    # On sélectionne TOUTE la liste par défaut au lieu de juste quelques paires.
     symbols_to_scan = st.multiselect("Choisissez les actifs", 
                                      options=all_available_symbols, 
                                      default=all_available_symbols)
@@ -152,10 +150,12 @@ else:
         st.info("Analyse terminée !")
         if failed_symbols:
             st.warning(f"**Données non trouvées pour :** {', '.join(sorted(failed_symbols))}.")
+            
         for label in ['Daily', 'Weekly']:
             st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
             if results[label]:
                 df_res = pd.DataFrame(results[label]).sort_values(by='Actif').reset_index(drop=True)
-                st.dataframe(df_res, use_container_width=True, hide_index=True)
+                # --- CHANGEMENT ICI : On utilise st.table au lieu de st.dataframe ---
+                st.table(df_res)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
