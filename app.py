@@ -21,10 +21,14 @@ st.caption("Traduction en Python du script PineScript pour trouver les S/R basé
 @st.cache_data(ttl=900) # Mise en cache des données pour 15 minutes
 def get_fmp_data(api_key, symbol, timeframe='daily', limit=200):
     """Récupère les données historiques depuis l'API FMP."""
+    # FMP utilise des tickers légèrement différents pour le Forex/Crypto
+    # La plupart des API forex standardisent sans slash (par ex. EURUSD)
+    url_symbol = symbol.replace('/', '')
+
     if timeframe == 'weekly':
-        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?apikey={api_key}"
+        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{url_symbol}?apikey={api_key}"
     else: # daily
-        url = f"https://financialmodelingprep.com/api/v3/historical-chart/1day/{symbol}?apikey={api_key}"
+        url = f"https://financialmodelingprep.com/api/v3/historical-chart/1day/{url_symbol}?apikey={api_key}"
     
     try:
         response = requests.get(url)
@@ -34,8 +38,11 @@ def get_fmp_data(api_key, symbol, timeframe='daily', limit=200):
         # FMP a des formats de sortie différents
         if 'historical' in data:
             df = pd.DataFrame(data['historical'])
-        else:
+        elif data:
             df = pd.DataFrame(data)
+        else:
+            st.warning(f"Aucune donnée reçue pour {symbol}. Le symbole est-il correct pour FMP?")
+            return None
             
         df = df.iloc[::-1].reset_index(drop=True) # Inverser pour avoir les dates les plus anciennes en premier
         df['date'] = pd.to_datetime(df['date'])
@@ -44,7 +51,7 @@ def get_fmp_data(api_key, symbol, timeframe='daily', limit=200):
         # On va les re-échantillonner si nécessaire
         if timeframe == 'weekly' and 'open' in df.columns:
              df.set_index('date', inplace=True)
-             df_weekly = df.resample('W').agg({
+             df_weekly = df.resample('W-FRI').agg({ # On ré-échantillonne à la fin de la semaine de trading (Vendredi)
                  'open': 'first',
                  'high': 'max',
                  'low': 'min',
@@ -54,6 +61,9 @@ def get_fmp_data(api_key, symbol, timeframe='daily', limit=200):
              df = df_weekly.reset_index()
 
         return df.tail(limit) # Retourner le nombre de barres demandé
+    except requests.exceptions.HTTPError as http_err:
+        st.error(f"Erreur HTTP pour {symbol}: {http_err} - Vérifiez que le symbole '{url_symbol}' est correct et que votre clé API est valide.")
+        return None
     except Exception as e:
         st.error(f"Erreur lors de la récupération des données pour {symbol}: {e}")
         return None
@@ -86,11 +96,15 @@ def find_pivots(df, left_bars, right_bars):
 # Fonction pour récupérer le prix actuel
 @st.cache_data(ttl=60)
 def get_current_price(api_key, symbol):
+    url_symbol = symbol.replace('/', '')
     try:
-        url = f"https://financialmodelingprep.com/api/v3/quote-short/{symbol}?apikey={api_key}"
+        url = f"https://financialmodelingprep.com/api/v3/quote-short/{url_symbol}?apikey={api_key}"
         response = requests.get(url)
         response.raise_for_status()
-        return response.json()[0]['price']
+        data = response.json()
+        if data:
+            return data[0]['price']
+        return None
     except:
         return None
 
@@ -103,45 +117,75 @@ with st.sidebar:
         api_key = st.secrets["FMP_API_KEY"]
         st.success("Clé API FMP chargée.", icon="✅")
     except:
-        st.warning("Ajoutez votre clé API dans un fichier secrets.toml pour ne pas la copier/coller.")
         api_key = st.text_input("Entrez votre clé API FinancialModelingPrep", type="password")
+        if not api_key:
+            st.warning("Ajoutez votre clé API dans les secrets ou entrez-la ci-dessus.")
 
-    # Sélection des actifs
-    default_symbols = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
+    # --- NOUVELLE LISTE D'ACTIFS ---
+    # Sélection des actifs par défaut (les plus courants)
+    default_symbols = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"]
+
+    # Liste complète des actifs disponibles pour la sélection
+    all_available_symbols = [
+        # Or
+        "XAUUSD",
+        # Paires Majeures
+        "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
+        # Paires Croisées (Minors) - EUR
+        "EURGBP", "EURJPY", "EURAUD", "EURCAD", "EURCHF", "EURNZD",
+        # Paires Croisées (Minors) - GBP
+        "GBPJPY", "GBPAUD", "GBPCAD", "GBPCHF", "GBPNZD",
+        # Paires Croisées (Minors) - AUD
+        "AUDJPY", "AUDCAD", "AUDCHF", "AUDNZD",
+        # Paires Croisées (Minors) - CAD
+        "CADJPY", "CADCHF",
+        # Paires Croisées (Minors) - NZD
+        "NZDJPY", "NZDCAD", "NZDCHF",
+        # Paires Croisées (Minors) - CHF
+        "CHFJPY",
+        # Crypto
+        "BTCUSD", "ETHUSD"
+    ]
+    
+    st.subheader("Sélection des Actifs")
     symbols_to_scan = st.multiselect(
         "Choisissez les actifs à analyser",
-        options=default_symbols + ["BTCUSD", "ETHUSD"], # Ajoutez d'autres si besoin
+        options=sorted(all_available_symbols), # On trie la liste pour une meilleure navigation
         default=default_symbols
     )
 
-    st.subheader("Paramètres de Détection (PineScript)")
-    left_bars = st.slider("Left Bars", min_value=1, max_value=50, value=15, help="Nombre de barres à gauche d'un pivot.")
-    right_bars = st.slider("Right Bars", min_value=1, max_value=50, value=15, help="Nombre de barres à droite d'un pivot.")
+    st.subheader("Paramètres de Détection")
+    left_bars = st.slider("Left Bars (gauche)", min_value=1, max_value=50, value=15, help="Nombre de barres à gauche d'un pivot.")
+    right_bars = st.slider("Right Bars (droite)", min_value=1, max_value=50, value=15, help="Nombre de barres à droite d'un pivot.")
     
-    scan_button = st.button("Lancer l'Analyse", type="primary")
+    scan_button = st.button("Lancer l'Analyse", type="primary", use_container_width=True)
 
 # --- Logique Principale de l'Application ---
 if scan_button and api_key and symbols_to_scan:
     results = {'Daily': [], 'Weekly': []}
     
-    progress_bar = st.progress(0, text="Analyse en cours...")
+    total_steps = len(symbols_to_scan) * 2 # 2 timeframes par symbole
+    current_step = 0
+    progress_bar = st.progress(0, text="Initialisation de l'analyse...")
     
-    for i, symbol in enumerate(symbols_to_scan):
+    for symbol in symbols_to_scan:
         current_price = get_current_price(api_key, symbol)
         
         for timeframe, label in [('daily', 'Daily'), ('weekly', 'Weekly')]:
             # Mettre à jour la barre de progression
-            progress_text = f"Analyse en cours... ({i+1}/{len(symbols_to_scan)}) {symbol} - {label}"
-            progress_bar.progress((i / len(symbols_to_scan)), text=progress_text)
+            current_step += 1
+            progress_value = current_step / total_steps
+            progress_text = f"Analyse en cours... ({current_step}/{total_steps}) {symbol} - {label}"
+            progress_bar.progress(progress_value, text=progress_text)
             
             # Récupération et analyse
-            df = get_fmp_data(api_key, symbol, timeframe, limit=250) # On prend une période assez large
-            if df is not None:
+            df = get_fmp_data(api_key, symbol, timeframe, limit=300) # On prend une période assez large
+            if df is not None and not df.empty:
                 supports, resistances = find_pivots(df, left_bars, right_bars)
                 
                 # Extraire le dernier support et la dernière résistance trouvés
-                last_support = supports.iloc[-1] if not supports.empty else None
-                last_resistance = resistances.iloc[-1] if not resistances.empty else None
+                last_support = supports.iloc[-1] if supports is not None and not supports.empty else None
+                last_resistance = resistances.iloc[-1] if resistances is not None and not resistances.empty else None
                 
                 # Calculer la distance par rapport au prix actuel
                 dist_s = (abs(current_price - last_support['level']) / current_price) * 100 if last_support is not None and current_price else np.nan
@@ -150,11 +194,11 @@ if scan_button and api_key and symbols_to_scan:
                 # Ajouter aux résultats
                 results[label].append({
                     'Actif': symbol,
-                    'Prix Actuel': current_price,
-                    'Dernier Support': last_support['level'] if last_support is not None else 'N/A',
+                    'Prix Actuel': f"{current_price:.5f}" if current_price else 'N/A',
+                    'Dernier Support': f"{last_support['level']:.5f}" if last_support is not None else 'N/A',
                     'Date Support': last_support['date'].strftime('%Y-%m-%d') if last_support is not None else 'N/A',
                     'Dist. Support (%)': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A',
-                    'Dernière Résistance': last_resistance['level'] if last_resistance is not None else 'N/A',
+                    'Dernière Résistance': f"{last_resistance['level']:.5f}" if last_resistance is not None else 'N/A',
                     'Date Résistance': last_resistance['date'].strftime('%Y-%m-%d') if last_resistance is not None else 'N/A',
                     'Dist. Résistance (%)': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
                 })
@@ -165,14 +209,14 @@ if scan_button and api_key and symbols_to_scan:
     st.subheader("Analyse Journalière (Daily)")
     if results['Daily']:
         daily_df = pd.DataFrame(results['Daily'])
-        st.dataframe(daily_df, use_container_width=True)
+        st.dataframe(daily_df, use_container_width=True, hide_index=True)
     else:
         st.warning("Aucun résultat pour l'analyse journalière.")
         
     st.subheader("Analyse Hebdomadaire (Weekly)")
     if results['Weekly']:
         weekly_df = pd.DataFrame(results['Weekly'])
-        st.dataframe(weekly_df, use_container_width=True)
+        st.dataframe(weekly_df, use_container_width=True, hide_index=True)
     else:
         st.warning("Aucun résultat pour l'analyse hebdomadaire.")
 
