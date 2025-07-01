@@ -105,9 +105,8 @@ else:
     base_url, env_name = determine_oanda_environment(access_token, account_id)
     if not base_url:
         st.error("Impossible de valider vos identifiants OANDA. Vérifiez `secrets.toml`.")
-    # On ne fait rien jusqu'à ce que le bouton soit cliqué
     elif scan_button and symbols_to_scan:
-        st.info(f"Analyse en cours sur l'environnement OANDA : **{env_name}**")
+        # st.info(f"Analyse en cours sur l'environnement OANDA : **{env_name}**") # --- MESSAGE SUPPRIMÉ ---
         results = {'Daily': [], 'Weekly': []}
         failed_symbols = []
         progress_bar = st.progress(0, text="Initialisation...")
@@ -132,10 +131,8 @@ else:
                     dist_s = (abs(current_price - last_s['level']) / current_price) * 100 if last_s is not None and current_price else np.nan
                     dist_r = (abs(current_price - last_r['level']) / current_price) * 100 if last_r is not None and current_price else np.nan
                     
-                    # --- CHANGEMENT ICI : Noms de colonnes plus courts ---
                     results[label].append({
-                        'Actif': symbol.replace('_', '/'), 
-                        'Prix Actuel': f"{current_price:.5f}" if current_price else 'N/A',
+                        'Actif': symbol.replace('_', '/'), 'Prix Actuel': f"{current_price:.5f}" if current_price else 'N/A',
                         'Support': f"{last_s['level']:.5f}" if last_s is not None else 'N/A',
                         'Date (S)': last_s['date'].strftime('%Y-%m-%d') if last_s is not None else 'N/A',
                         'Dist. (S) %': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A',
@@ -154,9 +151,13 @@ else:
             st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
             if results[label]:
                 df_res = pd.DataFrame(results[label]).sort_values(by='Actif').reset_index(drop=True)
-                # --- CHANGEMENT ICI : On utilise st.dataframe avec les bonnes options ---
-                st.dataframe(df_res, use_container_width=True, hide_index=True)
+                
+                # --- CHANGEMENT ICI : On calcule la hauteur du tableau dynamiquement ---
+                # Hauteur = (nombre de lignes + 1 pour l'en-tête) * 35 pixels par ligne
+                table_height = (len(df_res) + 1) * 35
+                st.dataframe(df_res, use_container_width=True, hide_index=True, height=table_height)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
     else:
-        st.info("Configurez vos actifs dans la barre latérale et cliquez sur 'Lancer l'Analyse'.")
+        # Message par défaut avant de lancer l'analyse
+        st.info(f"Connecté à OANDA (**{env_name}**). Configurez vos actifs et cliquez sur 'Lancer l'Analyse'.")
