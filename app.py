@@ -7,7 +7,7 @@ import numpy as np
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
-    page_title="Détecteur S/R Forex & Or (OANDA)",
+    page_title="Détecteur S/R Forex & Or",
     page_icon="📈",
     layout="wide"
 )
@@ -105,12 +105,9 @@ else:
     base_url, env_name = determine_oanda_environment(access_token, account_id)
     if not base_url:
         st.error("Impossible de valider vos identifiants OANDA. Vérifiez `secrets.toml`.")
-    elif not scan_button:
-        st.success(f"Connecté à l'environnement OANDA : **{env_name}**. Prêt à lancer l'analyse.")
-        st.info("Configurez vos actifs et cliquez sur 'Lancer l'Analyse'.")
-
-    if scan_button and base_url and symbols_to_scan:
-        st.success(f"Analyse en cours sur l'environnement : **{env_name}**")
+    # On ne fait rien jusqu'à ce que le bouton soit cliqué
+    elif scan_button and symbols_to_scan:
+        st.info(f"Analyse en cours sur l'environnement OANDA : **{env_name}**")
         results = {'Daily': [], 'Weekly': []}
         failed_symbols = []
         progress_bar = st.progress(0, text="Initialisation...")
@@ -135,19 +132,21 @@ else:
                     dist_s = (abs(current_price - last_s['level']) / current_price) * 100 if last_s is not None and current_price else np.nan
                     dist_r = (abs(current_price - last_r['level']) / current_price) * 100 if last_r is not None and current_price else np.nan
                     
+                    # --- CHANGEMENT ICI : Noms de colonnes plus courts ---
                     results[label].append({
-                        'Actif': symbol.replace('_', '/'), 'Prix Actuel': f"{current_price:.5f}" if current_price else 'N/A',
-                        'Dernier Support': f"{last_s['level']:.5f}" if last_s is not None else 'N/A',
-                        'Date Support': last_s['date'].strftime('%Y-%m-%d') if last_s is not None else 'N/A',
-                        'Dist. Support (%)': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A',
-                        'Dernière Résistance': f"{last_r['level']:.5f}" if last_r is not None else 'N/A',
-                        'Date Résistance': last_r['date'].strftime('%Y-%m-%d') if last_r is not None else 'N/A',
-                        'Dist. Résistance (%)': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
+                        'Actif': symbol.replace('_', '/'), 
+                        'Prix Actuel': f"{current_price:.5f}" if current_price else 'N/A',
+                        'Support': f"{last_s['level']:.5f}" if last_s is not None else 'N/A',
+                        'Date (S)': last_s['date'].strftime('%Y-%m-%d') if last_s is not None else 'N/A',
+                        'Dist. (S) %': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A',
+                        'Résistance': f"{last_r['level']:.5f}" if last_r is not None else 'N/A',
+                        'Date (R)': last_r['date'].strftime('%Y-%m-%d') if last_r is not None else 'N/A',
+                        'Dist. (R) %': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
                     })
             if not data_fetched: failed_symbols.append(symbol.replace('_', '/'))
 
         progress_bar.empty()
-        st.info("Analyse terminée !")
+        st.success("Analyse terminée !")
         if failed_symbols:
             st.warning(f"**Données non trouvées pour :** {', '.join(sorted(failed_symbols))}.")
             
@@ -155,7 +154,9 @@ else:
             st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
             if results[label]:
                 df_res = pd.DataFrame(results[label]).sort_values(by='Actif').reset_index(drop=True)
-                # --- CHANGEMENT ICI : On utilise st.table au lieu de st.dataframe ---
-                st.table(df_res)
+                # --- CHANGEMENT ICI : On utilise st.dataframe avec les bonnes options ---
+                st.dataframe(df_res, use_container_width=True, hide_index=True)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
+    else:
+        st.info("Configurez vos actifs dans la barre latérale et cliquez sur 'Lancer l'Analyse'.")
