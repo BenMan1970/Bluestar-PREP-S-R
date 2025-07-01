@@ -35,7 +35,7 @@ def get_fmp_data(api_key, symbol, timeframe='daily', limit=200):
         elif data:
             df = pd.DataFrame(data)
         else:
-            return None # L'API a renvoyé une liste vide, signifie "symbole non trouvé"
+            return None 
             
         df = df.iloc[::-1].reset_index(drop=True)
         df['date'] = pd.to_datetime(df['date'])
@@ -48,11 +48,9 @@ def get_fmp_data(api_key, symbol, timeframe='daily', limit=200):
              df = df_weekly.reset_index()
 
         return df.tail(limit)
-    except requests.exceptions.HTTPError as http_err:
-        # Erreur HTTP, souvent liée à un mauvais symbole ou clé API
+    except requests.exceptions.HTTPError:
         return None
     except Exception as e:
-        # Autre erreur
         st.error(f"Erreur inattendue pour {symbol}: {e}")
         return None
 
@@ -93,20 +91,37 @@ with st.sidebar:
         if not api_key:
             st.warning("Ajoutez votre clé API dans les secrets ou entrez-la ci-dessus.")
 
+    # --- LISTE MAXIMALE D'ACTIFS ---
     default_symbols = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"]
+    
+    # On ajoute les paires exotiques les plus communes. Leur disponibilité dépendra fortement du plan API.
     all_available_symbols = [
-        "XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
-        "EURGBP", "EURJPY", "EURAUD", "EURCAD", "EURCHF", "EURNZD",
-        "GBPJPY", "GBPAUD", "GBPCAD", "GBPCHF", "GBPNZD",
-        "AUDJPY", "AUDCAD", "AUDCHF", "AUDNZD",
-        "CADJPY", "CADCHF", "NZDJPY", "NZDCAD", "NZDCHF", "CHFJPY",
-        "BTCUSD", "ETHUSD"
+        # Or & Crypto
+        "XAUUSD", "BTCUSD", "ETHUSD",
+        # Paires Majeures
+        "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
+        # Paires Croisées (Minors) - EUR
+        "EURAUD", "EURCAD", "EURCHF", "EURGBP", "EURJPY", "EURNZD",
+        # Paires Croisées (Minors) - GBP
+        "GBPAUD", "GBPCAD", "GBPCHF", "GBPJPY", "GBPNZD",
+        # Paires Croisées (Minors) - AUD
+        "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD",
+        # Paires Croisées (Minors) - NZD
+        "NZDCAD", "NZDCHF", "NZDJPY",
+        # Paires Croisées (Minors) - CAD
+        "CADCHF", "CADJPY",
+        # Paires Croisées (Minors) - CHF
+        "CHFJPY",
+        # Paires Exotiques (disponibilité très variable)
+        "USDZAR", "USDTRY", "USDSEK", "USDSGD", "USDRUB", "USDPLN", "USDNOK",
+        "USDMXN", "USDHUF", "USDHKD", "USDCNH", "EURTRY", "EURSEK", "EURPLN",
+e        "EURNOK", "USDTHB", "USDDKK", "EURDKK", "EURHUF"
     ]
     
     st.subheader("Sélection des Actifs")
     symbols_to_scan = st.multiselect(
         "Choisissez les actifs à analyser",
-        options=sorted(all_available_symbols),
+        options=sorted(list(set(all_available_symbols))), # Tri et suppression des doublons
         default=default_symbols
     )
 
@@ -119,7 +134,7 @@ with st.sidebar:
 # --- Logique Principale de l'Application ---
 if scan_button and api_key and symbols_to_scan:
     results = {'Daily': [], 'Weekly': []}
-    failed_symbols = [] # <<< NOUVEAU : pour suivre les échecs
+    failed_symbols = [] 
 
     total_steps = len(symbols_to_scan) * 2
     current_step = 0
@@ -137,7 +152,7 @@ if scan_button and api_key and symbols_to_scan:
             
             df = get_fmp_data(api_key, symbol, timeframe, limit=300)
             if df is not None and not df.empty:
-                data_fetched_for_symbol = True # On a réussi à avoir des données
+                data_fetched_for_symbol = True
                 supports, resistances = find_pivots(df, left_bars, right_bars)
                 last_support = supports.iloc[-1] if supports is not None and not supports.empty else None
                 last_resistance = resistances.iloc[-1] if resistances is not None and not resistances.empty else None
@@ -156,20 +171,17 @@ if scan_button and api_key and symbols_to_scan:
                     'Dist. Résistance (%)': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
                 })
         
-        # <<< NOUVEAU : Si après avoir essayé Daily et Weekly, on n'a jamais eu de données, on le note
         if not data_fetched_for_symbol and symbol not in failed_symbols:
             failed_symbols.append(symbol)
 
     progress_bar.progress(1.0, text="Analyse terminée !")
 
-    # --- Affichage des Échecs ---
     if failed_symbols:
         st.warning(
-            f"**Données non trouvées pour les actifs suivants :** {', '.join(failed_symbols)}. "
+            f"**Données non trouvées pour les actifs suivants :** {', '.join(sorted(failed_symbols))}. "
             "Cela est probablement dû à des limitations de votre plan API sur FinancialModelingPrep."
         )
 
-    # --- Affichage des Résultats ---
     st.subheader("Analyse Journalière (Daily)")
     if results['Daily']:
         daily_df = pd.DataFrame(results['Daily'])
