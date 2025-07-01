@@ -16,10 +16,10 @@ st.title("📈 Détecteur de Supports & Résistances")
 
 # --- Fonctions Logiques pour OANDA ---
 
-@st.cache_data(ttl=3600) # On met en cache la détection pour 1h
-def determine_oanda_environment(api_key, account_id):
+@st.cache_data(ttl=3600)
+def determine_oanda_environment(access_token, account_id):
     """Teste les identifiants sur les environnements Practice et Live pour trouver le bon."""
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {access_token}"}
     environments = {
         "Practice (Démo)": "https://api-fxpractice.oanda.com",
         "Live (Réel)": "https://api-fxtrade.oanda.com"
@@ -27,37 +27,31 @@ def determine_oanda_environment(api_key, account_id):
 
     for name, url in environments.items():
         try:
-            # On fait un appel simple pour tester la connexion
             test_url = f"{url}/v3/accounts/{account_id}/summary"
             response = requests.get(test_url, headers=headers, timeout=5)
             if response.status_code == 200:
-                return url, name # On retourne l'URL et le nom de l'environnement valide
+                return url, name
         except requests.exceptions.RequestException:
-            continue # Si erreur de connexion, on essaie le suivant
+            continue
     
-    return None, None # Si aucun ne fonctionne
+    return None, None
 
 @st.cache_data(ttl=600)
-def get_oanda_data(base_url, api_key, symbol, timeframe='daily', limit=300):
-    """Récupère les données de bougies historiques."""
+def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=300):
     url = f"{base_url}/v3/instruments/{symbol}/candles"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {access_token}"}
     params = {"count": limit, "granularity": {'daily': 'D', 'weekly': 'W'}[timeframe], "price": "M"}
-
     try:
         response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
         data = response.json()
         if not data.get('candles'): return None
-        
         candles = [{'date': pd.to_datetime(c['time']), 'open': float(c['mid']['o']), 'high': float(c['mid']['h']),
                     'low': float(c['mid']['l']), 'close': float(c['mid']['c']), 'volume': int(c['volume'])}
                    for c in data.get('candles', []) if c.get('complete')]
-                   
         return pd.DataFrame(candles)
-    except requests.exceptions.HTTPError:
-        return None # L'échec sera géré dans la boucle principale
-
+    except:
+        return None
 
 def find_pivots(df, left_bars, right_bars):
     if df is None or df.empty: return None, None
@@ -69,9 +63,9 @@ def find_pivots(df, left_bars, right_bars):
     return supports, resistances
 
 @st.cache_data(ttl=15)
-def get_oanda_current_price(base_url, api_key, account_id, symbol):
+def get_oanda_current_price(base_url, access_token, account_id, symbol):
     url = f"{base_url}/v3/accounts/{account_id}/pricing"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {access_token}"}
     params = {"instruments": symbol}
     try:
         response = requests.get(url, headers=headers, params=params)
@@ -85,20 +79,18 @@ def get_oanda_current_price(base_url, api_key, account_id, symbol):
     except:
         return None
 
-
 # --- Interface Utilisateur (Sidebar) ---
 with st.sidebar:
     st.header("Paramètres")
     
-    # Récupération des secrets
+    # --- CHANGEMENT ICI : On utilise les bons noms de variables ---
     try:
-        api_key = st.secrets["OANDA_API_KEY"]
+        access_token = st.secrets["OANDA_ACCESS_TOKEN"]
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
     except:
-        api_key = None
+        access_token = None
         account_id = None
 
-    # Sélection des actifs
     st.header("Sélection des Actifs")
     default_symbols = ["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD"]
     all_available_symbols = sorted(list(set(default_symbols + [
@@ -108,7 +100,6 @@ with st.sidebar:
     ])))
     symbols_to_scan = st.multiselect("Choisissez les actifs", options=all_available_symbols, default=default_symbols)
 
-    # Paramètres de détection
     st.header("Paramètres de Détection")
     left_bars = st.slider("Left Bars (gauche)", 1, 50, 15)
     right_bars = st.slider("Right Bars (droite)", 1, 50, 15)
@@ -116,13 +107,13 @@ with st.sidebar:
     scan_button = st.button("Lancer l'Analyse", type="primary", use_container_width=True)
 
 # --- Logique Principale de l'Application ---
-if not api_key or not account_id:
-    st.warning("Veuillez configurer `OANDA_API_KEY` et `OANDA_ACCOUNT_ID` dans votre fichier `secrets.toml`.")
+if not access_token or not account_id:
+    st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans votre fichier `secrets.toml`.")
 else:
-    base_url, env_name = determine_oanda_environment(api_key, account_id)
+    base_url, env_name = determine_oanda_environment(access_token, account_id)
     
     if not base_url:
-        st.error("Impossible de valider vos identifiants OANDA sur les environnements Practice ou Live. Veuillez vérifier votre clé API et votre Account ID.")
+        st.error("Impossible de valider vos identifiants OANDA. Veuillez vérifier les valeurs dans `secrets.toml`.")
     elif not scan_button:
         st.success(f"Connecté à l'environnement OANDA : **{env_name}**. Prêt à lancer l'analyse.")
         st.info("Configurez vos actifs et cliquez sur 'Lancer l'Analyse'.")
@@ -131,24 +122,23 @@ else:
         st.success(f"Analyse en cours sur l'environnement : **{env_name}**")
         results = {'Daily': [], 'Weekly': []}
         failed_symbols = []
-        
         progress_bar = st.progress(0, text="Initialisation...")
         total_steps = len(symbols_to_scan) * 2
         
         for i, symbol in enumerate(symbols_to_scan):
             data_fetched = False
-            current_price = get_oanda_current_price(base_url, api_key, account_id, symbol)
+            current_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
             
             for j, timeframe in enumerate(['daily', 'weekly']):
                 progress_step = i * 2 + j + 1
-                progress_text = f"Analyse... ({progress_step}/{total_steps}) {symbol.replace('_', '/')} - {timeframe.capitalize()}"
+                label = timeframe.capitalize()
+                progress_text = f"Analyse... ({progress_step}/{total_steps}) {symbol.replace('_', '/')} - {label}"
                 progress_bar.progress(progress_step / total_steps, text=progress_text)
 
-                df = get_oanda_data(base_url, api_key, symbol, timeframe, limit=300)
+                df = get_oanda_data(base_url, access_token, symbol, timeframe, limit=300)
                 
                 if df is not None and not df.empty:
                     data_fetched = True
-                    label = timeframe.capitalize()
                     supports, resistances = find_pivots(df, left_bars, right_bars)
                     last_s = supports.iloc[-1] if supports is not None and not supports.empty else None
                     last_r = resistances.iloc[-1] if resistances is not None and not resistances.empty else None
@@ -165,14 +155,13 @@ else:
                         'Dist. Résistance (%)': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
                     })
             
-            if not data_fetched:
-                failed_symbols.append(symbol.replace('_', '/'))
+            if not data_fetched: failed_symbols.append(symbol.replace('_', '/'))
 
         progress_bar.empty()
         st.info("Analyse terminée !")
 
         if failed_symbols:
-            st.warning(f"**Données non trouvées pour :** {', '.join(sorted(failed_symbols))}. Ces instruments ne sont peut-être pas disponibles sur votre compte.")
+            st.warning(f"**Données non trouvées pour :** {', '.join(sorted(failed_symbols))}.")
 
         for label in ['Daily', 'Weekly']:
             st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
