@@ -16,8 +16,6 @@ st.title("📈 Détecteur de Supports & Résistances")
 st.info("Configuré pour l'environnement de démo (Practice) OANDA.")
 
 # --- Fonctions Logiques pour OANDA ---
-
-# --- CHANGEMENT ICI : L'URL de l'environnement de démo est maintenant fixée ---
 BASE_URL = "https://api-fxpractice.oanda.com"
 
 @st.cache_data(ttl=600)
@@ -26,7 +24,6 @@ def get_oanda_data(api_key, symbol, timeframe='daily', limit=300):
     instrument = symbol.replace('/', '_')
     granularity_map = {'daily': 'D', 'weekly': 'W'}
     granularity = granularity_map.get(timeframe, 'D')
-
     url = f"{BASE_URL}/v3/instruments/{instrument}/candles"
     headers = {"Authorization": f"Bearer {api_key}"}
     params = {"count": limit, "granularity": granularity, "price": "M"}
@@ -35,20 +32,15 @@ def get_oanda_data(api_key, symbol, timeframe='daily', limit=300):
         response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
         data = response.json()
-        
-        if not data['candles']: return None
-
+        if not data.get('candles'): return None
         candles = [{'date': pd.to_datetime(c['time']), 'open': float(c['mid']['o']), 'high': float(c['mid']['h']),
                     'low': float(c['mid']['l']), 'close': float(c['mid']['c']), 'volume': int(c['volume'])}
                    for c in data['candles'] if c['complete']]
-        
         return pd.DataFrame(candles)
-
     except:
         return None
 
 def find_pivots(df, left_bars, right_bars):
-    """Identique à avant, trouve les pivots sur un DataFrame."""
     if df is None or df.empty: return None, None
     distance = left_bars + right_bars
     r_indices, _ = find_peaks(df['high'], distance=distance)
@@ -59,12 +51,10 @@ def find_pivots(df, left_bars, right_bars):
 
 @st.cache_data(ttl=15)
 def get_oanda_current_price(api_key, account_id, symbol):
-    """Récupère le prix actuel d'un instrument depuis l'API OANDA."""
     instrument = symbol.replace('/', '_')
     url = f"{BASE_URL}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {api_key}"}
     params = {"instruments": instrument}
-    
     try:
         response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
@@ -80,8 +70,6 @@ def get_oanda_current_price(api_key, account_id, symbol):
 # --- Interface Utilisateur (Sidebar) ---
 with st.sidebar:
     st.header("Paramètres OANDA")
-    
-    # --- CHANGEMENT ICI : Logique de secrets simplifiée ---
     try:
         api_key = st.secrets["OANDA_API_KEY"]
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
@@ -92,21 +80,29 @@ with st.sidebar:
         account_id = st.text_input("Entrez votre Account ID OANDA", value="")
 
     st.header("Sélection des Actifs")
+    
+    # --- CORRECTION APPLIQUÉE ICI ---
+    # Définition des symboles par défaut (corrects)
     default_symbols = ["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD"]
+    
+    # Définition de TOUTES les paires majeures avec le format OANDA correct
     all_major_pairs = [
-        "EUR_USD", "EUR_GBP", "EUR_JPY", "EURAUD", "EURNZD", "EURCAD", "EURCHF",
-        "GBP_USD", "GBP_JPY", "GBPAUD", "GBPNZD", "GBPCAD", "GBPCHF",
-        "AUD_USD", "AUDNZD", "AUDCAD", "AUDCHF", "AUDJPY",
-        "NZD_USD", "NZDCAD", "NZDCHF", "NZDJPY",
-        "USD_CAD", "USD_CHF", "USD_JPY", "CADCHF", "CADJPY", "CHFJPY"
+        "EUR_USD", "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_NZD", "EUR_CAD", "EUR_CHF",
+        "GBP_USD", "GBP_JPY", "GBP_AUD", "GBP_NZD", "GBP_CAD", "GBP_CHF",
+        "AUD_USD", "AUD_NZD", "AUD_CAD", "AUD_CHF", "AUD_JPY",
+        "NZD_USD", "NZD_CAD", "NZD_CHF", "NZD_JPY",
+        "USD_CAD", "USD_CHF", "USD_JPY",
+        "CAD_CHF", "CAD_JPY",
+        "CHF_JPY"
     ]
-    # Remplacer les noms pour qu'ils correspondent au format OANDA
-    all_major_pairs = [p.replace("AUD", "_AUD_").replace("NZD", "_NZD_").replace("CAD", "_CAD_").replace("CHF", "_CHF_").replace("JPY", "_JPY_").replace("__", "_") for p in all_major_pairs]
+    
+    # Liste finale combinée
     all_available_symbols = ["XAU_USD"] + all_major_pairs
     
+    # Le widget qui plantait va maintenant fonctionner car default_symbols est bien contenu dans all_available_symbols
     symbols_to_scan_oanda = st.multiselect(
         "Choisissez les actifs à analyser",
-        options=sorted(list(set(all_available_symbols))),
+        options=sorted(list(set(all_available_symbols))), # set() pour éviter les doublons
         default=default_symbols
     )
 
@@ -120,18 +116,18 @@ with st.sidebar:
 if scan_button and api_key and account_id and symbols_to_scan_oanda:
     results = {'Daily': [], 'Weekly': []}
     failed_symbols = []
-    
     total_steps = len(symbols_to_scan_oanda) * 2
     progress_bar = st.progress(0, text="Initialisation...")
     
     for i, symbol_oanda in enumerate(symbols_to_scan_oanda):
-        display_symbol = symbol_oanda.replace('_', '')
+        display_symbol = symbol_oanda.replace('_', '/')
         data_fetched = False
         current_price = get_oanda_current_price(api_key, account_id, symbol_oanda)
         
         for timeframe, label in [('daily', 'Daily'), ('weekly', 'Weekly')]:
-            progress_text = f"Analyse... ({i*2 + (1 if timeframe=='daily' else 2)}/{total_steps}) {display_symbol} - {label}"
-            progress_bar.progress((i*2 + (1 if timeframe=='daily' else 2)) / total_steps, text=progress_text)
+            progress_step = i * 2 + (1 if timeframe == 'daily' else 2)
+            progress_text = f"Analyse... ({progress_step}/{total_steps}) {display_symbol} - {label}"
+            progress_bar.progress(progress_step / total_steps, text=progress_text)
             
             df = get_oanda_data(api_key, symbol_oanda, timeframe, limit=300)
             
