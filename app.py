@@ -15,25 +15,17 @@ st.set_page_config(
 st.title("📈 Détecteur de Supports & Résistances")
 
 # --- Fonctions Logiques pour OANDA ---
-
 @st.cache_data(ttl=3600)
 def determine_oanda_environment(access_token, account_id):
-    """Teste les identifiants sur les environnements Practice et Live pour trouver le bon."""
     headers = {"Authorization": f"Bearer {access_token}"}
-    environments = {
-        "Practice (Démo)": "https://api-fxpractice.oanda.com",
-        "Live (Réel)": "https://api-fxtrade.oanda.com"
-    }
-
+    environments = {"Practice (Démo)": "https://api-fxpractice.oanda.com", "Live (Réel)": "https://api-fxtrade.oanda.com"}
     for name, url in environments.items():
         try:
-            test_url = f"{url}/v3/accounts/{account_id}/summary"
-            response = requests.get(test_url, headers=headers, timeout=5)
+            response = requests.get(f"{url}/v3/accounts/{account_id}/summary", headers=headers, timeout=5)
             if response.status_code == 200:
                 return url, name
-        except requests.exceptions.RequestException:
+        except:
             continue
-    
     return None, None
 
 @st.cache_data(ttl=600)
@@ -82,23 +74,25 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
 # --- Interface Utilisateur (Sidebar) ---
 with st.sidebar:
     st.header("Paramètres")
-    
-    # --- CHANGEMENT ICI : On utilise les bons noms de variables ---
     try:
         access_token = st.secrets["OANDA_ACCESS_TOKEN"]
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
     except:
-        access_token = None
-        account_id = None
+        access_token, account_id = None, None
 
     st.header("Sélection des Actifs")
-    default_symbols = ["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD"]
-    all_available_symbols = sorted(list(set(default_symbols + [
-        "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_NZD", "EUR_CAD", "EUR_CHF", "GBP_JPY", "GBP_AUD", 
-        "GBP_NZD", "GBP_CAD", "GBP_CHF", "AUD_NZD", "AUD_CAD", "AUD_CHF", "AUD_JPY", "NZD_CAD", 
+    all_available_symbols = sorted(list(set([
+        "XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD",
+        "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_NZD", "EUR_CAD", "EUR_CHF", "GBP_JPY", "GBP_AUD",
+        "GBP_NZD", "GBP_CAD", "GBP_CHF", "AUD_NZD", "AUD_CAD", "AUD_CHF", "AUD_JPY", "NZD_CAD",
         "NZD_CHF", "NZD_JPY", "CAD_CHF", "CAD_JPY", "CHF_JPY"
     ])))
-    symbols_to_scan = st.multiselect("Choisissez les actifs", options=all_available_symbols, default=default_symbols)
+    
+    # --- CHANGEMENT ICI ---
+    # On sélectionne TOUTE la liste par défaut au lieu de juste quelques paires.
+    symbols_to_scan = st.multiselect("Choisissez les actifs", 
+                                     options=all_available_symbols, 
+                                     default=all_available_symbols)
 
     st.header("Paramètres de Détection")
     left_bars = st.slider("Left Bars (gauche)", 1, 50, 15)
@@ -106,14 +100,13 @@ with st.sidebar:
     
     scan_button = st.button("Lancer l'Analyse", type="primary", use_container_width=True)
 
-# --- Logique Principale de l'Application ---
+# --- Logique Principale ---
 if not access_token or not account_id:
-    st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans votre fichier `secrets.toml`.")
+    st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans `secrets.toml`.")
 else:
     base_url, env_name = determine_oanda_environment(access_token, account_id)
-    
     if not base_url:
-        st.error("Impossible de valider vos identifiants OANDA. Veuillez vérifier les valeurs dans `secrets.toml`.")
+        st.error("Impossible de valider vos identifiants OANDA. Vérifiez `secrets.toml`.")
     elif not scan_button:
         st.success(f"Connecté à l'environnement OANDA : **{env_name}**. Prêt à lancer l'analyse.")
         st.info("Configurez vos actifs et cliquez sur 'Lancer l'Analyse'.")
@@ -134,7 +127,6 @@ else:
                 label = timeframe.capitalize()
                 progress_text = f"Analyse... ({progress_step}/{total_steps}) {symbol.replace('_', '/')} - {label}"
                 progress_bar.progress(progress_step / total_steps, text=progress_text)
-
                 df = get_oanda_data(base_url, access_token, symbol, timeframe, limit=300)
                 
                 if df is not None and not df.empty:
@@ -154,15 +146,12 @@ else:
                         'Date Résistance': last_r['date'].strftime('%Y-%m-%d') if last_r is not None else 'N/A',
                         'Dist. Résistance (%)': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
                     })
-            
             if not data_fetched: failed_symbols.append(symbol.replace('_', '/'))
 
         progress_bar.empty()
         st.info("Analyse terminée !")
-
         if failed_symbols:
             st.warning(f"**Données non trouvées pour :** {', '.join(sorted(failed_symbols))}.")
-
         for label in ['Daily', 'Weekly']:
             st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
             if results[label]:
