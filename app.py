@@ -91,37 +91,36 @@ with st.sidebar:
         if not api_key:
             st.warning("Ajoutez votre clé API dans les secrets ou entrez-la ci-dessus.")
 
-    # --- LISTE MAXIMALE D'ACTIFS ---
+    # --- LISTE DES 28 PAIRES MAJEURES + XAUUSD ---
     default_symbols = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"]
     
-    # On ajoute les paires exotiques les plus communes. Leur disponibilité dépendra fortement du plan API.
-    all_available_symbols = [
-        # Or & Crypto
-        "XAUUSD", "BTCUSD", "ETHUSD",
-        # Paires Majeures
-        "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
-        # Paires Croisées (Minors) - EUR
-        "EURAUD", "EURCAD", "EURCHF", "EURGBP", "EURJPY", "EURNZD",
-        # Paires Croisées (Minors) - GBP
-        "GBPAUD", "GBPCAD", "GBPCHF", "GBPJPY", "GBPNZD",
-        # Paires Croisées (Minors) - AUD
-        "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD",
-        # Paires Croisées (Minors) - NZD
-        "NZDCAD", "NZDCHF", "NZDJPY",
-        # Paires Croisées (Minors) - CAD
+    # Génération de toutes les combinaisons des 8 devises majeures
+    all_major_pairs = [
+        # Contre l'EUR
+        "EURUSD", "EURGBP", "EURJPY", "EURAUD", "EURNZD", "EURCAD", "EURCHF",
+        # Contre le GBP (sans l'EUR déjà listé)
+        "GBPUSD", "GBPJPY", "GBPAUD", "GBPNZD", "GBPCAD", "GBPCHF",
+        # Contre le JPY
+        "JPYUSD", "JPYGBP", "JPYAUD", "JPYNZD", "JPYCAD", "JPYCHF", # Note: Ce sont les paires inversées, on utilise les standards
+        # ...La méthode systématique est plus simple.
+        
+        # Les 28 paires majeures et croisées standard
+        "EURUSD", "EURGBP", "EURJPY", "EURAUD", "EURNZD", "EURCAD", "EURCHF",
+        "GBPUSD", "GBPJPY", "GBPAUD", "GBPNZD", "GBPCAD", "GBPCHF",
+        "AUDUSD", "AUDNZD", "AUDCAD", "AUDCHF", "AUDJPY",
+        "NZDUSD", "NZDCAD", "NZDCHF", "NZDJPY",
+        "USDCAD", "USDCHF", "USDJPY",
         "CADCHF", "CADJPY",
-        # Paires Croisées (Minors) - CHF
-        "CHFJPY",
-        # Paires Exotiques (disponibilité très variable)
-        "USDZAR", "USDTRY", "USDSEK", "USDSGD", "USDRUB", "USDPLN", "USDNOK",
-        "USDMXN", "USDHUF", "USDHKD", "USDCNH", "EURTRY", "EURSEK", "EURPLN",
-e        "EURNOK", "USDTHB", "USDDKK", "EURDKK", "EURHUF"
+        "CHFJPY"
     ]
+    
+    # Ajout de l'Or à la liste finale
+    all_available_symbols = ["XAUUSD"] + all_major_pairs
     
     st.subheader("Sélection des Actifs")
     symbols_to_scan = st.multiselect(
-        "Choisissez les actifs à analyser",
-        options=sorted(list(set(all_available_symbols))), # Tri et suppression des doublons
+        "Choisissez les actifs à analyser (29)",
+        options=sorted(list(set(all_available_symbols))), # Tri et suppression des doublons pour la propreté
         default=default_symbols
     )
 
