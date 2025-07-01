@@ -106,7 +106,6 @@ else:
     if not base_url:
         st.error("Impossible de valider vos identifiants OANDA. Vérifiez `secrets.toml`.")
     elif scan_button and symbols_to_scan:
-        # st.info(f"Analyse en cours sur l'environnement OANDA : **{env_name}**") # --- MESSAGE SUPPRIMÉ ---
         results = {'Daily': [], 'Weekly': []}
         failed_symbols = []
         progress_bar = st.progress(0, text="Initialisation...")
@@ -151,13 +150,7 @@ else:
             st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
             if results[label]:
                 df_res = pd.DataFrame(results[label]).sort_values(by='Actif').reset_index(drop=True)
-                
-                # --- CHANGEMENT ICI : On calcule la hauteur du tableau dynamiquement ---
-                # Hauteur = (nombre de lignes + 1 pour l'en-tête) * 35 pixels par ligne
                 table_height = (len(df_res) + 1) * 35
                 st.dataframe(df_res, use_container_width=True, hide_index=True, height=table_height)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
-    else:
-        # Message par défaut avant de lancer l'analyse
-        st.info(f"Connecté à OANDA (**{env_name}**). Configurez vos actifs et cliquez sur 'Lancer l'Analyse'.")
