@@ -6,9 +6,6 @@ from scipy.signal import find_peaks
 import numpy as np
 from datetime import datetime
 
-### AJOUT : Importation pour la génération du PDF ###
-from fpdf import FPDF
-
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
     page_title="Détecteur S/R Forex & Or",
@@ -75,59 +72,8 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
     except:
         return None
 
-### AJOUT : Fonction pour créer le rapport PDF (VERSION CORRIGÉE ET ROBUSTE) ###
-def create_pdf_report(daily_df, weekly_df):
-    
-    # Petite fonction pour nettoyer le texte pour FPDF
-    def sanitize_text(text):
-        return str(text).encode('latin-1', 'replace').decode('latin-1')
-
-    pdf = FPDF(orientation='L', unit='mm', format='A4')
-    pdf.add_page()
-    
-    # Titre du document (maintenant sanitisé)
-    pdf.set_font('Arial', 'B', 16)
-    pdf.cell(0, 10, sanitize_text("Rapport d'Analyse - Supports & Résistances"), 0, 1, 'C')
-    pdf.set_font('Arial', '', 10)
-    pdf.cell(0, 10, sanitize_text(f"Généré le : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"), 0, 1, 'C')
-    pdf.ln(10)
-
-    # Fonction interne pour dessiner un tableau
-    def draw_table(title, df_data):
-        if df_data is None or df_data.empty:
-            return
-        pdf.set_font('Arial', 'B', 12)
-        # Titre du tableau (maintenant sanitisé)
-        pdf.cell(0, 10, sanitize_text(title), 0, 1, 'L')
-        pdf.ln(2)
-        
-        pdf.set_font('Arial', 'B', 8)
-        page_width = pdf.w - 2 * pdf.l_margin
-        col_widths = [page_width * p for p in [0.10, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.18]]
-        
-        # En-têtes (maintenant sanitisés)
-        for i, header in enumerate(df_data.columns):
-            pdf.cell(col_widths[i], 8, sanitize_text(header), 1, 0, 'C')
-        pdf.ln()
-        
-        # Données (maintenant sanitisées)
-        pdf.set_font('Arial', '', 7)
-        for _, row in df_data.iterrows():
-            for i, item in enumerate(row):
-                pdf.cell(col_widths[i], 6, sanitize_text(item), 1, 0, 'C')
-            pdf.ln()
-        pdf.ln(10)
-
-    # Noms des tableaux qui seront passés à la fonction
-    daily_title = "Analyse Dailière (Daily)"
-    weekly_title = "Analyse Hebdomadaire (Weekly)"
-
-    # Dessiner les tableaux
-    draw_table(daily_title, daily_df)
-    draw_table(weekly_title, weekly_df)
-    
-    # Retourner le contenu du PDF en bytes
-    return pdf.output(dest='S')
+# ### SUPPRESSION ###
+# La fonction de création de PDF a été entièrement supprimée.
 
 # --- Interface Utilisateur (Sidebar) ---
 with st.sidebar:
@@ -204,32 +150,36 @@ else:
         if failed_symbols:
             st.warning(f"**Données non trouvées pour :** {', '.join(sorted(failed_symbols))}.")
             
-        # --- Stockage des DataFrames pour l'affichage et le téléchargement ---
         df_daily_results = pd.DataFrame(results['Daily'])
         df_weekly_results = pd.DataFrame(results['Weekly'])
 
-        ### AJOUT : Section de Téléchargement ###
+        ### MODIFICATION MAJEURE : Passage au téléchargement CSV ###
         if not df_daily_results.empty or not df_weekly_results.empty:
-            st.divider() # Ajoute une ligne de séparation visuelle
+            st.divider()
+
+            # Préparer les données pour un fichier CSV unique
+            df_daily_results['Période'] = 'Daily'
+            df_weekly_results['Période'] = 'Weekly'
+            combined_df = pd.concat([df_daily_results, df_weekly_results], ignore_index=True)
             
-            # Générer le PDF en mémoire
-            pdf_bytes = create_pdf_report(df_daily_results, df_weekly_results)
+            # Convertir le DataFrame en CSV (en mémoire)
+            # .to_csv() crée une chaîne de caractères, .encode() la transforme en bytes, ce que le bouton demande.
+            csv_data = combined_df.to_csv(index=False).encode('utf-8')
             
-            # Créer le bouton de téléchargement
             st.download_button(
-                label="📥 Télécharger le rapport PDF",
-                data=pdf_bytes,
-                file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf",
+                label="📥 Télécharger les résultats (CSV)",
+                data=csv_data,
+                file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime='text/csv',
                 use_container_width=True
             )
         
-        # --- Affichage des résultats ---
+        # --- Affichage des résultats (inchangé) ---
         for label, df_data in [('Daily', df_daily_results), ('Weekly', df_weekly_results)]:
             st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
             if not df_data.empty:
                 df_res = df_data.sort_values(by='Actif').reset_index(drop=True)
                 table_height = (len(df_res) + 1) * 35
-                st.dataframe(df_res, use_container_width=True, hide_index=True, height=table_height)
+                st.dataframe(df_res.drop(columns=['Période']), use_container_width=True, hide_index=True, height=table_height)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
