@@ -118,7 +118,8 @@ def create_pdf_report(daily_df, weekly_df):
     draw_table("Analyse Hebdomadaire (Weekly)", weekly_df)
     
     # Retourner le contenu du PDF en bytes
-    return pdf.output(dest='S').encode('latin-1')
+    # ### CORRECTION APPLIQUÉE ICI ###
+    return pdf.output(dest='S')
 
 # --- Interface Utilisateur (Sidebar) ---
 with st.sidebar:
@@ -224,4 +225,3 @@ else:
                 st.dataframe(df_res, use_container_width=True, hide_index=True, height=table_height)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
-              
