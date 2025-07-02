@@ -23,7 +23,6 @@ st.title("📈 Détecteur de Supports & Résistances")
 # --- Fonctions Logiques (inchangées) ---
 @st.cache_data(ttl=3600)
 def determine_oanda_environment(access_token, account_id):
-    # ... (code inchangé)
     headers = {"Authorization": f"Bearer {access_token}"}
     environments = {"Practice (Démo)": "https://api-fxpractice.oanda.com", "Live (Réel)": "https://api-fxtrade.oanda.com"}
     for name, url in environments.items():
@@ -37,7 +36,6 @@ def determine_oanda_environment(access_token, account_id):
 
 @st.cache_data(ttl=600)
 def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=300):
-    # ... (code inchangé)
     url = f"{base_url}/v3/instruments/{symbol}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"count": limit, "granularity": {'daily': 'D', 'weekly': 'W'}[timeframe], "price": "M"}
@@ -54,7 +52,6 @@ def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=300)
         return None
 
 def find_pivots(df, left_bars, right_bars):
-    # ... (code inchangé)
     if df is None or df.empty: return None, None
     distance = left_bars + right_bars
     r_indices, _ = find_peaks(df['high'], distance=distance)
@@ -65,7 +62,6 @@ def find_pivots(df, left_bars, right_bars):
 
 @st.cache_data(ttl=15)
 def get_oanda_current_price(base_url, access_token, account_id, symbol):
-    # ... (code inchangé)
     url = f"{base_url}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"instruments": symbol}
@@ -95,7 +91,8 @@ def create_image_report(daily_df, weekly_df):
     for df in [daily_df, weekly_df]:
         if not df.empty:
             styled_df = df.style.set_table_styles([s]).set_properties(**props).hide()
-            img_bytes = dfi.export(styled_df, table_conversion='chrome', fontsize=14)
+            # ### CORRECTION FINALE ICI ###
+            img_bytes = dfi.export(styled_df, table_conversion='matplotlib', fontsize=14)
             img_bytes_list.append(img_bytes)
         else:
             img_bytes_list.append(None)
@@ -106,11 +103,11 @@ def create_image_report(daily_df, weekly_df):
     # Calculer la taille de l'image finale
     padding = 50
     title_height = 60
-    total_width = max(img.width for img in images if img)
+    total_width = max(img.width for img in images if img) + (2*padding)
     total_height = sum(img.height + title_height for img in images if img) + padding
     
     # Créer l'image de fond
-    final_image = Image.new('RGB', (total_width, total_height), 'white')
+    final_image = Image.new('RGB', (total_width, total_height), '#1E1E2E') # Fond sombre
     draw = ImageDraw.Draw(final_image)
     
     try:
@@ -122,9 +119,9 @@ def create_image_report(daily_df, weekly_df):
     current_y = padding // 2
     for i, img in enumerate(images):
         if img:
-            draw.text((padding, current_y), titles[i], font=font, fill="black")
+            draw.text((padding, current_y), titles[i], font=font, fill="white")
             current_y += title_height
-            final_image.paste(img, (0, current_y))
+            final_image.paste(img, (padding, current_y))
             current_y += img.height
 
     # Sauvegarder l'image finale en mémoire
@@ -160,7 +157,7 @@ with st.sidebar:
     
     scan_button = st.button("Lancer l'Analyse", type="primary", use_container_width=True)
 
-# --- Logique Principale (légèrement modifiée à la fin) ---
+# --- Logique Principale (inchangée) ---
 if not access_token or not account_id:
     st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans `secrets.toml`.")
 else:
@@ -173,7 +170,6 @@ else:
         progress_bar = st.progress(0, text="Initialisation...")
         total_steps = len(symbols_to_scan) * 2
         
-        # ... Boucle d'analyse (inchangée) ...
         for i, symbol in enumerate(symbols_to_scan):
             data_fetched = False
             current_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
