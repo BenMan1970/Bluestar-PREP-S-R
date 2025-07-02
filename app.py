@@ -5,6 +5,11 @@ import requests
 from scipy.signal import find_peaks
 import numpy as np
 from datetime import datetime
+from io import BytesIO
+
+# NOUVEAUX IMPORTS POUR LA GÉNÉRATION D'IMAGE
+import dataframe_image as dfi
+from PIL import Image, ImageDraw, ImageFont
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
@@ -15,9 +20,10 @@ st.set_page_config(
 
 st.title("📈 Détecteur de Supports & Résistances")
 
-# --- Fonctions Logiques pour OANDA ---
+# --- Fonctions Logiques (inchangées) ---
 @st.cache_data(ttl=3600)
 def determine_oanda_environment(access_token, account_id):
+    # ... (code inchangé)
     headers = {"Authorization": f"Bearer {access_token}"}
     environments = {"Practice (Démo)": "https://api-fxpractice.oanda.com", "Live (Réel)": "https://api-fxtrade.oanda.com"}
     for name, url in environments.items():
@@ -31,6 +37,7 @@ def determine_oanda_environment(access_token, account_id):
 
 @st.cache_data(ttl=600)
 def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=300):
+    # ... (code inchangé)
     url = f"{base_url}/v3/instruments/{symbol}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"count": limit, "granularity": {'daily': 'D', 'weekly': 'W'}[timeframe], "price": "M"}
@@ -47,6 +54,7 @@ def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=300)
         return None
 
 def find_pivots(df, left_bars, right_bars):
+    # ... (code inchangé)
     if df is None or df.empty: return None, None
     distance = left_bars + right_bars
     r_indices, _ = find_peaks(df['high'], distance=distance)
@@ -57,6 +65,7 @@ def find_pivots(df, left_bars, right_bars):
 
 @st.cache_data(ttl=15)
 def get_oanda_current_price(base_url, access_token, account_id, symbol):
+    # ... (code inchangé)
     url = f"{base_url}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"instruments": symbol}
@@ -72,10 +81,59 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
     except:
         return None
 
-# ### SUPPRESSION ###
-# La fonction de création de PDF a été entièrement supprimée.
+### NOUVELLE FONCTION POUR CRÉER L'IMAGE ###
+def create_image_report(daily_df, weekly_df):
+    """Crée une seule image PNG à partir des deux DataFrames."""
+    
+    # Style pour les tableaux
+    s = {'selector': 'th', 'props': [('background-color', '#44475a'), ('color', 'white'), ('text-align', 'center')]}
+    props = {'text-align': 'center'}
+    
+    # Créer les images des tableaux en mémoire
+    img_bytes_list = []
+    titles = ["Analyse Dailière (Daily)", "Analyse Hebdomadaire (Weekly)"]
+    for df in [daily_df, weekly_df]:
+        if not df.empty:
+            styled_df = df.style.set_table_styles([s]).set_properties(**props).hide()
+            img_bytes = dfi.export(styled_df, table_conversion='chrome', fontsize=14)
+            img_bytes_list.append(img_bytes)
+        else:
+            img_bytes_list.append(None)
 
-# --- Interface Utilisateur (Sidebar) ---
+    # Ouvrir les images avec Pillow
+    images = [Image.open(BytesIO(b)) if b else None for b in img_bytes_list]
+    
+    # Calculer la taille de l'image finale
+    padding = 50
+    title_height = 60
+    total_width = max(img.width for img in images if img)
+    total_height = sum(img.height + title_height for img in images if img) + padding
+    
+    # Créer l'image de fond
+    final_image = Image.new('RGB', (total_width, total_height), 'white')
+    draw = ImageDraw.Draw(final_image)
+    
+    try:
+        font = ImageFont.truetype("arial.ttf", 40)
+    except IOError:
+        font = ImageFont.load_default()
+
+    # Coller les images et dessiner les titres
+    current_y = padding // 2
+    for i, img in enumerate(images):
+        if img:
+            draw.text((padding, current_y), titles[i], font=font, fill="black")
+            current_y += title_height
+            final_image.paste(img, (0, current_y))
+            current_y += img.height
+
+    # Sauvegarder l'image finale en mémoire
+    output_buffer = BytesIO()
+    final_image.save(output_buffer, format="PNG")
+    return output_buffer.getvalue()
+
+
+# --- Interface Utilisateur (Sidebar) (inchangée) ---
 with st.sidebar:
     st.header("Paramètres")
     try:
@@ -102,7 +160,7 @@ with st.sidebar:
     
     scan_button = st.button("Lancer l'Analyse", type="primary", use_container_width=True)
 
-# --- Logique Principale ---
+# --- Logique Principale (légèrement modifiée à la fin) ---
 if not access_token or not account_id:
     st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans `secrets.toml`.")
 else:
@@ -115,6 +173,7 @@ else:
         progress_bar = st.progress(0, text="Initialisation...")
         total_steps = len(symbols_to_scan) * 2
         
+        # ... Boucle d'analyse (inchangée) ...
         for i, symbol in enumerate(symbols_to_scan):
             data_fetched = False
             current_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
@@ -153,24 +212,18 @@ else:
         df_daily_results = pd.DataFrame(results['Daily'])
         df_weekly_results = pd.DataFrame(results['Weekly'])
 
-        ### MODIFICATION MAJEURE : Passage au téléchargement CSV ###
+        ### NOUVELLE SECTION DE TÉLÉCHARGEMENT D'IMAGE ###
         if not df_daily_results.empty or not df_weekly_results.empty:
             st.divider()
-
-            # Préparer les données pour un fichier CSV unique
-            df_daily_results['Période'] = 'Daily'
-            df_weekly_results['Période'] = 'Weekly'
-            combined_df = pd.concat([df_daily_results, df_weekly_results], ignore_index=True)
             
-            # Convertir le DataFrame en CSV (en mémoire)
-            # .to_csv() crée une chaîne de caractères, .encode() la transforme en bytes, ce que le bouton demande.
-            csv_data = combined_df.to_csv(index=False).encode('utf-8')
+            # Générer l'image en mémoire
+            image_bytes = create_image_report(df_daily_results, df_weekly_results)
             
             st.download_button(
-                label="📥 Télécharger les résultats (CSV)",
-                data=csv_data,
-                file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime='text/csv',
+                label="🖼️ Télécharger les résultats (Image)",
+                data=image_bytes,
+                file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
+                mime='image/png',
                 use_container_width=True
             )
         
@@ -180,6 +233,6 @@ else:
             if not df_data.empty:
                 df_res = df_data.sort_values(by='Actif').reset_index(drop=True)
                 table_height = (len(df_res) + 1) * 35
-                st.dataframe(df_res.drop(columns=['Période']), use_container_width=True, hide_index=True, height=table_height)
+                st.dataframe(df_res, use_container_width=True, hide_index=True, height=table_height)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
