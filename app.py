@@ -4,6 +4,8 @@ import pandas as pd
 import requests
 from scipy.signal import find_peaks
 import numpy as np
+from fpdf import FPDF  # Ajout pour la génération PDF
+from io import BytesIO  # Ajout pour la gestion des fichiers en mémoire
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
@@ -13,6 +15,67 @@ st.set_page_config(
 )
 
 st.title("📈 Détecteur de Supports & Résistances")
+
+# --- Fonction pour générer le PDF --- (NOUVEAU)
+def create_pdf(df_daily, df_weekly, left_bars, right_bars, symbols_analyzed, failed_symbols):
+    """Crée un PDF avec les résultats de l'analyse"""
+    pdf = FPDF()
+    pdf.add_page()
+    
+    # Titre principal
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, "Détecteur de Supports & Résistances", ln=1, align='C')
+    pdf.set_font("Arial", '', 12)
+    pdf.cell(0, 10, "Paramètres de l'analyse:", ln=1)
+    pdf.cell(0, 10, f"Left Bars: {left_bars}, Right Bars: {right_bars}", ln=1)
+    pdf.cell(0, 10, f"Actifs analysés: {', '.join([s.replace('_', '/') for s in symbols_analyzed])}", ln=1)
+    if failed_symbols:
+        pdf.cell(0, 10, f"Actifs sans données: {', '.join(failed_symbols)}", ln=1)
+    pdf.ln(10)
+    
+    # Tableau Daily
+    if df_daily is not None and not df_daily.empty:
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(0, 10, "Résultats - Daily", ln=1)
+        pdf.set_font("Arial", '', 10)
+        
+        # En-têtes
+        col_widths = [30, 30, 30, 25, 25, 30, 25, 25]
+        headers = df_daily.columns.tolist()
+        for i, header in enumerate(headers):
+            pdf.cell(col_widths[i], 10, header, border=1)
+        pdf.ln()
+        
+        # Données
+        for _, row in df_daily.iterrows():
+            for i, col in enumerate(headers):
+                pdf.cell(col_widths[i], 10, str(row[col]), border=1)
+            pdf.ln()
+        pdf.ln(10)
+    
+    # Tableau Weekly
+    if df_weekly is not None and not df_weekly.empty:
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(0, 10, "Résultats - Weekly", ln=1)
+        pdf.set_font("Arial", '', 10)
+        
+        # En-têtes
+        for i, header in enumerate(headers):
+            pdf.cell(col_widths[i], 10, header, border=1)
+        pdf.ln()
+        
+        # Données
+        for _, row in df_weekly.iterrows():
+            for i, col in enumerate(headers):
+                pdf.cell(col_widths[i], 10, str(row[col]), border=1)
+            pdf.ln()
+    
+    # Pied de page
+    pdf.set_y(-20)
+    pdf.set_font("Arial", 'I', 8)
+    pdf.cell(0, 10, "Généré par l'application Détecteur de Supports & Résistances", 0, 0, 'C')
+    
+    return pdf.output(dest='S').encode('latin1')
 
 # --- Fonctions Logiques pour OANDA ---
 @st.cache_data(ttl=3600)
@@ -146,11 +209,49 @@ else:
         if failed_symbols:
             st.warning(f"**Données non trouvées pour :** {', '.join(sorted(failed_symbols))}.")
             
+        # Stocker les dataframes pour l'export PDF
+        df_daily = pd.DataFrame(results['Daily']) if results['Daily'] else None
+        df_weekly = pd.DataFrame(results['Weekly']) if results['Weekly'] else None
+        
         for label in ['Daily', 'Weekly']:
             st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
-            if results[label]:
-                df_res = pd.DataFrame(results[label]).sort_values(by='Actif').reset_index(drop=True)
-                table_height = (len(df_res) + 1) * 35
-                st.dataframe(df_res, use_container_width=True, hide_index=True, height=table_height)
+            df = df_daily if label == 'Daily' else df_weekly
+            if df is not None and not df.empty:
+                df_sorted = df.sort_values(by='Actif').reset_index(drop=True)
+                table_height = (len(df_sorted) + 1) * 35
+                st.dataframe(df_sorted, use_container_width=True, hide_index=True, height=table_height)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
+        
+        # --- Section d'export PDF --- (NOUVEAU)
+        if df_daily is not None or df_weekly is not None:
+            st.markdown("---")
+            st.subheader("Exporter les Résultats")
+            
+            if st.button("💾 Télécharger PDF"):
+                pdf_bytes = create_pdf(
+                    df_daily.sort_values(by='Actif') if df_daily is not None else None,
+                    df_weekly.sort_values(by='Actif') if df_weekly is not None else None,
+                    left_bars,
+                    right_bars,
+                    symbols_to_scan,
+                    failed_symbols
+                )
+                
+                st.download_button(
+                    label="⬇️ Télécharger le PDF",
+                    data=pdf_bytes,
+                    file_name="supports_resistances.pdf",
+                    mime="application/pdf"
+                )
+            
+            # Bouton d'impression
+            st.button("🖨️ Imprimer la page", on_click=lambda: st.markdown(
+                """
+                <script>
+                    window.print();
+                </script>
+                """,
+                unsafe_allow_html=True
+            ))
+              
