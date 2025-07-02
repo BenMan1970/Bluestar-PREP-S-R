@@ -75,16 +75,21 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
     except:
         return None
 
-### AJOUT : Fonction pour créer le rapport PDF ###
+### AJOUT : Fonction pour créer le rapport PDF (VERSION CORRIGÉE ET ROBUSTE) ###
 def create_pdf_report(daily_df, weekly_df):
+    
+    # Petite fonction pour nettoyer le texte pour FPDF
+    def sanitize_text(text):
+        return str(text).encode('latin-1', 'replace').decode('latin-1')
+
     pdf = FPDF(orientation='L', unit='mm', format='A4')
     pdf.add_page()
     
-    # Titre du document
+    # Titre du document (maintenant sanitisé)
     pdf.set_font('Arial', 'B', 16)
-    pdf.cell(0, 10, "Rapport d'Analyse - Supports & Résistances", 0, 1, 'C')
+    pdf.cell(0, 10, sanitize_text("Rapport d'Analyse - Supports & Résistances"), 0, 1, 'C')
     pdf.set_font('Arial', '', 10)
-    pdf.cell(0, 10, f"Généré le : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", 0, 1, 'C')
+    pdf.cell(0, 10, sanitize_text(f"Généré le : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"), 0, 1, 'C')
     pdf.ln(10)
 
     # Fonction interne pour dessiner un tableau
@@ -92,32 +97,34 @@ def create_pdf_report(daily_df, weekly_df):
         if df_data is None or df_data.empty:
             return
         pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 10, title, 0, 1, 'L')
+        # Titre du tableau (maintenant sanitisé)
+        pdf.cell(0, 10, sanitize_text(title), 0, 1, 'L')
         pdf.ln(2)
         
         pdf.set_font('Arial', 'B', 8)
-        # Largeur des colonnes (ajustée pour le format paysage A4)
         page_width = pdf.w - 2 * pdf.l_margin
         col_widths = [page_width * p for p in [0.10, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.18]]
         
-        # En-têtes
+        # En-têtes (maintenant sanitisés)
         for i, header in enumerate(df_data.columns):
-            pdf.cell(col_widths[i], 8, str(header), 1, 0, 'C')
+            pdf.cell(col_widths[i], 8, sanitize_text(header), 1, 0, 'C')
         pdf.ln()
         
-        # Données
+        # Données (maintenant sanitisées)
         pdf.set_font('Arial', '', 7)
         for _, row in df_data.iterrows():
             for i, item in enumerate(row):
-                # ### CORRECTION APPLIQUÉE ICI pour éviter les erreurs d'encodage ###
-                sanitized_item = str(item).encode('latin-1', 'replace').decode('latin-1')
-                pdf.cell(col_widths[i], 6, sanitized_item, 1, 0, 'C')
+                pdf.cell(col_widths[i], 6, sanitize_text(item), 1, 0, 'C')
             pdf.ln()
         pdf.ln(10)
 
+    # Noms des tableaux qui seront passés à la fonction
+    daily_title = "Analyse Dailière (Daily)"
+    weekly_title = "Analyse Hebdomadaire (Weekly)"
+
     # Dessiner les tableaux
-    draw_table("Analyse Dailière (Daily)", daily_df)
-    draw_table("Analyse Hebdomadaire (Weekly)", weekly_df)
+    draw_table(daily_title, daily_df)
+    draw_table(weekly_title, weekly_df)
     
     # Retourner le contenu du PDF en bytes
     return pdf.output(dest='S')
