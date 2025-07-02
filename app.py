@@ -7,8 +7,7 @@ import numpy as np
 from datetime import datetime
 from io import BytesIO
 
-# NOUVEAUX IMPORTS POUR LA GÉNÉRATION D'IMAGE
-import dataframe_image as dfi
+# L'UNIQUE IMPORT NÉCESSAIRE POUR L'IMAGE
 from PIL import Image, ImageDraw, ImageFont
 
 # --- Configuration de la Page Streamlit ---
@@ -77,56 +76,43 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
     except:
         return None
 
-### NOUVELLE FONCTION POUR CRÉER L'IMAGE ###
-def create_image_report(daily_df, weekly_df):
-    """Crée une seule image PNG à partir des deux DataFrames."""
+### FONCTION DE CRÉATION D'IMAGE SIMPLE ET FIABLE ###
+def create_simple_image_report(daily_df, weekly_df):
+    """Crée une image simple à partir du texte des DataFrames."""
     
-    # Style pour les tableaux
-    s = {'selector': 'th', 'props': [('background-color', '#44475a'), ('color', 'white'), ('text-align', 'center')]}
-    props = {'text-align': 'center'}
-    
-    # Créer les images des tableaux en mémoire
-    img_bytes_list = []
-    titles = ["Analyse Dailière (Daily)", "Analyse Hebdomadaire (Weekly)"]
-    for df in [daily_df, weekly_df]:
-        if not df.empty:
-            styled_df = df.style.set_table_styles([s]).set_properties(**props).hide()
-            # ### CORRECTION FINALE ICI ###
-            img_bytes = dfi.export(styled_df, table_conversion='matplotlib', fontsize=14)
-            img_bytes_list.append(img_bytes)
-        else:
-            img_bytes_list.append(None)
+    # Préparer le texte des rapports
+    daily_text = "Analyse Dailière (Daily)\n" + ("-"*50) + "\n"
+    daily_text += daily_df.to_string(index=False) if not daily_df.empty else "Aucune donnée."
 
-    # Ouvrir les images avec Pillow
-    images = [Image.open(BytesIO(b)) if b else None for b in img_bytes_list]
-    
-    # Calculer la taille de l'image finale
-    padding = 50
-    title_height = 60
-    total_width = max(img.width for img in images if img) + (2*padding)
-    total_height = sum(img.height + title_height for img in images if img) + padding
-    
-    # Créer l'image de fond
-    final_image = Image.new('RGB', (total_width, total_height), '#1E1E2E') # Fond sombre
-    draw = ImageDraw.Draw(final_image)
-    
+    weekly_text = "Analyse Hebdomadaire (Weekly)\n" + ("-"*50) + "\n"
+    weekly_text += weekly_df.to_string(index=False) if not weekly_df.empty else "Aucune donnée."
+
+    full_text = daily_text + "\n\n" + weekly_text
+
+    # Utiliser une police de base qui est toujours disponible
     try:
-        font = ImageFont.truetype("arial.ttf", 40)
+        font = ImageFont.truetype("DejaVuSansMono.ttf", 12)
     except IOError:
-        font = ImageFont.load_default()
+        font = ImageFont.load_default() # Plan B, toujours fonctionnel
 
-    # Coller les images et dessiner les titres
-    current_y = padding // 2
-    for i, img in enumerate(images):
-        if img:
-            draw.text((padding, current_y), titles[i], font=font, fill="white")
-            current_y += title_height
-            final_image.paste(img, (padding, current_y))
-            current_y += img.height
-
-    # Sauvegarder l'image finale en mémoire
+    # Créer une image temporaire pour mesurer la taille du texte
+    temp_img = Image.new('RGB', (1, 1))
+    temp_draw = ImageDraw.Draw(temp_img)
+    text_bbox = temp_draw.multiline_textbbox((0, 0), full_text, font=font)
+    
+    # Calculer la taille de l'image finale avec un peu de marge
+    padding = 20
+    width = text_bbox[2] + 2 * padding
+    height = text_bbox[3] + 2 * padding
+    
+    # Créer l'image finale et dessiner le texte
+    img = Image.new('RGB', (width, height), color='white')
+    draw = ImageDraw.Draw(img)
+    draw.multiline_text((padding, padding), full_text, font=font, fill='black')
+    
+    # Sauvegarder l'image en mémoire
     output_buffer = BytesIO()
-    final_image.save(output_buffer, format="PNG")
+    img.save(output_buffer, format="PNG")
     return output_buffer.getvalue()
 
 
@@ -157,7 +143,7 @@ with st.sidebar:
     
     scan_button = st.button("Lancer l'Analyse", type="primary", use_container_width=True)
 
-# --- Logique Principale (inchangée) ---
+# --- Logique Principale ---
 if not access_token or not account_id:
     st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans `secrets.toml`.")
 else:
@@ -208,12 +194,12 @@ else:
         df_daily_results = pd.DataFrame(results['Daily'])
         df_weekly_results = pd.DataFrame(results['Weekly'])
 
-        ### NOUVELLE SECTION DE TÉLÉCHARGEMENT D'IMAGE ###
+        ### SECTION DE TÉLÉCHARGEMENT SIMPLE ###
         if not df_daily_results.empty or not df_weekly_results.empty:
             st.divider()
             
-            # Générer l'image en mémoire
-            image_bytes = create_image_report(df_daily_results, df_weekly_results)
+            # Générer l'image en mémoire avec la nouvelle fonction simple
+            image_bytes = create_simple_image_report(df_daily_results, df_weekly_results)
             
             st.download_button(
                 label="🖼️ Télécharger les résultats (Image)",
@@ -232,3 +218,4 @@ else:
                 st.dataframe(df_res, use_container_width=True, hide_index=True, height=table_height)
             else:
                 st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
+    
