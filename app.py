@@ -109,7 +109,9 @@ def create_pdf_report(daily_df, weekly_df):
         pdf.set_font('Arial', '', 7)
         for _, row in df_data.iterrows():
             for i, item in enumerate(row):
-                pdf.cell(col_widths[i], 6, str(item), 1, 0, 'C')
+                # ### CORRECTION APPLIQUÉE ICI pour éviter les erreurs d'encodage ###
+                sanitized_item = str(item).encode('latin-1', 'replace').decode('latin-1')
+                pdf.cell(col_widths[i], 6, sanitized_item, 1, 0, 'C')
             pdf.ln()
         pdf.ln(10)
 
@@ -118,7 +120,6 @@ def create_pdf_report(daily_df, weekly_df):
     draw_table("Analyse Hebdomadaire (Weekly)", weekly_df)
     
     # Retourner le contenu du PDF en bytes
-    # ### CORRECTION APPLIQUÉE ICI ###
     return pdf.output(dest='S')
 
 # --- Interface Utilisateur (Sidebar) ---
