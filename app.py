@@ -16,22 +16,22 @@ st.set_page_config(
 st.title("📡 Scanner S/R Exhaustif (H4, D1, W)")
 st.markdown("Génère une liste complète des zones de Support/Résistance pour une analyse de confluences approfondie.")
 
-# --- Fonctions de l'API OANDA (inchangées) ---
+# --- Fonctions de l'API OANDA ---
 @st.cache_data(ttl=3600)
 def determine_oanda_environment(access_token, account_id):
+    # ... (le code de cette fonction est inchangé)
     headers = {"Authorization": f"Bearer {access_token}"}
     environments = {"Practice (Démo)": "https://api-fxpractice.oanda.com", "Live (Réel)": "https://api-fxtrade.oanda.com"}
     for name, url in environments.items():
         try:
             response = requests.get(f"{url}/v3/accounts/{account_id}/summary", headers=headers, timeout=5)
-            if response.status_code == 200:
-                return url, name
-        except requests.RequestException:
-            continue
+            if response.status_code == 200: return url, name
+        except requests.RequestException: continue
     return None, None
 
 @st.cache_data(ttl=600)
 def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=500):
+    # ... (le code de cette fonction est inchangé)
     url = f"{base_url}/v3/instruments/{symbol}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"count": limit, "granularity": {'h4': 'H4', 'daily': 'D', 'weekly': 'W'}[timeframe], "price": "M"}
@@ -44,11 +44,11 @@ def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=500)
                     'low': float(c['mid']['l']), 'close': float(c['mid']['c']), 'volume': int(c['volume'])}
                    for c in data.get('candles', []) if c.get('complete')]
         return pd.DataFrame(candles).set_index('date')
-    except requests.RequestException:
-        return None
+    except requests.RequestException: return None
 
 @st.cache_data(ttl=15)
 def get_oanda_current_price(base_url, access_token, account_id, symbol):
+    # ... (le code de cette fonction est inchangé)
     url = f"{base_url}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"instruments": symbol}
@@ -61,11 +61,11 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
             ask = float(data['prices'][0]['closeoutAsk'])
             return (bid + ask) / 2
         return None
-    except requests.RequestException:
-        return None
+    except requests.RequestException: return None
 
-# --- MOTEUR D'ANALYSE PROFESSIONNEL (inchangé) ---
+# --- MOTEUR D'ANALYSE PROFESSIONNEL ---
 def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
+    # ... (le code de cette fonction est inchangé)
     if df is None or df.empty or len(df) < 20: return pd.DataFrame(), pd.DataFrame()
     r_indices, _ = find_peaks(df['high'], distance=5)
     s_indices, _ = find_peaks(-df['low'], distance=5)
@@ -93,16 +93,14 @@ def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
     return supports, resistances
 
 def generate_text_report(results_dict):
-    """Génère un rapport textuel complet pour tous les timeframes."""
+    # ... (le code de cette fonction est inchangé)
     report_lines = ["Rapport Complet des Niveaux de Support/Résistance :\n"]
     title_map = {'H4': '--- Analyse 4 Heures (H4) ---', 'Daily': '--- Analyse Journalière (Daily) ---', 'Weekly': '--- Analyse Hebdomadaire (Weekly) ---'}
-    
     for timeframe_key, df in results_dict.items():
         if not df.empty:
             report_lines.append(title_map[timeframe_key])
             report_lines.append(df.to_string(index=False))
             report_lines.append("\n")
-            
     return "\n".join(report_lines)
 
 # --- INTERFACE UTILISATEUR (SIDEBAR) ---
@@ -115,23 +113,18 @@ with st.sidebar:
     except:
         access_token, account_id = None, None
         st.error("Secrets OANDA non trouvés.")
-
     st.header("2. Sélection des Actifs")
     all_symbols = sorted(["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD", "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_NZD", "EUR_CAD", "EUR_CHF", "GBP_JPY", "GBP_AUD", "GBP_NZD", "GBP_CAD", "GBP_CHF", "AUD_NZD", "AUD_CAD", "AUD_CHF", "AUD_JPY", "NZD_CAD", "NZD_CHF", "NZD_JPY", "CAD_CHF", "CAD_JPY", "CHF_JPY"])
-    
     st.info("Cochez la case pour scanner tous les actifs.")
     select_all = st.checkbox("Scanner les 29 actifs")
-
     if select_all:
         symbols_to_scan = all_symbols
     else:
         default_selection = sorted(["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "EUR_JPY", "GBP_JPY"])
         symbols_to_scan = st.multiselect("Ou choisissez des actifs spécifiques :", options=all_symbols, default=default_selection)
-
     st.header("3. Paramètres de Détection")
     zone_width = st.slider("Largeur de zone (%)", 0.1, 2.0, 0.4, 0.1, help="Largeur de la zone pour regrouper les pivots.")
     min_touches = st.slider("Force minimale (touches)", 2, 10, 3, 1, help="Nombre de contacts minimum pour valider une zone.")
-    
     scan_button = st.button("🚀 Lancer le Scan Complet", type="primary", use_container_width=True)
 
 # --- LOGIQUE PRINCIPALE ---
@@ -139,38 +132,27 @@ if scan_button and symbols_to_scan:
     if not access_token or not account_id:
         st.warning("Veuillez configurer vos secrets OANDA pour lancer l'analyse.")
     else:
-        base_url, env_name = determine_oanda_environment(access_token, account_id)
+        base_url, _ = determine_oanda_environment(access_token, account_id)
         if not base_url:
             st.error("Impossible de valider vos identifiants OANDA. Vérifiez vos secrets.")
         else:
-            # Structure pour stocker les résultats par timeframe
             results = {'H4': [], 'Daily': [], 'Weekly': []}
             timeframes = ['h4', 'daily', 'weekly']
-            
             progress_bar = st.progress(0, text="Initialisation...")
-            st.success(f"Connecté à l'environnement OANDA : {env_name}")
-
             total_steps = len(symbols_to_scan) * len(timeframes)
-            
             for i, symbol in enumerate(symbols_to_scan):
                 current_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
-                
                 for j, timeframe in enumerate(timeframes):
                     progress_step = (i * len(timeframes) + j + 1)
                     progress_text = f"Scan... ({progress_step}/{total_steps}) {symbol.replace('_', '/')} - {timeframe.upper()}"
                     progress_bar.progress(progress_step / total_steps, text=progress_text)
-                    
                     df = get_oanda_data(base_url, access_token, symbol, timeframe, limit=500)
-                    
                     if df is not None and not df.empty:
                         supports, resistances = find_strong_sr_zones(df, zone_percentage_width=zone_width, min_touches=min_touches)
-                        
                         sup = supports.iloc[-1] if not supports.empty else None
                         res = resistances.iloc[0] if not resistances.empty else None
-                        
                         dist_s = (abs(current_price - sup['level']) / current_price) * 100 if sup is not None and current_price is not None else np.nan
                         dist_r = (abs(current_price - res['level']) / current_price) * 100 if res is not None and current_price is not None else np.nan
-                        
                         results[timeframe.capitalize()].append({
                             'Actif': symbol.replace('_', '/'), 
                             'Prix Actuel': f"{current_price:.5f}" if current_price is not None else 'N/A',
@@ -181,33 +163,28 @@ if scan_button and symbols_to_scan:
                             'Force (R)': f"{int(res['strength'])} touches" if res is not None else 'N/A',
                             'Dist. (R) %': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
                         })
-
             progress_bar.empty()
+            # **MODIFICATION : Le message de succès est plus générique et le message de connexion a été retiré.**
             st.success("Scan terminé !")
             
-            # Création des DataFrames finaux
             df_h4 = pd.DataFrame(results['H4'])
             df_daily = pd.DataFrame(results['Daily'])
             df_weekly = pd.DataFrame(results['Weekly'])
             
-            # Préparation du rapport textuel pour la collaboration
-            st.subheader("📋 Rapport Complet pour Analyse de Confluences")
-            with st.expander("Cliquez ici pour copier le rapport complet pour Gemini"):
+            # **MODIFICATION : Le titre de la section est plus générique.**
+            st.subheader("📋 Rapport Complet pour Analyse")
+            with st.expander("Cliquez ici pour voir et copier le rapport"):
                 report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
                 report_text = generate_text_report(report_dict)
                 st.code(report_text, language="text")
 
-            # Affichage des résultats par timeframe
             st.divider()
             st.subheader("--- Analyse 4 Heures (H4) ---")
             st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
-            
             st.subheader("--- Analyse Journalière (Daily) ---")
             st.dataframe(df_daily.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
-
             st.subheader("--- Analyse Hebdomadaire (Weekly) ---")
             st.dataframe(df_weekly.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
-
 elif not symbols_to_scan:
     st.info("Veuillez sélectionner des actifs à scanner ou cocher la case 'Scanner les 29 actifs'.")
 else:
