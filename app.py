@@ -5,6 +5,8 @@ import requests
 from scipy.signal import find_peaks
 import numpy as np
 from datetime import datetime
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont # Imports nécessaires pour l'image
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
@@ -16,10 +18,9 @@ st.set_page_config(
 st.title("📡 Scanner S/R Exhaustif (H4, D1, W)")
 st.markdown("Génère une liste complète des zones de Support/Résistance pour une analyse de confluences approfondie.")
 
-# --- Fonctions de l'API OANDA ---
+# --- Fonctions de l'API OANDA (inchangées) ---
 @st.cache_data(ttl=3600)
 def determine_oanda_environment(access_token, account_id):
-    # ... (le code de cette fonction est inchangé)
     headers = {"Authorization": f"Bearer {access_token}"}
     environments = {"Practice (Démo)": "https://api-fxpractice.oanda.com", "Live (Réel)": "https://api-fxtrade.oanda.com"}
     for name, url in environments.items():
@@ -31,7 +32,6 @@ def determine_oanda_environment(access_token, account_id):
 
 @st.cache_data(ttl=600)
 def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=500):
-    # ... (le code de cette fonction est inchangé)
     url = f"{base_url}/v3/instruments/{symbol}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"count": limit, "granularity": {'h4': 'H4', 'daily': 'D', 'weekly': 'W'}[timeframe], "price": "M"}
@@ -48,7 +48,6 @@ def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=500)
 
 @st.cache_data(ttl=15)
 def get_oanda_current_price(base_url, access_token, account_id, symbol):
-    # ... (le code de cette fonction est inchangé)
     url = f"{base_url}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"instruments": symbol}
@@ -63,9 +62,8 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
         return None
     except requests.RequestException: return None
 
-# --- MOTEUR D'ANALYSE PROFESSIONNEL ---
+# --- MOTEUR D'ANALYSE PROFESSIONNEL (inchangé) ---
 def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
-    # ... (le code de cette fonction est inchangé)
     if df is None or df.empty or len(df) < 20: return pd.DataFrame(), pd.DataFrame()
     r_indices, _ = find_peaks(df['high'], distance=5)
     s_indices, _ = find_peaks(-df['low'], distance=5)
@@ -92,8 +90,9 @@ def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
     resistances = zones_df[zones_df['level'] >= last_price].copy()
     return supports, resistances
 
+# --- Fonctions de Création de Rapport ---
 def generate_text_report(results_dict):
-    # ... (le code de cette fonction est inchangé)
+    """Génère un rapport textuel complet pour copier-coller."""
     report_lines = ["Rapport Complet des Niveaux de Support/Résistance :\n"]
     title_map = {'H4': '--- Analyse 4 Heures (H4) ---', 'Daily': '--- Analyse Journalière (Daily) ---', 'Weekly': '--- Analyse Hebdomadaire (Weekly) ---'}
     for timeframe_key, df in results_dict.items():
@@ -103,7 +102,33 @@ def generate_text_report(results_dict):
             report_lines.append("\n")
     return "\n".join(report_lines)
 
-# --- INTERFACE UTILISATEUR (SIDEBAR) ---
+# NOUVELLE FONCTION : CRÉATION DU RAPPORT EN IMAGE
+def create_image_report(results_dict):
+    """Crée une image PNG à partir du dictionnaire de résultats."""
+    full_text = generate_text_report(results_dict)
+
+    try:
+        font = ImageFont.truetype("DejaVuSansMono.ttf", 12)
+    except IOError:
+        font = ImageFont.load_default()
+
+    temp_img = Image.new('RGB', (1, 1))
+    temp_draw = ImageDraw.Draw(temp_img)
+    text_bbox = temp_draw.multiline_textbbox((0, 0), full_text, font=font)
+    
+    padding = 25
+    width = text_bbox[2] + 2 * padding
+    height = text_bbox[3] + 2 * padding
+    
+    img = Image.new('RGB', (width, height), color=(20, 25, 35)) # Fond sombre
+    draw = ImageDraw.Draw(img)
+    draw.multiline_text((padding, padding), full_text, font=font, fill=(230, 230, 230)) # Texte clair
+    
+    output_buffer = BytesIO()
+    img.save(output_buffer, format="PNG")
+    return output_buffer.getvalue()
+
+# --- INTERFACE UTILISATEUR (SIDEBAR) (inchangée) ---
 with st.sidebar:
     st.header("1. Connexion")
     try:
@@ -153,31 +178,34 @@ if scan_button and symbols_to_scan:
                         res = resistances.iloc[0] if not resistances.empty else None
                         dist_s = (abs(current_price - sup['level']) / current_price) * 100 if sup is not None and current_price is not None else np.nan
                         dist_r = (abs(current_price - res['level']) / current_price) * 100 if res is not None and current_price is not None else np.nan
-                        results[timeframe.capitalize()].append({
-                            'Actif': symbol.replace('_', '/'), 
-                            'Prix Actuel': f"{current_price:.5f}" if current_price is not None else 'N/A',
-                            'Support': f"{sup['level']:.5f}" if sup is not None else 'N/A',
-                            'Force (S)': f"{int(sup['strength'])} touches" if sup is not None else 'N/A',
-                            'Dist. (S) %': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A',
-                            'Résistance': f"{res['level']:.5f}" if res is not None else 'N/A',
-                            'Force (R)': f"{int(res['strength'])} touches" if res is not None else 'N/A',
-                            'Dist. (R) %': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
-                        })
+                        results[timeframe.capitalize()].append({'Actif': symbol.replace('_', '/'), 'Prix Actuel': f"{current_price:.5f}" if current_price is not None else 'N/A', 'Support': f"{sup['level']:.5f}" if sup is not None else 'N/A', 'Force (S)': f"{int(sup['strength'])} touches" if sup is not None else 'N/A', 'Dist. (S) %': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A', 'Résistance': f"{res['level']:.5f}" if res is not None else 'N/A', 'Force (R)': f"{int(res['strength'])} touches" if res is not None else 'N/A', 'Dist. (R) %': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A'})
             progress_bar.empty()
-            # **MODIFICATION : Le message de succès est plus générique et le message de connexion a été retiré.**
             st.success("Scan terminé !")
             
             df_h4 = pd.DataFrame(results['H4'])
             df_daily = pd.DataFrame(results['Daily'])
             df_weekly = pd.DataFrame(results['Weekly'])
-            
-            # **MODIFICATION : Le titre de la section est plus générique.**
-            st.subheader("📋 Rapport Complet pour Analyse")
-            with st.expander("Cliquez ici pour voir et copier le rapport"):
-                report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
+            report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
+
+            # Section de rapport avec les DEUX options
+            st.subheader("📋 Options d'Exportation du Rapport")
+            with st.expander("Cliquez ici pour voir les options d'exportation"):
+                # Option 1: Texte
+                st.markdown("**1. Copier le Rapport Texte**")
                 report_text = generate_text_report(report_dict)
                 st.code(report_text, language="text")
 
+                # Option 2: Image
+                st.markdown("**2. Télécharger le Rapport Image**")
+                image_bytes = create_image_report(report_dict)
+                st.download_button(
+                    label="🖼️ Télécharger le Rapport (Image)",
+                    data=image_bytes,
+                    file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
+                    mime="image/png"
+                )
+
+            # Affichage des résultats (inchangé)
             st.divider()
             st.subheader("--- Analyse 4 Heures (H4) ---")
             st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
@@ -185,6 +213,7 @@ if scan_button and symbols_to_scan:
             st.dataframe(df_daily.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
             st.subheader("--- Analyse Hebdomadaire (Weekly) ---")
             st.dataframe(df_weekly.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
+
 elif not symbols_to_scan:
     st.info("Veuillez sélectionner des actifs à scanner ou cocher la case 'Scanner les 29 actifs'.")
 else:
