@@ -5,18 +5,16 @@ import requests
 from scipy.signal import find_peaks
 import numpy as np
 from datetime import datetime
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
-    page_title="Détecteur S/R Pro (H4, D, W)",
-    page_icon="💎",
+    page_title="Système de Trading S/R Pro",
+    page_icon="🎯",
     layout="wide"
 )
 
-st.title("💎 Détecteur de Zones de Support/Résistance Pro")
-st.markdown("Analyse des timeframes H4, Daily et Weekly avec un score de force pour chaque niveau.")
+st.title("🎯 Système de Trading S/R Pro")
+st.markdown("Identifie et classe les meilleures opportunités de trading par un score de confluence (Force + Proximité + Timeframe).")
 
 # --- Fonctions de l'API OANDA (inchangées) ---
 @st.cache_data(ttl=3600)
@@ -66,71 +64,57 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
     except requests.RequestException:
         return None
 
-# --- NOUVEL INDICATEUR DE S/R PROFESSIONNEL (inchangé) ---
+# --- MOTEUR D'ANALYSE PROFESSIONNEL ---
 def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
-    if df is None or df.empty or len(df) < 20:
-        return pd.DataFrame(), pd.DataFrame()
+    if df is None or df.empty or len(df) < 20: return pd.DataFrame(), pd.DataFrame()
     r_indices, _ = find_peaks(df['high'], distance=5)
     s_indices, _ = find_peaks(-df['low'], distance=5)
     pivots_high = df.iloc[r_indices]['high']
     pivots_low = df.iloc[s_indices]['low']
     all_pivots = pd.concat([pivots_high, pivots_low]).sort_values()
-    if all_pivots.empty:
-        return pd.DataFrame(), pd.DataFrame()
+    if all_pivots.empty: return pd.DataFrame(), pd.DataFrame()
     zones = []
     if not all_pivots.empty:
         current_zone = [all_pivots.iloc[0]]
         for price in all_pivots.iloc[1:]:
             zone_avg = np.mean(current_zone)
-            if abs(price - zone_avg) < (zone_avg * zone_percentage_width / 100):
-                current_zone.append(price)
-            else:
-                zones.append(list(current_zone))
-                current_zone = [price]
+            if abs(price - zone_avg) < (zone_avg * zone_percentage_width / 100): current_zone.append(price)
+            else: zones.append(list(current_zone)); current_zone = [price]
         zones.append(list(current_zone))
     strong_zones = []
     for zone in zones:
         if len(zone) >= min_touches:
-            level = np.mean(zone)
-            last_touch_date = all_pivots[all_pivots.isin(zone)].index.max()
-            strong_zones.append({'level': level, 'strength': len(zone), 'last_touch_date': last_touch_date})
-    if not strong_zones:
-        return pd.DataFrame(), pd.DataFrame()
+            strong_zones.append({'level': np.mean(zone), 'strength': len(zone)})
+    if not strong_zones: return pd.DataFrame(), pd.DataFrame()
     zones_df = pd.DataFrame(strong_zones).sort_values(by='level').reset_index(drop=True)
     last_price = df['close'].iloc[-1]
     supports = zones_df[zones_df['level'] < last_price].copy()
     resistances = zones_df[zones_df['level'] >= last_price].copy()
     return supports, resistances
 
-# --- Fonction de création d'image (inchangée) ---
-def create_image_report(results_dict):
-    full_text = ""
-    title_map = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journalière (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
-    for timeframe, df in results_dict.items():
-        full_text += title_map[timeframe] + "\n" + ("-"*80) + "\n"
-        df_display = df.rename(columns={'Force (S)': 'F(S)', 'Dist. (S) %': 'D(S)%', 'Force (R)': 'F(R)', 'Dist. (R) %': 'D(R)%'})
-        full_text += df_display.to_string(index=False) if not df.empty else "Aucune zone détectée."
-        full_text += "\n\n"
-    try:
-        font = ImageFont.truetype("DejaVuSansMono.ttf", 12)
-    except IOError:
-        font = ImageFont.load_default()
-    temp_img = Image.new('RGB', (1, 1))
-    temp_draw = ImageDraw.Draw(temp_img)
-    text_bbox = temp_draw.multiline_textbbox((0, 0), full_text, font=font)
-    padding = 20
-    width = text_bbox[2] + 2 * padding
-    height = text_bbox[3] + 2 * padding
-    img = Image.new('RGB', (width, height), color=(20, 25, 35))
-    draw = ImageDraw.Draw(img)
-    draw.multiline_text((padding, padding), full_text, font=font, fill=(230, 230, 230))
-    output_buffer = BytesIO()
-    img.save(output_buffer, format="PNG")
-    return output_buffer.getvalue()
+def calculate_confluence_score(strength, distance, timeframe):
+    """Calcule un score de pertinence pour une opportunité de trading."""
+    tf_weights = {'H4': 1.0, 'Daily': 1.5, 'Weekly': 2.5}
+    # Plus la force est grande, plus le score est élevé
+    # Plus la distance est petite, plus le score est élevé
+    # Le poids du timeframe multiplie l'importance
+    if distance < 0.01: distance = 0.01 # Pour éviter la division par zéro
+    score = (strength * tf_weights.get(timeframe, 1.0)) / distance
+    return score
 
-# --- Interface Utilisateur (Sidebar) (inchangée) ---
+def generate_text_report(df):
+    """Génère un rapport textuel pour copier-coller."""
+    report_lines = ["Rapport des Top Opportunités S/R :\n"]
+    for _, row in df.head(15).iterrows(): # Top 15
+        report_lines.append(
+            f"- **{row['Actif']} ({row['Timeframe']})** : {row['Type']} à **{row['Niveau']:.5f}**, "
+            f"Force: {row['Force']}, Distance: {row['Distance (%)']}"
+        )
+    return "\n".join(report_lines)
+
+# --- INTERFACE UTILISATEUR (SIDEBAR) ---
 with st.sidebar:
-    st.header("Connexion OANDA")
+    st.header("1. Connexion")
     try:
         access_token = st.secrets["OANDA_ACCESS_TOKEN"]
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
@@ -138,88 +122,79 @@ with st.sidebar:
     except:
         access_token, account_id = None, None
         st.error("Secrets OANDA non trouvés.")
-    st.header("Sélection des Actifs")
-    all_symbols = sorted(["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD", "EUR_GBP", "EUR_JPY"])
-    symbols_to_scan = st.multiselect("Choisissez les actifs", options=all_symbols, default=["XAU_USD", "EUR_USD", "GBP_USD"])
-    st.header("Paramètres de Détection Pro")
-    zone_width = st.slider(
-        "Largeur de zone (%)", 0.1, 2.0, 0.4, 0.1,
-        help="Pourcentage du prix pour regrouper les pivots. Plus la valeur est grande, plus les zones sont larges."
-    )
-    min_touches = st.slider(
-        "Force minimale (touches)", 2, 10, 3, 1,
-        help="Nombre minimum de contacts avec une zone pour la considérer comme valide."
-    )
+
+    st.header("2. Sélection des Actifs")
+    all_symbols = sorted(["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD", "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_NZD", "EUR_CAD", "EUR_CHF", "GBP_JPY", "GBP_AUD", "GBP_NZD", "GBP_CAD", "GBP_CHF", "AUD_NZD", "AUD_CAD", "AUD_CHF", "AUD_JPY", "NZD_CAD", "NZD_CHF", "NZD_JPY", "CAD_CHF", "CAD_JPY", "CHF_JPY"])
+    default_selection = sorted(["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "EUR_JPY", "GBP_JPY"])
+    symbols_to_scan = st.multiselect("Choisissez les actifs", options=all_symbols, default=default_selection)
+
+    st.header("3. Paramètres de Détection")
+    zone_width = st.slider("Largeur de zone (%)", 0.1, 2.0, 0.4, 0.1, help="Largeur de la zone pour regrouper les pivots.")
+    min_touches = st.slider("Force minimale (touches)", 2, 10, 3, 1, help="Nombre de contacts minimum pour valider une zone.")
+
     scan_button = st.button("🚀 Lancer l'Analyse", type="primary", use_container_width=True)
 
-# --- Logique Principale ---
-if not access_token or not account_id:
-    st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans les secrets de Streamlit.")
-elif scan_button and symbols_to_scan:
-    base_url, env_name = determine_oanda_environment(access_token, account_id)
-    if not base_url:
-        st.error("Impossible de valider vos identifiants OANDA. Vérifiez vos secrets.")
+# --- LOGIQUE PRINCIPALE ---
+if scan_button and symbols_to_scan:
+    if not access_token or not account_id:
+        st.warning("Veuillez configurer vos secrets OANDA pour lancer l'analyse.")
     else:
-        results = {'H4': [], 'Daily': [], 'Weekly': []}
-        timeframes = ['h4', 'daily', 'weekly']
-        progress_bar = st.progress(0, text="Initialisation...")
-        total_steps = len(symbols_to_scan) * len(timeframes)
-        
-        for i, symbol in enumerate(symbols_to_scan):
-            current_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
-            for j, timeframe in enumerate(timeframes):
-                progress_step = i * len(timeframes) + j + 1
-                progress_text = f"Analyse... ({progress_step}/{total_steps}) {symbol.replace('_', '/')} - {timeframe.upper()}"
-                progress_bar.progress(progress_step / total_steps, text=progress_text)
-                df = get_oanda_data(base_url, access_token, symbol, timeframe, limit=500)
-                
-                if df is not None and not df.empty:
-                    supports, resistances = find_strong_sr_zones(df, zone_percentage_width=zone_width, min_touches=min_touches)
-                    
-                    sup = supports.iloc[-1] if not supports.empty else None
-                    res = resistances.iloc[0] if not resistances.empty else None
-                    
-                    # --- CORRECTION APPLIQUÉE ICI ---
-                    # On utilise "is not None" pour éviter l'erreur d'ambiguïté de Pandas
-                    dist_s = (abs(current_price - sup['level']) / current_price) * 100 if sup is not None and current_price is not None else np.nan
-                    dist_r = (abs(current_price - res['level']) / current_price) * 100 if res is not None and current_price is not None else np.nan
-                    
-                    results[timeframe.capitalize()].append({
-                        'Actif': symbol.replace('_', '/'), 
-                        'Prix Actuel': f"{current_price:.5f}" if current_price is not None else 'N/A',
-                        'Support': f"{sup['level']:.5f}" if sup is not None else 'N/A',
-                        'Force (S)': f"{sup['strength']} touches" if sup is not None else 'N/A',
-                        'Dist. (S) %': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A',
-                        'Résistance': f"{res['level']:.5f}" if res is not None else 'N/A',
-                        'Force (R)': f"{res['strength']} touches" if res is not None else 'N/A',
-                        'Dist. (R) %': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
-                    })
-        
-        progress_bar.empty()
-        st.success(f"Analyse terminée sur l'environnement : {env_name}")
-        df_h4_results = pd.DataFrame(results['H4'])
-        df_daily_results = pd.DataFrame(results['Daily'])
-        df_weekly_results = pd.DataFrame(results['Weekly'])
-        results_for_image = {'H4': df_h4_results, 'Daily': df_daily_results, 'Weekly': df_weekly_results}
-        
-        if any(not df.empty for df in results_for_image.values()):
-            st.divider()
-            image_bytes = create_image_report(results_for_image)
-            st.download_button(
-                label="🖼️ Télécharger le Rapport Complet (Image)",
-                data=image_bytes,
-                file_name=f"rapport_sr_pro_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
-                mime='image/png',
-                use_container_width=True
-            )
-        
-        title_map = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journalière (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
-        for label, df_data in [('H4', df_h4_results), ('Daily', df_daily_results), ('Weekly', df_weekly_results)]:
-            st.subheader(title_map[label])
-            if not df_data.empty:
-                df_res = df_data.sort_values(by='Actif').reset_index(drop=True)
-                st.dataframe(df_res, use_container_width=True, hide_index=True)
+        base_url, env_name = determine_oanda_environment(access_token, account_id)
+        if not base_url:
+            st.error("Impossible de valider vos identifiants OANDA. Vérifiez vos secrets.")
+        else:
+            all_opportunities = []
+            timeframes = ['h4', 'daily', 'weekly']
+            progress_bar = st.progress(0, text="Initialisation...")
+            st.success(f"Connecté à l'environnement OANDA : {env_name}")
+
+            for i, symbol in enumerate(symbols_to_scan):
+                # OPTIMISATION : Obtenir le prix une seule fois par symbole
+                current_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
+                if current_price is None: continue
+
+                for j, timeframe in enumerate(timeframes):
+                    progress_step = (i * len(timeframes) + j) / (len(symbols_to_scan) * len(timeframes))
+                    progress_bar.progress(progress_step, text=f"Analyse : {symbol.replace('_','/')} ({timeframe.upper()})")
+
+                    df = get_oanda_data(base_url, access_token, symbol, timeframe, limit=500)
+                    if df is not None and not df.empty:
+                        supports, resistances = find_strong_sr_zones(df, zone_percentage_width=zone_width, min_touches=min_touches)
+
+                        for _, s_row in supports.iterrows():
+                            distance = (current_price - s_row['level']) / current_price * 100
+                            all_opportunities.append({
+                                'Actif': symbol.replace('_','/'), 'Timeframe': timeframe.upper(), 'Type': 'Support 📈',
+                                'Niveau': s_row['level'], 'Force': int(s_row['strength']), 'Distance (%)': f"{distance:.2f}%",
+                                'Score': calculate_confluence_score(s_row['strength'], distance, timeframe.upper())
+                            })
+                        for _, r_row in resistances.iterrows():
+                            distance = (r_row['level'] - current_price) / current_price * 100
+                            all_opportunities.append({
+                                'Actif': symbol.replace('_','/'), 'Timeframe': timeframe.upper(), 'Type': 'Résistance 📉',
+                                'Niveau': r_row['level'], 'Force': int(r_row['strength']), 'Distance (%)': f"{distance:.2f}%",
+                                'Score': calculate_confluence_score(r_row['strength'], distance, timeframe.upper())
+                            })
+            
+            progress_bar.progress(1.0, text="Analyse terminée !")
+
+            if not all_opportunities:
+                st.info("Aucune opportunité correspondant à vos critères n'a été trouvée.")
             else:
-                st.info(f"Aucune zone de S/R suffisamment forte n'a été trouvée pour cette unité de temps.")
+                results_df = pd.DataFrame(all_opportunities)
+                results_df = results_df.sort_values(by='Score', ascending=False).reset_index(drop=True)
+                
+                st.subheader("🏆 Top Opportunités de Trading (Classées par Score)")
+                st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+                st.subheader("📋 Rapport pour Analyse Approfondie avec Gemini")
+                with st.expander("Cliquez ici pour voir et copier le rapport"):
+                    report_text = generate_text_report(results_df)
+                    st.code(report_text, language="markdown")
+                
+                st.success("Analyse terminée. Les meilleures opportunités sont en haut du tableau.")
+
+elif not symbols_to_scan:
+    st.info("Veuillez sélectionner au moins un actif dans la barre latérale.")
 else:
     st.info("Cliquez sur 'Lancer l'Analyse' pour commencer.")
