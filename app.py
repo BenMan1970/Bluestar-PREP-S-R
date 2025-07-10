@@ -6,20 +6,19 @@ from scipy.signal import find_peaks
 import numpy as np
 from datetime import datetime
 from io import BytesIO
-
-# L'UNIQUE IMPORT NÉCESSAIRE POUR L'IMAGE
 from PIL import Image, ImageDraw, ImageFont
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
-    page_title="Détecteur S/R Forex & Or",
-    page_icon="📈",
+    page_title="Détecteur S/R Pro (H4, D, W)",
+    page_icon="💎",
     layout="wide"
 )
 
-st.title("📈 Détecteur de Supports & Résistances")
+st.title("💎 Détecteur de Zones de Support/Résistance Pro")
+st.markdown("Analyse des timeframes H4, Daily et Weekly avec un score de force pour chaque niveau.")
 
-# --- Fonctions Logiques (inchangées) ---
+# --- Fonctions de l'API OANDA (inchangées) ---
 @st.cache_data(ttl=3600)
 def determine_oanda_environment(access_token, account_id):
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -29,35 +28,27 @@ def determine_oanda_environment(access_token, account_id):
             response = requests.get(f"{url}/v3/accounts/{account_id}/summary", headers=headers, timeout=5)
             if response.status_code == 200:
                 return url, name
-        except:
+        except requests.RequestException:
             continue
     return None, None
 
 @st.cache_data(ttl=600)
-def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=300):
+def get_oanda_data(base_url, access_token, symbol, timeframe='daily', limit=500):
     url = f"{base_url}/v3/instruments/{symbol}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"count": limit, "granularity": {'daily': 'D', 'weekly': 'W'}[timeframe], "price": "M"}
+    # **MODIFICATION : Ajout du H4**
+    params = {"count": limit, "granularity": {'h4': 'H4', 'daily': 'D', 'weekly': 'W'}[timeframe], "price": "M"}
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
         if not data.get('candles'): return None
         candles = [{'date': pd.to_datetime(c['time']), 'open': float(c['mid']['o']), 'high': float(c['mid']['h']),
                     'low': float(c['mid']['l']), 'close': float(c['mid']['c']), 'volume': int(c['volume'])}
                    for c in data.get('candles', []) if c.get('complete')]
-        return pd.DataFrame(candles)
-    except:
+        return pd.DataFrame(candles).set_index('date')
+    except requests.RequestException:
         return None
-
-def find_pivots(df, left_bars, right_bars):
-    if df is None or df.empty: return None, None
-    distance = left_bars + right_bars
-    r_indices, _ = find_peaks(df['high'], distance=distance)
-    s_indices, _ = find_peaks(-df['low'], distance=distance)
-    resistances = df.iloc[r_indices][['date', 'high']].rename(columns={'high': 'level'})
-    supports = df.iloc[s_indices][['date', 'low']].rename(columns={'low': 'level'})
-    return supports, resistances
 
 @st.cache_data(ttl=15)
 def get_oanda_current_price(base_url, access_token, account_id, symbol):
@@ -65,7 +56,7 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"instruments": symbol}
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=5)
         response.raise_for_status()
         data = response.json()
         if 'prices' in data and data.get('prices'):
@@ -73,149 +64,209 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
             ask = float(data['prices'][0]['closeoutAsk'])
             return (bid + ask) / 2
         return None
-    except:
+    except requests.RequestException:
         return None
 
-### FONCTION DE CRÉATION D'IMAGE SIMPLE ET FIABLE ###
-def create_simple_image_report(daily_df, weekly_df):
-    """Crée une image simple à partir du texte des DataFrames."""
+# --- NOUVEL INDICATEUR DE S/R PROFESSIONNEL ---
+def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
+    """
+    Détecte les zones de Support et de Résistance robustes en se basant sur le clustering de pivots et leur force.
+    """
+    if df is None or df.empty or len(df) < 20:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # 1. Trouver tous les pivots initiaux (hauts et bas)
+    r_indices, _ = find_peaks(df['high'], distance=5)
+    s_indices, _ = find_peaks(-df['low'], distance=5)
     
-    # Préparer le texte des rapports
-    daily_text = "Analyse Dailière (Daily)\n" + ("-"*50) + "\n"
-    daily_text += daily_df.to_string(index=False) if not daily_df.empty else "Aucune donnée."
+    pivots_high = df.iloc[r_indices]['high']
+    pivots_low = df.iloc[s_indices]['low']
+    all_pivots = pd.concat([pivots_high, pivots_low]).sort_values()
 
-    weekly_text = "Analyse Hebdomadaire (Weekly)\n" + ("-"*50) + "\n"
-    weekly_text += weekly_df.to_string(index=False) if not weekly_df.empty else "Aucune donnée."
+    if all_pivots.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-    full_text = daily_text + "\n\n" + weekly_text
+    # 2. Grouper les pivots en zones en fonction de leur proximité
+    zones = []
+    if not all_pivots.empty:
+        current_zone = [all_pivots.iloc[0]]
+        for price in all_pivots.iloc[1:]:
+            zone_avg = np.mean(current_zone)
+            if abs(price - zone_avg) < (zone_avg * zone_percentage_width / 100):
+                current_zone.append(price)
+            else:
+                zones.append(list(current_zone))
+                current_zone = [price]
+        zones.append(list(current_zone))
 
-    # Utiliser une police de base qui est toujours disponible
+    # 3. Calculer la force et le niveau moyen de chaque zone, et filtrer
+    strong_zones = []
+    for zone in zones:
+        if len(zone) >= min_touches:
+            level = np.mean(zone)
+            # Trouver la date de la dernière touche dans cette zone
+            last_touch_date = all_pivots[all_pivots.isin(zone)].index.max()
+            strong_zones.append({
+                'level': level,
+                'strength': len(zone),
+                'last_touch_date': last_touch_date
+            })
+    
+    if not strong_zones:
+        return pd.DataFrame(), pd.DataFrame()
+        
+    zones_df = pd.DataFrame(strong_zones).sort_values(by='level').reset_index(drop=True)
+
+    # 4. Séparer en Supports et Résistances par rapport au dernier prix
+    last_price = df['close'].iloc[-1]
+    supports = zones_df[zones_df['level'] < last_price].copy()
+    resistances = zones_df[zones_df['level'] >= last_price].copy()
+    
+    return supports, resistances
+
+
+def create_image_report(results_dict):
+    """Crée une image simple à partir du dictionnaire de résultats."""
+    full_text = ""
+    title_map = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journalière (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
+    
+    for timeframe, df in results_dict.items():
+        full_text += title_map[timeframe] + "\n" + ("-"*80) + "\n"
+        # Renommer les colonnes pour une meilleure lisibilité dans l'image
+        df_display = df.rename(columns={'Force (S)': 'F(S)', 'Dist. (S) %': 'D(S)%', 'Force (R)': 'F(R)', 'Dist. (R) %': 'D(R)%'})
+        full_text += df_display.to_string(index=False) if not df.empty else "Aucune zone détectée."
+        full_text += "\n\n"
+
     try:
         font = ImageFont.truetype("DejaVuSansMono.ttf", 12)
     except IOError:
-        font = ImageFont.load_default() # Plan B, toujours fonctionnel
+        font = ImageFont.load_default()
 
-    # Créer une image temporaire pour mesurer la taille du texte
     temp_img = Image.new('RGB', (1, 1))
     temp_draw = ImageDraw.Draw(temp_img)
     text_bbox = temp_draw.multiline_textbbox((0, 0), full_text, font=font)
     
-    # Calculer la taille de l'image finale avec un peu de marge
     padding = 20
     width = text_bbox[2] + 2 * padding
     height = text_bbox[3] + 2 * padding
     
-    # Créer l'image finale et dessiner le texte
-    img = Image.new('RGB', (width, height), color='white')
+    img = Image.new('RGB', (width, height), color=(20, 25, 35))
     draw = ImageDraw.Draw(img)
-    draw.multiline_text((padding, padding), full_text, font=font, fill='black')
+    draw.multiline_text((padding, padding), full_text, font=font, fill=(230, 230, 230))
     
-    # Sauvegarder l'image en mémoire
     output_buffer = BytesIO()
     img.save(output_buffer, format="PNG")
     return output_buffer.getvalue()
 
 
-# --- Interface Utilisateur (Sidebar) (inchangée) ---
+# --- Interface Utilisateur (Sidebar) ---
 with st.sidebar:
-    st.header("Paramètres")
+    st.header("Connexion OANDA")
     try:
         access_token = st.secrets["OANDA_ACCESS_TOKEN"]
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
+        st.success("Secrets OANDA chargés.")
     except:
         access_token, account_id = None, None
+        st.error("Secrets OANDA non trouvés.")
 
     st.header("Sélection des Actifs")
-    all_available_symbols = sorted(list(set([
-        "XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD",
-        "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_NZD", "EUR_CAD", "EUR_CHF", "GBP_JPY", "GBP_AUD",
-        "GBP_NZD", "GBP_CAD", "GBP_CHF", "AUD_NZD", "AUD_CAD", "AUD_CHF", "AUD_JPY", "NZD_CAD",
-        "NZD_CHF", "NZD_JPY", "CAD_CHF", "CAD_JPY", "CHF_JPY"
-    ])))
-    
-    symbols_to_scan = st.multiselect("Choisissez les actifs", 
-                                     options=all_available_symbols, 
-                                     default=all_available_symbols)
+    all_symbols = sorted(["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD", "EUR_GBP", "EUR_JPY"])
+    symbols_to_scan = st.multiselect("Choisissez les actifs", options=all_symbols, default=["XAU_USD", "EUR_USD", "GBP_USD"])
 
-    st.header("Paramètres de Détection")
-    left_bars = st.slider("Left Bars (gauche)", 1, 50, 15)
-    right_bars = st.slider("Right Bars (droite)", 1, 50, 15)
+    st.header("Paramètres de Détection Pro")
+    zone_width = st.slider(
+        "Largeur de zone (%)", 0.1, 2.0, 0.4, 0.1,
+        help="Pourcentage du prix pour regrouper les pivots. Plus la valeur est grande, plus les zones sont larges."
+    )
+    min_touches = st.slider(
+        "Force minimale (touches)", 2, 10, 3, 1,
+        help="Nombre minimum de contacts avec une zone pour la considérer comme valide."
+    )
     
-    scan_button = st.button("Lancer l'Analyse", type="primary", use_container_width=True)
+    scan_button = st.button("🚀 Lancer l'Analyse", type="primary", use_container_width=True)
 
 # --- Logique Principale ---
 if not access_token or not account_id:
-    st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans `secrets.toml`.")
-else:
+    st.warning("Veuillez configurer `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` dans les secrets de Streamlit.")
+elif scan_button and symbols_to_scan:
     base_url, env_name = determine_oanda_environment(access_token, account_id)
     if not base_url:
-        st.error("Impossible de valider vos identifiants OANDA. Vérifiez `secrets.toml`.")
-    elif scan_button and symbols_to_scan:
-        results = {'Daily': [], 'Weekly': []}
-        failed_symbols = []
+        st.error("Impossible de valider vos identifiants OANDA. Vérifiez vos secrets.")
+    else:
+        # **MODIFICATION : Ajout de 'H4'**
+        results = {'H4': [], 'Daily': [], 'Weekly': []}
+        timeframes = ['h4', 'daily', 'weekly']
+        
         progress_bar = st.progress(0, text="Initialisation...")
-        total_steps = len(symbols_to_scan) * 2
+        total_steps = len(symbols_to_scan) * len(timeframes)
         
         for i, symbol in enumerate(symbols_to_scan):
-            data_fetched = False
             current_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
             
-            for j, timeframe in enumerate(['daily', 'weekly']):
-                progress_step = i * 2 + j + 1
-                label = timeframe.capitalize()
-                progress_text = f"Analyse... ({progress_step}/{total_steps}) {symbol.replace('_', '/')} - {label}"
+            for j, timeframe in enumerate(timeframes):
+                progress_step = i * len(timeframes) + j + 1
+                progress_text = f"Analyse... ({progress_step}/{total_steps}) {symbol.replace('_', '/')} - {timeframe.upper()}"
                 progress_bar.progress(progress_step / total_steps, text=progress_text)
-                df = get_oanda_data(base_url, access_token, symbol, timeframe, limit=300)
+                
+                # Utiliser l'index basé sur la date
+                df = get_oanda_data(base_url, access_token, symbol, timeframe, limit=500)
                 
                 if df is not None and not df.empty:
-                    data_fetched = True
-                    supports, resistances = find_pivots(df, left_bars, right_bars)
-                    last_s = supports.iloc[-1] if supports is not None and not supports.empty else None
-                    last_r = resistances.iloc[-1] if resistances is not None and not resistances.empty else None
-                    dist_s = (abs(current_price - last_s['level']) / current_price) * 100 if last_s is not None and current_price else np.nan
-                    dist_r = (abs(current_price - last_r['level']) / current_price) * 100 if last_r is not None and current_price else np.nan
+                    # **MODIFICATION : Appel au nouvel indicateur**
+                    supports, resistances = find_strong_sr_zones(df, zone_percentage_width=zone_width, min_touches=min_touches)
                     
-                    results[label].append({
-                        'Actif': symbol.replace('_', '/'), 'Prix Actuel': f"{current_price:.5f}" if current_price else 'N/A',
-                        'Support': f"{last_s['level']:.5f}" if last_s is not None else 'N/A',
-                        'Date (S)': last_s['date'].strftime('%Y-%m-%d') if last_s is not None else 'N/A',
+                    # On prend le support le plus proche et la résistance la plus proche
+                    sup = supports.iloc[-1] if not supports.empty else None
+                    res = resistances.iloc[0] if not resistances.empty else None
+                    
+                    dist_s = (abs(current_price - sup['level']) / current_price) * 100 if sup and current_price else np.nan
+                    dist_r = (abs(current_price - res['level']) / current_price) * 100 if res and current_price else np.nan
+                    
+                    # **MODIFICATION : Ajout de la colonne "Force"**
+                    results[timeframe.capitalize()].append({
+                        'Actif': symbol.replace('_', '/'), 
+                        'Prix Actuel': f"{current_price:.5f}" if current_price else 'N/A',
+                        'Support': f"{sup['level']:.5f}" if sup else 'N/A',
+                        'Force (S)': f"{sup['strength']} touches" if sup else 'N/A',
                         'Dist. (S) %': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A',
-                        'Résistance': f"{last_r['level']:.5f}" if last_r is not None else 'N/A',
-                        'Date (R)': last_r['date'].strftime('%Y-%m-%d') if last_r is not None else 'N/A',
+                        'Résistance': f"{res['level']:.5f}" if res else 'N/A',
+                        'Force (R)': f"{res['strength']} touches" if res else 'N/A',
                         'Dist. (R) %': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
                     })
-            if not data_fetched: failed_symbols.append(symbol.replace('_', '/'))
 
         progress_bar.empty()
-        st.success("Analyse terminée !")
-        if failed_symbols:
-            st.warning(f"**Données non trouvées pour :** {', '.join(sorted(failed_symbols))}.")
-            
+        st.success(f"Analyse terminée sur l'environnement : {env_name}")
+        
+        df_h4_results = pd.DataFrame(results['H4'])
         df_daily_results = pd.DataFrame(results['Daily'])
         df_weekly_results = pd.DataFrame(results['Weekly'])
 
-        ### SECTION DE TÉLÉCHARGEMENT SIMPLE ###
-        if not df_daily_results.empty or not df_weekly_results.empty:
+        results_for_image = {
+            'H4': df_h4_results,
+            'Daily': df_daily_results,
+            'Weekly': df_weekly_results
+        }
+        
+        if any(not df.empty for df in results_for_image.values()):
             st.divider()
-            
-            # Générer l'image en mémoire avec la nouvelle fonction simple
-            image_bytes = create_simple_image_report(df_daily_results, df_weekly_results)
-            
+            image_bytes = create_image_report(results_for_image)
             st.download_button(
-                label="🖼️ Télécharger les résultats (Image)",
+                label="🖼️ Télécharger le Rapport Complet (Image)",
                 data=image_bytes,
-                file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
+                file_name=f"rapport_sr_pro_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
                 mime='image/png',
                 use_container_width=True
             )
         
-        # --- Affichage des résultats (inchangé) ---
-        for label, df_data in [('Daily', df_daily_results), ('Weekly', df_weekly_results)]:
-            st.subheader(f"Analyse {label.lower().replace('y', 'ière')} ({label})")
+        # --- Affichage des résultats ---
+        title_map = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journalière (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
+        for label, df_data in [('H4', df_h4_results), ('Daily', df_daily_results), ('Weekly', df_weekly_results)]:
+            st.subheader(title_map[label])
             if not df_data.empty:
                 df_res = df_data.sort_values(by='Actif').reset_index(drop=True)
-                table_height = (len(df_res) + 1) * 35
-                st.dataframe(df_res, use_container_width=True, hide_index=True, height=table_height)
+                st.dataframe(df_res, use_container_width=True, hide_index=True)
             else:
-                st.info(f"Aucun résultat pour l'analyse {label.lower().replace('y', 'ière')}.")
-    
+                st.info(f"Aucune zone de S/R suffisamment forte n'a été trouvée pour cette unité de temps.")
+else:
+    st.info("Cliquez sur 'Lancer l'Analyse' pour commencer.")
