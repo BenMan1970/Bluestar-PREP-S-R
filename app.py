@@ -62,9 +62,14 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
         return None
     except requests.RequestException: return None
 
-# --- MOTEUR D'ANALYSE PROFESSIONNEL (inchangé) ---
-def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
-    if df is None or df.empty or len(df) < 20: return pd.DataFrame(), pd.DataFrame()
+# --- MOTEUR D'ANALYSE PROFESSIONNEL (corrigé) ---
+
+# MODIFICATION 1: La signature de la fonction accepte 'current_price' et la logique de séparation a été corrigée.
+def find_strong_sr_zones(df, current_price, zone_percentage_width=0.5, min_touches=2):
+    # Ajout d'une vérification pour s'assurer que current_price n'est pas None
+    if df is None or df.empty or len(df) < 20 or current_price is None:
+        return pd.DataFrame(), pd.DataFrame()
+        
     r_indices, _ = find_peaks(df['high'], distance=5)
     s_indices, _ = find_peaks(-df['low'], distance=5)
     pivots_high = df.iloc[r_indices]['high']
@@ -85,14 +90,15 @@ def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
             strong_zones.append({'level': np.mean(zone), 'strength': len(zone)})
     if not strong_zones: return pd.DataFrame(), pd.DataFrame()
     zones_df = pd.DataFrame(strong_zones).sort_values(by='level').reset_index(drop=True)
-    last_price = df['close'].iloc[-1]
-    supports = zones_df[zones_df['level'] < last_price].copy()
-    resistances = zones_df[zones_df['level'] >= last_price].copy()
+    
+    # Correction logique : On utilise le 'current_price' pour séparer les supports des résistances.
+    supports = zones_df[zones_df['level'] < current_price].copy()
+    resistances = zones_df[zones_df['level'] >= current_price].copy()
+    
     return supports, resistances
 
 # --- Fonctions de Création de Rapport ---
 
-# Classe PDF personnalisée
 class PDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 15)
@@ -132,7 +138,6 @@ class PDF(FPDF):
                 self.cell(col_widths.get(col_name, 20), 6, str(row[col_name]), 1, 0, 'C')
             self.ln()
 
-# FONCTION CORRIGÉE
 def create_pdf_report(results_dict):
     """Crée un rapport PDF à partir du dictionnaire de résultats."""
     pdf = PDF('L', 'mm', 'A4')
@@ -145,11 +150,9 @@ def create_pdf_report(results_dict):
         pdf.chapter_body(df)
         pdf.ln(10)
 
-    # CORRECTION : On convertit explicitement le 'bytearray' retourné par fpdf2 en 'bytes'
-    # pour le rendre compatible avec st.download_button.
+    # On convertit le 'bytearray' retourné par fpdf2 en 'bytes' pour Streamlit.
     return bytes(pdf.output())
 
-# Fonction de création CSV (inchangée et correcte)
 def create_csv_report(results_dict):
     """Combine tous les résultats dans un seul DataFrame et le retourne en CSV."""
     all_dfs = []
@@ -160,7 +163,7 @@ def create_csv_report(results_dict):
             all_dfs.append(df_copy)
     
     if not all_dfs:
-        return ""
+        return b"" # Retourne des bytes vides
 
     full_df = pd.concat(all_dfs, ignore_index=True)
     cols = ['Timeframe'] + [col for col in full_df.columns if col != 'Timeframe']
@@ -203,7 +206,6 @@ if scan_button and symbols_to_scan:
         if not base_url:
             st.error("Impossible de valider vos identifiants OANDA. Vérifiez vos secrets.")
         else:
-            # Code de scan (inchangé)
             results = {'H4': [], 'Daily': [], 'Weekly': []}
             timeframes = ['h4', 'daily', 'weekly']
             progress_bar = st.progress(0, text="Initialisation...")
@@ -216,7 +218,9 @@ if scan_button and symbols_to_scan:
                     progress_bar.progress(progress_step / total_steps, text=progress_text)
                     df = get_oanda_data(base_url, access_token, symbol, timeframe, limit=500)
                     if df is not None and not df.empty:
-                        supports, resistances = find_strong_sr_zones(df, zone_percentage_width=zone_width, min_touches=min_touches)
+                        # MODIFICATION 2: On passe le 'current_price' pour une classification cohérente.
+                        supports, resistances = find_strong_sr_zones(df, current_price, zone_percentage_width=zone_width, min_touches=min_touches)
+                        
                         sup = supports.iloc[-1] if not supports.empty else None
                         res = resistances.iloc[0] if not resistances.empty else None
                         dist_s = (abs(current_price - sup['level']) / current_price) * 100 if sup is not None and current_price is not None else np.nan
@@ -230,7 +234,6 @@ if scan_button and symbols_to_scan:
             df_weekly = pd.DataFrame(results['Weekly'])
             report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
 
-            # Section de téléchargement (inchangée)
             st.subheader("📋 Options d'Exportation du Rapport")
             with st.expander("Cliquez ici pour télécharger les résultats"):
                 
@@ -256,7 +259,7 @@ if scan_button and symbols_to_scan:
                         use_container_width=True
                     )
 
-            # Affichage des résultats (inchangé)
+
             st.divider()
             st.subheader("--- Analyse 4 Heures (H4) ---")
             st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
