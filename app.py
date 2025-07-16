@@ -6,7 +6,7 @@ from scipy.signal import find_peaks
 import numpy as np
 from datetime import datetime
 from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont # Imports nécessaires pour l'image
+from fpdf import FPDF # NOUVEL IMPORT pour la génération de PDF
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
@@ -91,42 +91,87 @@ def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
     return supports, resistances
 
 # --- Fonctions de Création de Rapport ---
-def generate_text_report(results_dict):
-    """Génère un rapport textuel complet pour copier-coller."""
-    report_lines = ["Rapport Complet des Niveaux de Support/Résistance :\n"]
-    title_map = {'H4': '--- Analyse 4 Heures (H4) ---', 'Daily': '--- Analyse Journalière (Daily) ---', 'Weekly': '--- Analyse Hebdomadaire (Weekly) ---'}
+
+# NOUVELLE FONCTION : CRÉATION DU RAPPORT EN PDF
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Helvetica', 'B', 15)
+        self.cell(0, 10, 'Rapport de Scan Support/Résistance', 0, 1, 'C')
+        self.set_font('Helvetica', '', 8)
+        self.cell(0, 10, f"Généré le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", 0, 1, 'C')
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Helvetica', 'I', 8)
+        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+
+    def chapter_title(self, title):
+        self.set_font('Helvetica', 'B', 12)
+        self.cell(0, 10, title, 0, 1, 'L')
+        self.ln(4)
+
+    def chapter_body(self, df):
+        if df.empty:
+            self.set_font('Helvetica', '', 10)
+            self.multi_cell(0, 10, "Aucune donnée à afficher pour ce timeframe.")
+            self.ln()
+            return
+
+        self.set_font('Helvetica', 'B', 8)
+        # Calculer la largeur des colonnes
+        col_widths = {'Actif': 25, 'Prix Actuel': 25, 'Support': 25, 'Force (S)': 25,
+                      'Dist. (S) %': 20, 'Résistance': 25, 'Force (R)': 25, 'Dist. (R) %': 20}
+        
+        # En-têtes de tableau
+        for col_name in df.columns:
+            self.cell(col_widths.get(col_name, 20), 7, col_name, 1, 0, 'C')
+        self.ln()
+        
+        # Données du tableau
+        self.set_font('Helvetica', '', 7)
+        for index, row in df.iterrows():
+            for col_name in df.columns:
+                self.cell(col_widths.get(col_name, 20), 6, str(row[col_name]), 1, 0, 'C')
+            self.ln()
+
+def create_pdf_report(results_dict):
+    """Crée un rapport PDF à partir du dictionnaire de résultats."""
+    pdf = PDF('L', 'mm', 'A4') # L for Landscape (paysage) pour plus de place
+    pdf.add_page()
+    
+    title_map = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journalière (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
+
     for timeframe_key, df in results_dict.items():
+        pdf.chapter_title(title_map[timeframe_key])
+        pdf.chapter_body(df)
+        pdf.ln(10)
+
+    # Retourne les données binaires du PDF
+    return pdf.output(dest='S').encode('latin-1')
+
+# NOUVELLE FONCTION : CRÉATION DU RAPPORT EN CSV
+def create_csv_report(results_dict):
+    """Combine tous les résultats dans un seul DataFrame et le retourne en CSV."""
+    all_dfs = []
+    for timeframe, df in results_dict.items():
         if not df.empty:
-            report_lines.append(title_map[timeframe_key])
-            report_lines.append(df.to_string(index=False))
-            report_lines.append("\n")
-    return "\n".join(report_lines)
-
-# NOUVELLE FONCTION : CRÉATION DU RAPPORT EN IMAGE
-def create_image_report(results_dict):
-    """Crée une image PNG à partir du dictionnaire de résultats."""
-    full_text = generate_text_report(results_dict)
-
-    try:
-        font = ImageFont.truetype("DejaVuSansMono.ttf", 12)
-    except IOError:
-        font = ImageFont.load_default()
-
-    temp_img = Image.new('RGB', (1, 1))
-    temp_draw = ImageDraw.Draw(temp_img)
-    text_bbox = temp_draw.multiline_textbbox((0, 0), full_text, font=font)
+            df_copy = df.copy()
+            df_copy['Timeframe'] = timeframe # Ajoute une colonne pour identifier le timeframe
+            all_dfs.append(df_copy)
     
-    padding = 25
-    width = text_bbox[2] + 2 * padding
-    height = text_bbox[3] + 2 * padding
+    if not all_dfs:
+        return "" # Retourne une chaîne vide si aucune donnée
+
+    full_df = pd.concat(all_dfs, ignore_index=True)
+    # Réorganiser les colonnes pour mettre 'Timeframe' en premier
+    cols = ['Timeframe'] + [col for col in full_df.columns if col != 'Timeframe']
+    full_df = full_df[cols]
     
-    img = Image.new('RGB', (width, height), color=(20, 25, 35)) # Fond sombre
-    draw = ImageDraw.Draw(img)
-    draw.multiline_text((padding, padding), full_text, font=font, fill=(230, 230, 230)) # Texte clair
-    
-    output_buffer = BytesIO()
-    img.save(output_buffer, format="PNG")
-    return output_buffer.getvalue()
+    # Convertir en CSV dans un buffer en mémoire
+    csv_buffer = BytesIO()
+    full_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+    return csv_buffer.getvalue()
 
 # --- INTERFACE UTILISATEUR (SIDEBAR) (inchangée) ---
 with st.sidebar:
@@ -187,23 +232,34 @@ if scan_button and symbols_to_scan:
             df_weekly = pd.DataFrame(results['Weekly'])
             report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
 
-            # Section de rapport avec les DEUX options
+            # MODIFIÉ : Section de rapport avec les options PDF et CSV
             st.subheader("📋 Options d'Exportation du Rapport")
-            with st.expander("Cliquez ici pour voir les options d'exportation"):
-                # Option 1: Texte
-                st.markdown("**1. Copier le Rapport Texte**")
-                report_text = generate_text_report(report_dict)
-                st.code(report_text, language="text")
+            with st.expander("Cliquez ici pour télécharger les résultats"):
+                
+                col1, col2 = st.columns(2)
 
-                # Option 2: Image
-                st.markdown("**2. Télécharger le Rapport Image**")
-                image_bytes = create_image_report(report_dict)
-                st.download_button(
-                    label="🖼️ Télécharger le Rapport (Image)",
-                    data=image_bytes,
-                    file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
-                    mime="image/png"
-                )
+                with col1:
+                    # Option 1: PDF
+                    pdf_bytes = create_pdf_report(report_dict)
+                    st.download_button(
+                        label="📄 Télécharger le Rapport (PDF)",
+                        data=pdf_bytes,
+                        file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+
+                with col2:
+                    # Option 2: CSV
+                    csv_bytes = create_csv_report(report_dict)
+                    st.download_button(
+                        label="📊 Télécharger les Données (CSV)",
+                        data=csv_bytes,
+                        file_name=f"donnees_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
 
             # Affichage des résultats (inchangé)
             st.divider()
