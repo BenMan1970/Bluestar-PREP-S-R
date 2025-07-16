@@ -6,7 +6,7 @@ from scipy.signal import find_peaks
 import numpy as np
 from datetime import datetime
 from io import BytesIO
-from fpdf import FPDF # NOUVEL IMPORT pour la génération de PDF
+from fpdf import FPDF # Import pour la génération de PDF
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
@@ -92,7 +92,7 @@ def find_strong_sr_zones(df, zone_percentage_width=0.5, min_touches=2):
 
 # --- Fonctions de Création de Rapport ---
 
-# NOUVELLE FONCTION : CRÉATION DU RAPPORT EN PDF
+# Classe PDF personnalisée
 class PDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 15)
@@ -119,25 +119,23 @@ class PDF(FPDF):
             return
 
         self.set_font('Helvetica', 'B', 8)
-        # Calculer la largeur des colonnes
         col_widths = {'Actif': 25, 'Prix Actuel': 25, 'Support': 25, 'Force (S)': 25,
                       'Dist. (S) %': 20, 'Résistance': 25, 'Force (R)': 25, 'Dist. (R) %': 20}
         
-        # En-têtes de tableau
         for col_name in df.columns:
             self.cell(col_widths.get(col_name, 20), 7, col_name, 1, 0, 'C')
         self.ln()
         
-        # Données du tableau
         self.set_font('Helvetica', '', 7)
         for index, row in df.iterrows():
             for col_name in df.columns:
                 self.cell(col_widths.get(col_name, 20), 6, str(row[col_name]), 1, 0, 'C')
             self.ln()
 
+# FONCTION CORRIGÉE
 def create_pdf_report(results_dict):
     """Crée un rapport PDF à partir du dictionnaire de résultats."""
-    pdf = PDF('L', 'mm', 'A4') # L for Landscape (paysage) pour plus de place
+    pdf = PDF('L', 'mm', 'A4')
     pdf.add_page()
     
     title_map = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journalière (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
@@ -147,28 +145,26 @@ def create_pdf_report(results_dict):
         pdf.chapter_body(df)
         pdf.ln(10)
 
-    # Retourne les données binaires du PDF
-    return pdf.output(dest='S').encode('latin-1')
+    # CORRECTION : pdf.output() retourne directement des 'bytes', l'encodage est inutile et cause l'erreur.
+    return pdf.output()
 
-# NOUVELLE FONCTION : CRÉATION DU RAPPORT EN CSV
+# Fonction de création CSV (inchangée)
 def create_csv_report(results_dict):
     """Combine tous les résultats dans un seul DataFrame et le retourne en CSV."""
     all_dfs = []
     for timeframe, df in results_dict.items():
         if not df.empty:
             df_copy = df.copy()
-            df_copy['Timeframe'] = timeframe # Ajoute une colonne pour identifier le timeframe
+            df_copy['Timeframe'] = timeframe
             all_dfs.append(df_copy)
     
     if not all_dfs:
-        return "" # Retourne une chaîne vide si aucune donnée
+        return ""
 
     full_df = pd.concat(all_dfs, ignore_index=True)
-    # Réorganiser les colonnes pour mettre 'Timeframe' en premier
     cols = ['Timeframe'] + [col for col in full_df.columns if col != 'Timeframe']
     full_df = full_df[cols]
     
-    # Convertir en CSV dans un buffer en mémoire
     csv_buffer = BytesIO()
     full_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
     return csv_buffer.getvalue()
@@ -232,14 +228,12 @@ if scan_button and symbols_to_scan:
             df_weekly = pd.DataFrame(results['Weekly'])
             report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
 
-            # MODIFIÉ : Section de rapport avec les options PDF et CSV
             st.subheader("📋 Options d'Exportation du Rapport")
             with st.expander("Cliquez ici pour télécharger les résultats"):
                 
                 col1, col2 = st.columns(2)
 
                 with col1:
-                    # Option 1: PDF
                     pdf_bytes = create_pdf_report(report_dict)
                     st.download_button(
                         label="📄 Télécharger le Rapport (PDF)",
@@ -250,7 +244,6 @@ if scan_button and symbols_to_scan:
                     )
 
                 with col2:
-                    # Option 2: CSV
                     csv_bytes = create_csv_report(report_dict)
                     st.download_button(
                         label="📊 Télécharger les Données (CSV)",
@@ -261,7 +254,6 @@ if scan_button and symbols_to_scan:
                     )
 
 
-            # Affichage des résultats (inchangé)
             st.divider()
             st.subheader("--- Analyse 4 Heures (H4) ---")
             st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
