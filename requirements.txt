@@ -3,5 +3,4 @@ pandas
 requests
 scipy
 numpy
-dataframe-image  
-Pillow
+fpdf2
