@@ -145,10 +145,11 @@ def create_pdf_report(results_dict):
         pdf.chapter_body(df)
         pdf.ln(10)
 
-    # CORRECTION : pdf.output() retourne directement des 'bytes', l'encodage est inutile et cause l'erreur.
-    return pdf.output()
+    # CORRECTION : On convertit explicitement le 'bytearray' retourné par fpdf2 en 'bytes'
+    # pour le rendre compatible avec st.download_button.
+    return bytes(pdf.output())
 
-# Fonction de création CSV (inchangée)
+# Fonction de création CSV (inchangée et correcte)
 def create_csv_report(results_dict):
     """Combine tous les résultats dans un seul DataFrame et le retourne en CSV."""
     all_dfs = []
@@ -202,6 +203,7 @@ if scan_button and symbols_to_scan:
         if not base_url:
             st.error("Impossible de valider vos identifiants OANDA. Vérifiez vos secrets.")
         else:
+            # Code de scan (inchangé)
             results = {'H4': [], 'Daily': [], 'Weekly': []}
             timeframes = ['h4', 'daily', 'weekly']
             progress_bar = st.progress(0, text="Initialisation...")
@@ -228,6 +230,7 @@ if scan_button and symbols_to_scan:
             df_weekly = pd.DataFrame(results['Weekly'])
             report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
 
+            # Section de téléchargement (inchangée)
             st.subheader("📋 Options d'Exportation du Rapport")
             with st.expander("Cliquez ici pour télécharger les résultats"):
                 
@@ -253,7 +256,7 @@ if scan_button and symbols_to_scan:
                         use_container_width=True
                     )
 
-
+            # Affichage des résultats (inchangé)
             st.divider()
             st.subheader("--- Analyse 4 Heures (H4) ---")
             st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
