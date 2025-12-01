@@ -178,19 +178,19 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
 class PDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 15)
-        self.cell(0, 10, 'Rapport de Scan Support/Résistance', 0, 1, 'C')
+        self.cell(0, 10, 'Rapport de Scan Support/Résistance', border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
-        self.cell(0, 10, f"Généré le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", 0, 1, 'C')
+        self.cell(0, 10, f"Généré le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.ln(5)
 
     def footer(self):
         self.set_y(-15)
         self.set_font('Helvetica', 'I', 8)
-        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+        self.cell(0, 10, f'Page {self.page_no()}', border=0, align='C')
 
     def chapter_title(self, title):
         self.set_font('Helvetica', 'B', 12)
-        self.cell(0, 10, title, 0, 1, 'L')
+        self.cell(0, 10, title, border=0, align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
 
     def chapter_body(self, df):
@@ -227,13 +227,13 @@ class PDF(FPDF):
             }
         
         for col_name in df.columns:
-            self.cell(col_widths.get(col_name, 20), 7, col_name, 1, 0, 'C')
+            self.cell(col_widths.get(col_name, 20), 7, col_name, border=1, align='C', new_x='RIGHT', new_y='TOP')
         self.ln()
         
         self.set_font('Helvetica', '', 7)
         for index, row in df.iterrows():
             for col_name in df.columns:
-                self.cell(col_widths.get(col_name, 20), 6, str(row[col_name]), 1, 0, 'C')
+                self.cell(col_widths.get(col_name, 20), 6, str(row[col_name]), border=1, align='C', new_x='RIGHT', new_y='TOP')
             self.ln()
 
 def create_pdf_report(results_dict, confluences_df=None):
@@ -403,7 +403,7 @@ if scan_button and symbols_to_scan:
                 st.markdown("**Ces zones sont validées par plusieurs timeframes - HAUTE PROBABILITÉ**")
                 st.dataframe(
                     confluences_df.sort_values(by='Force Totale', ascending=False).reset_index(drop=True), 
-                    use_container_width=False,
+                    width='content',
                     hide_index=True
                 )
             else:
@@ -437,13 +437,13 @@ if scan_button and symbols_to_scan:
             # --- TABLEAUX PAR TIMEFRAME ---
             st.divider()
             st.subheader("📅 Analyse 4 Heures (H4)")
-            st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), use_container_width=False, hide_index=True)
+            st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), width='content', hide_index=True)
             
             st.subheader("📅 Analyse Journalière (Daily)")
-            st.dataframe(df_daily.sort_values(by='Actif').reset_index(drop=True), use_container_width=False, hide_index=True)
+            st.dataframe(df_daily.sort_values(by='Actif').reset_index(drop=True), width='content', hide_index=True)
             
             st.subheader("📅 Analyse Hebdomadaire (Weekly)")
-            st.dataframe(df_weekly.sort_values(by='Actif').reset_index(drop=True), use_container_width=False, hide_index=True)
+            st.dataframe(df_weekly.sort_values(by='Actif').reset_index(drop=True), width='content', hide_index=True)
 
 elif not symbols_to_scan:
     st.info("Veuillez sélectionner des actifs à scanner ou cocher la case 'Scanner tous les actifs'.")
