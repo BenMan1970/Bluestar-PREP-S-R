@@ -381,7 +381,7 @@ if scan_button and symbols_to_scan:
                 st.markdown("**Ces zones sont validées par plusieurs timeframes - HAUTE PROBABILITÉ**")
                 st.dataframe(
                     confluences_df.sort_values(by='Force Totale', ascending=False).reset_index(drop=True), 
-                    use_container_width=True, 
+                    use_container_width=False,
                     hide_index=True
                 )
             else:
@@ -415,13 +415,13 @@ if scan_button and symbols_to_scan:
             # --- TABLEAUX PAR TIMEFRAME ---
             st.divider()
             st.subheader("📅 Analyse 4 Heures (H4)")
-            st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
+            st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), use_container_width=False, hide_index=True)
             
             st.subheader("📅 Analyse Journalière (Daily)")
-            st.dataframe(df_daily.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
+            st.dataframe(df_daily.sort_values(by='Actif').reset_index(drop=True), use_container_width=False, hide_index=True)
             
             st.subheader("📅 Analyse Hebdomadaire (Weekly)")
-            st.dataframe(df_weekly.sort_values(by='Actif').reset_index(drop=True), use_container_width=True, hide_index=True)
+            st.dataframe(df_weekly.sort_values(by='Actif').reset_index(drop=True), use_container_width=False, hide_index=True)
 
 elif not symbols_to_scan:
     st.info("Veuillez sélectionner des actifs à scanner ou cocher la case 'Scanner tous les actifs'.")
