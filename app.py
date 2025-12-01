@@ -7,8 +7,6 @@ import numpy as np
 from datetime import datetime
 from io import BytesIO
 from fpdf import FPDF
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
@@ -175,57 +173,6 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
     
     return confluences
 
-def create_chart_with_zones(df, symbol, supports, resistances, current_price):
-    """Crée un graphique avec les zones S/R"""
-    if df is None or df.empty:
-        return None
-    
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.03, 
-                        row_heights=[0.7, 0.3])
-    
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df['open'],
-        high=df['high'],
-        low=df['low'],
-        close=df['close'],
-        name='Prix'
-    ), row=1, col=1)
-    
-    # Supports
-    for _, sup in supports.iterrows():
-        fig.add_hline(y=sup['level'], line_dash="dash", line_color="green", 
-                      annotation_text=f"S: {sup['level']:.5f} ({int(sup['strength'])})",
-                      annotation_position="right", row=1, col=1)
-    
-    # Résistances
-    for _, res in resistances.iterrows():
-        fig.add_hline(y=res['level'], line_dash="dash", line_color="red", 
-                      annotation_text=f"R: {res['level']:.5f} ({int(res['strength'])})",
-                      annotation_position="right", row=1, col=1)
-    
-    # Prix actuel
-    if current_price:
-        fig.add_hline(y=current_price, line_color="blue", line_width=2,
-                      annotation_text=f"Prix: {current_price:.5f}", row=1, col=1)
-    
-    # Volume
-    colors = ['red' if close < open else 'green' 
-              for close, open in zip(df['close'], df['open'])]
-    fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume', 
-                         marker_color=colors, showlegend=False), row=2, col=1)
-    
-    fig.update_layout(
-        title=f"{symbol.replace('_', '/')} - Zones Support/Résistance",
-        xaxis_rangeslider_visible=False,
-        height=600,
-        template="plotly_dark"
-    )
-    
-    return fig
-
 # --- Fonctions de Création de Rapport ---
 
 class PDF(FPDF):
@@ -348,9 +295,6 @@ with st.sidebar:
     min_touches = st.slider("Force minimale (touches)", 2, 10, 3, 1, help="Nombre de contacts minimum pour valider une zone.")
     confluence_threshold = st.slider("Seuil de confluence (%)", 0.3, 2.0, 1.0, 0.1, help="Distance max pour considérer une confluence entre TFs.")
     
-    st.header("4. Options d'Affichage")
-    show_charts = st.checkbox("Afficher les graphiques", value=False, help="Génère des graphiques pour chaque actif (plus lent)")
-    
     scan_button = st.button("🚀 Lancer le Scan Complet", type="primary", use_container_width=True)
 
 # --- LOGIQUE PRINCIPALE ---
@@ -461,21 +405,6 @@ if scan_button and symbols_to_scan:
                         mime="text/csv",
                         use_container_width=True
                     )
-
-            # --- GRAPHIQUES (optionnel) ---
-            if show_charts:
-                st.divider()
-                st.subheader("📊 Graphiques des Actifs")
-                for symbol in symbols_to_scan:
-                    with st.expander(f"📈 {symbol.replace('_', '/')}"):
-                        df_daily_chart = get_oanda_data(base_url, access_token, symbol, 'daily', limit=100)
-                        current_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
-                        
-                        if df_daily_chart is not None and not df_daily_chart.empty:
-                            supports, resistances = find_strong_sr_zones(df_daily_chart, current_price, zone_percentage_width=zone_width, min_touches=min_touches, timeframe='daily')
-                            chart = create_chart_with_zones(df_daily_chart, symbol, supports, resistances, current_price)
-                            if chart:
-                                st.plotly_chart(chart, use_container_width=True)
 
             # --- TABLEAUX PAR TIMEFRAME ---
             st.divider()
