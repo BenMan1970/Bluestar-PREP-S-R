@@ -432,7 +432,7 @@ if scan_button and symbols_to_scan:
                         "Niveau": st.column_config.TextColumn("Niveau", width="small"),
                         "Type": st.column_config.TextColumn("Type", width="small"),
                         "Timeframes": st.column_config.TextColumn("Timeframes", width="medium"),
-                        "Force Totale": st.column_config.NumberColumn("Force Totale", width="small", format="%d"),
+                        "Force Totale": st.column_config.TextColumn("Force Totale", width="small"),
                         "Distance %": st.column_config.TextColumn("Distance %", width="small"),
                         "Alerte": st.column_config.TextColumn("Alerte", width="large"),
                     },
