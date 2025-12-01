@@ -15,6 +15,29 @@ st.set_page_config(
     layout="wide"
 )
 
+# CSS pour forcer l'affichage complet des tableaux sans barre de défilement
+st.markdown("""
+    <style>
+    /* Supprimer la barre de défilement horizontale des dataframes */
+    [data-testid="stDataFrame"] > div {
+        overflow-x: visible !important;
+        overflow-y: visible !important;
+    }
+    
+    /* S'assurer que le contenu est complètement visible */
+    [data-testid="stDataFrame"] iframe {
+        width: 100% !important;
+        height: auto !important;
+    }
+    
+    /* Enlever les scrollbars */
+    ::-webkit-scrollbar {
+        width: 0px !important;
+        height: 0px !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 st.title("📡 Scanner S/R Exhaustif (H4, D1, W)")
 st.markdown("Génère une liste complète des zones de Support/Résistance pour une analyse de confluences approfondie.")
 
@@ -401,10 +424,22 @@ if scan_button and symbols_to_scan:
                 st.divider()
                 st.subheader("🔥 ZONES DE CONFLUENCE MULTI-TIMEFRAMES")
                 st.markdown("**Ces zones sont validées par plusieurs timeframes - HAUTE PROBABILITÉ**")
+                
+                # Afficher avec height fixe pour éviter le scroll
                 st.dataframe(
-                    confluences_df.sort_values(by='Force Totale', ascending=False).reset_index(drop=True), 
-                    width='content',
-                    hide_index=True
+                    confluences_df.sort_values(by='Force Totale', ascending=False).reset_index(drop=True),
+                    column_config={
+                        "Actif": st.column_config.TextColumn("Actif", width="small"),
+                        "Niveau": st.column_config.TextColumn("Niveau", width="small"),
+                        "Type": st.column_config.TextColumn("Type", width="small"),
+                        "Timeframes": st.column_config.TextColumn("Timeframes", width="medium"),
+                        "Force Totale": st.column_config.NumberColumn("Force Totale", width="small"),
+                        "Distance %": st.column_config.TextColumn("Distance %", width="small"),
+                        "Alerte": st.column_config.TextColumn("Alerte", width="large"),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(len(confluences_df) * 35 + 38, 600)  # Hauteur adaptative
                 )
             else:
                 st.info("Aucune confluence détectée avec les paramètres actuels. Essayez d'augmenter le seuil de confluence.")
@@ -437,13 +472,58 @@ if scan_button and symbols_to_scan:
             # --- TABLEAUX PAR TIMEFRAME ---
             st.divider()
             st.subheader("📅 Analyse 4 Heures (H4)")
-            st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True), width='content', hide_index=True)
+            st.dataframe(
+                df_h4.sort_values(by='Actif').reset_index(drop=True),
+                column_config={
+                    "Actif": st.column_config.TextColumn("Actif", width="small"),
+                    "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
+                    "Support": st.column_config.TextColumn("Support", width="small"),
+                    "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
+                    "Dist. (S) %": st.column_config.TextColumn("Dist. (S) %", width="small"),
+                    "Résistance": st.column_config.TextColumn("Résistance", width="small"),
+                    "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
+                    "Dist. (R) %": st.column_config.TextColumn("Dist. (R) %", width="small"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                height=min(len(df_h4) * 35 + 38, 600)
+            )
             
             st.subheader("📅 Analyse Journalière (Daily)")
-            st.dataframe(df_daily.sort_values(by='Actif').reset_index(drop=True), width='content', hide_index=True)
+            st.dataframe(
+                df_daily.sort_values(by='Actif').reset_index(drop=True),
+                column_config={
+                    "Actif": st.column_config.TextColumn("Actif", width="small"),
+                    "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
+                    "Support": st.column_config.TextColumn("Support", width="small"),
+                    "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
+                    "Dist. (S) %": st.column_config.TextColumn("Dist. (S) %", width="small"),
+                    "Résistance": st.column_config.TextColumn("Résistance", width="small"),
+                    "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
+                    "Dist. (R) %": st.column_config.TextColumn("Dist. (R) %", width="small"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                height=min(len(df_daily) * 35 + 38, 600)
+            )
             
             st.subheader("📅 Analyse Hebdomadaire (Weekly)")
-            st.dataframe(df_weekly.sort_values(by='Actif').reset_index(drop=True), width='content', hide_index=True)
+            st.dataframe(
+                df_weekly.sort_values(by='Actif').reset_index(drop=True),
+                column_config={
+                    "Actif": st.column_config.TextColumn("Actif", width="small"),
+                    "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
+                    "Support": st.column_config.TextColumn("Support", width="small"),
+                    "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
+                    "Dist. (S) %": st.column_config.TextColumn("Dist. (S) %", width="small"),
+                    "Résistance": st.column_config.TextColumn("Résistance", width="small"),
+                    "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
+                    "Dist. (R) %": st.column_config.TextColumn("Dist. (R) %", width="small"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                height=min(len(df_weekly) * 35 + 38, 600)
+            )
 
 elif not symbols_to_scan:
     st.info("Veuillez sélectionner des actifs à scanner ou cocher la case 'Scanner tous les actifs'.")
