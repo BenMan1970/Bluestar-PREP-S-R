@@ -201,8 +201,30 @@ class PDF(FPDF):
             return
 
         self.set_font('Helvetica', 'B', 8)
-        col_widths = {'Actif': 25, 'Prix Actuel': 25, 'Support': 25, 'Force (S)': 25,
-                      'Dist. (S) %': 20, 'Résistance': 25, 'Force (R)': 25, 'Dist. (R) %': 20}
+        
+        # Largeurs spécifiques pour le tableau de confluences
+        if 'Timeframes' in df.columns:
+            col_widths = {
+                'Actif': 20, 
+                'Niveau': 22, 
+                'Type': 22, 
+                'Timeframes': 42,
+                'Force Totale': 22, 
+                'Distance %': 20, 
+                'Alerte': 42
+            }
+        else:
+            # Largeurs pour les autres tableaux
+            col_widths = {
+                'Actif': 25, 
+                'Prix Actuel': 25, 
+                'Support': 25, 
+                'Force (S)': 25,
+                'Dist. (S) %': 20, 
+                'Résistance': 25, 
+                'Force (R)': 25, 
+                'Dist. (R) %': 20
+            }
         
         for col_name in df.columns:
             self.cell(col_widths.get(col_name, 20), 7, col_name, 1, 0, 'C')
