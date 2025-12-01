@@ -221,11 +221,17 @@ def create_pdf_report(results_dict, confluences_df=None):
     
     # Ajouter les confluences en premier si disponibles
     if confluences_df is not None and not confluences_df.empty:
-        pdf.chapter_title('🔥 ZONES DE CONFLUENCE MULTI-TIMEFRAMES')
-        pdf.chapter_body(confluences_df)
+        # Nettoyer les emojis pour le PDF
+        clean_df = confluences_df.copy()
+        if 'Alerte' in clean_df.columns:
+            clean_df['Alerte'] = clean_df['Alerte'].str.replace('🔥', '[CHAUD]', regex=False)
+            clean_df['Alerte'] = clean_df['Alerte'].str.replace('⚠️', '[PROCHE]', regex=False)
+        
+        pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
+        pdf.chapter_body(clean_df)
         pdf.ln(10)
     
-    title_map = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journalière (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
+    title_map = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journaliere (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
 
     for timeframe_key, df in results_dict.items():
         pdf.chapter_title(title_map[timeframe_key])
