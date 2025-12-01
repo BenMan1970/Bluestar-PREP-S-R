@@ -232,9 +232,9 @@ class PDF(FPDF):
                 'Niveau': 22, 
                 'Type': 22, 
                 'Timeframes': 42,
-                'Force Totale': 22, 
+                'Force Totale': 24, 
                 'Distance %': 20, 
-                'Alerte': 42
+                'Alerte': 40
             }
         else:
             # Largeurs pour les autres tableaux
@@ -316,7 +316,6 @@ with st.sidebar:
     try:
         access_token = st.secrets["OANDA_ACCESS_TOKEN"]
         account_id = st.secrets["OANDA_ACCOUNT_ID"]
-        st.success("Secrets OANDA chargés.")
     except:
         access_token, account_id = None, None
         st.error("Secrets OANDA non trouvés.")
@@ -333,7 +332,7 @@ with st.sidebar:
     ])
     
     st.info("Cochez la case pour scanner tous les actifs.")
-    select_all = st.checkbox("Scanner tous les actifs (33)")
+    select_all = st.checkbox("Scanner tous les actifs (33)", value=True)
     
     if select_all:
         symbols_to_scan = all_symbols
@@ -433,7 +432,7 @@ if scan_button and symbols_to_scan:
                         "Niveau": st.column_config.TextColumn("Niveau", width="small"),
                         "Type": st.column_config.TextColumn("Type", width="small"),
                         "Timeframes": st.column_config.TextColumn("Timeframes", width="medium"),
-                        "Force Totale": st.column_config.NumberColumn("Force Totale", width="small"),
+                        "Force Totale": st.column_config.NumberColumn("Force Totale", width="small", format="%d"),
                         "Distance %": st.column_config.TextColumn("Distance %", width="small"),
                         "Alerte": st.column_config.TextColumn("Alerte", width="large"),
                     },
