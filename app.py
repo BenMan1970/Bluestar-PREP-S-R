@@ -471,9 +471,20 @@ if scan_button and symbols_to_scan:
                 conf_filtered = pd.DataFrame()
             
             # Préparer les DataFrames pour export
-            df_h4 = pd.DataFrame(results['H4'])
-            df_daily = pd.DataFrame(results['Daily'])
-            df_weekly = pd.DataFrame(results['Weekly'])
+            def filter_tf_table(df, max_pct):
+                if df.empty:
+                    return df
+                def dist_val(s):
+                    try: return float(str(s).replace('%',''))
+                    except: return 999.0
+                dist_s = df['Dist. (S) %'].apply(dist_val)
+                dist_r = df['Dist. (R) %'].apply(dist_val)
+                mask = (dist_s <= max_pct) | (dist_r <= max_pct)
+                return df[mask].reset_index(drop=True)
+
+            df_h4 = filter_tf_table(pd.DataFrame(results['H4']), max_dist_filter)
+            df_daily = filter_tf_table(pd.DataFrame(results['Daily']), max_dist_filter)
+            df_weekly = filter_tf_table(pd.DataFrame(results['Weekly']), max_dist_filter)
             report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
 
             # --- AFFICHAGE DES CONFLUENCES EN PREMIER ---
