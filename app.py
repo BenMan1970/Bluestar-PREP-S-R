@@ -252,55 +252,50 @@ class PDF(FPDF):
             self.ln()
             return
 
-        # Tableau de confluences (9 colonnes) — police 7/6
+        # A4 landscape: 297mm. Marges 5mm chaque cote = 287mm utile.
         if 'Timeframes' in df.columns:
+            # Confluences 9 colonnes → total 285mm
             col_widths = {
-                'Actif': 20,
-                'Signal': 22,
-                'Niveau': 20,
-                'Type': 20,
-                'Timeframes': 44,
-                'Nb TF': 10,
-                'Force Totale': 18,
-                'Distance %': 16,
-                'Alerte': 22,
+                'Actif': 22, 'Signal': 28, 'Niveau': 24, 'Type': 24,
+                'Timeframes': 68, 'Nb TF': 13, 'Force Totale': 22,
+                'Distance %': 20, 'Alerte': 64,
             }
-            hdr_font, row_font, row_h = 7, 6, 5
+            font_size = 7
         else:
-            # Tableaux TF (10 colonnes) — police 6/5.5 pour tout faire rentrer
+            # TF tables 10 colonnes → total 285mm
             col_widths = {
-                'Actif': 22,
-                'Prix Actuel': 23,
-                'Support': 23,
-                'Force (S)': 22,
-                'Dist. (S) %': 15,
-                'Dist. S ATR': 15,
-                'Resistance': 23,
-                'Résistance': 23,
-                'Force (R)': 22,
-                'Dist. (R) %': 15,
-                'Dist. R ATR': 15,
+                'Actif': 26, 'Prix Actuel': 28, 'Support': 28,
+                'Force (S)': 26, 'Dist. (S) %': 18, 'Dist. S ATR': 18,
+                'Resistance': 28, 'Résistance': 28,
+                'Force (R)': 26, 'Dist. (R) %': 18, 'Dist. R ATR': 18,
             }
-            hdr_font, row_font, row_h = 6, 6, 5
+            font_size = 7
 
-        self.set_font('Helvetica', 'B', hdr_font)
+        # Centrer le tableau horizontalement
+        total_w = sum(col_widths.get(c, 18) for c in df.columns)
+        usable_w = self.w - self.l_margin - self.r_margin
+        x_start = self.l_margin + max(0, (usable_w - total_w) / 2)
+
+        # En-têtes
+        self.set_font('Helvetica', 'B', font_size)
+        self.set_x(x_start)
         for col_name in df.columns:
             w = col_widths.get(col_name, 18)
-            # Tronquer le header si nécessaire pour éviter tout débordement
-            hdr = col_name[:14] if len(col_name) > 14 else col_name
-            self.cell(w, 6, hdr, border=1, align='C', new_x='RIGHT', new_y='TOP')
+            self.cell(w, 6, col_name, border=1, align='C', new_x='RIGHT', new_y='TOP')
         self.ln()
 
-        self.set_font('Helvetica', '', row_font)
-        for index, row in df.iterrows():
+        # Données
+        self.set_font('Helvetica', '', font_size)
+        for _, row in df.iterrows():
+            self.set_x(x_start)
             for col_name in df.columns:
                 w = col_widths.get(col_name, 18)
                 val = str(row[col_name])
-                # Tronquer les valeurs trop longues
-                max_chars = int(w / 1.4)
+                # Tronquer seulement si vraiment nécessaire
+                max_chars = int(w / 1.25)
                 if len(val) > max_chars:
                     val = val[:max_chars - 1] + '.'
-                self.cell(w, row_h, val, border=1, align='C', new_x='RIGHT', new_y='TOP')
+                self.cell(w, 5, val, border=1, align='C', new_x='RIGHT', new_y='TOP')
             self.ln()
 
 def strip_emojis_df(df):
@@ -367,6 +362,85 @@ def create_csv_report(results_dict, confluences_df=None):
     full_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
     return csv_buffer.getvalue()
 
+
+def _display_results(sr):
+    df_h4, df_daily, df_weekly = sr['df_h4'], sr['df_daily'], sr['df_weekly']
+    conf_filtered, report_dict  = sr['conf_filtered'], sr['report_dict']
+
+    tf_cfg = {
+        "Actif": st.column_config.TextColumn("Actif", width="small"),
+        "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
+        "Support": st.column_config.TextColumn("Support", width="small"),
+        "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
+        "Dist. (S) %": st.column_config.TextColumn("Dist. S %", width="small"),
+        "Dist. S ATR": st.column_config.TextColumn("Dist. S ATR", width="small"),
+        "Résistance": st.column_config.TextColumn("Résistance", width="small"),
+        "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
+        "Dist. (R) %": st.column_config.TextColumn("Dist. R %", width="small"),
+        "Dist. R ATR": st.column_config.TextColumn("Dist. R ATR", width="small"),
+    }
+
+    # Confluences
+    if not conf_filtered.empty:
+        st.divider()
+        st.subheader("🔥 ZONES DE CONFLUENCE MULTI-TIMEFRAMES")
+        st.markdown("**Ces zones sont validées par plusieurs timeframes - HAUTE PROBABILITÉ**")
+        conf_display = conf_filtered.sort_values(by=['Alerte', 'Force Totale'], ascending=[False, False]).reset_index(drop=True)
+        hot    = len(conf_display[conf_display['Alerte'] == '🔥 ZONE CHAUDE'])
+        proche = len(conf_display[conf_display['Alerte'] == '⚠️ Proche'])
+        buy_z  = len(conf_display[conf_display['Signal'] == '🟢 BUY ZONE'])
+        sell_z = len(conf_display[conf_display['Signal'] == '🔴 SELL ZONE'])
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("🔥 Zones Chaudes", hot)
+        mc2.metric("⚠️ Zones Proches", proche)
+        mc3.metric("🟢 BUY Zones", buy_z)
+        mc4.metric("🔴 SELL Zones", sell_z)
+        st.dataframe(conf_display, column_config={
+            "Actif": st.column_config.TextColumn("Actif", width="small"),
+            "Signal": st.column_config.TextColumn("Signal", width="small"),
+            "Niveau": st.column_config.TextColumn("Niveau", width="small"),
+            "Type": st.column_config.TextColumn("Type", width="small"),
+            "Timeframes": st.column_config.TextColumn("Timeframes", width="medium"),
+            "Nb TF": st.column_config.NumberColumn("Nb TF", width="small"),
+            "Force Totale": st.column_config.NumberColumn("Force Totale", width="small"),
+            "Distance %": st.column_config.TextColumn("Distance %", width="small"),
+            "Alerte": st.column_config.TextColumn("Alerte", width="small"),
+        }, hide_index=True, use_container_width=True,
+           height=min(len(conf_display) * 35 + 38, 700))
+    else:
+        st.info("Aucune confluence détectée. Essayez d'augmenter le seuil de confluence.")
+
+    # Export
+    st.subheader("📋 Options d'Exportation du Rapport")
+    with st.expander("Cliquez ici pour télécharger les résultats"):
+        col1, col2 = st.columns(2)
+        with col1:
+            pdf_bytes = create_pdf_report(report_dict, conf_filtered)
+            st.download_button("📄 Télécharger le Rapport (PDF)", data=pdf_bytes,
+                file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf", use_container_width=True)
+        with col2:
+            csv_bytes = create_csv_report(report_dict, conf_filtered)
+            st.download_button("📊 Télécharger les Données (CSV)", data=csv_bytes,
+                file_name=f"donnees_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", use_container_width=True)
+
+    # Tableaux
+    st.divider()
+    st.subheader("📅 Analyse 4 Heures (H4)")
+    st.dataframe(df_h4.sort_values(by='Actif').reset_index(drop=True),
+        column_config=tf_cfg, hide_index=True, use_container_width=True,
+        height=min(len(df_h4) * 35 + 38, 600))
+    st.subheader("📅 Analyse Journalière (Daily)")
+    st.dataframe(df_daily.sort_values(by='Actif').reset_index(drop=True),
+        column_config=tf_cfg, hide_index=True, use_container_width=True,
+        height=min(len(df_daily) * 35 + 38, 600))
+    st.subheader("📅 Analyse Hebdomadaire (Weekly)")
+    st.dataframe(df_weekly.sort_values(by='Actif').reset_index(drop=True),
+        column_config=tf_cfg, hide_index=True, use_container_width=True,
+        height=min(len(df_weekly) * 35 + 38, 600))
+
+
 # --- INTERFACE UTILISATEUR (SIDEBAR) ---
 with st.sidebar:
     st.header("1. Connexion")
@@ -407,6 +481,7 @@ with st.sidebar:
 
 # --- LOGIQUE PRINCIPALE ---
 if scan_button and symbols_to_scan:
+    st.session_state.pop('scan_results', None)
     if not access_token or not account_id:
         st.warning("Veuillez configurer vos secrets OANDA pour lancer l'analyse.")
     else:
@@ -498,134 +573,19 @@ if scan_button and symbols_to_scan:
             df_daily = filter_tf_table(pd.DataFrame(results['Daily']), max_dist_filter)
             df_weekly = filter_tf_table(pd.DataFrame(results['Weekly']), max_dist_filter)
             report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
+            # ── Sauvegarde pour survivre aux reruns (clic PDF/CSV) ──
+            st.session_state['scan_results'] = {
+                'df_h4': df_h4, 'df_daily': df_daily, 'df_weekly': df_weekly,
+                'conf_filtered': conf_filtered, 'report_dict': report_dict,
+            }
 
-            # --- AFFICHAGE DES CONFLUENCES EN PREMIER ---
-            if not conf_filtered.empty:
-                st.divider()
-                st.subheader("🔥 ZONES DE CONFLUENCE MULTI-TIMEFRAMES")
-                st.markdown("**Ces zones sont validées par plusieurs timeframes - HAUTE PROBABILITÉ**")
-                
-                conf_display = conf_filtered.sort_values(by=['Alerte', 'Force Totale'], ascending=[False, False]).reset_index(drop=True)
-                
-                # Métriques résumées
-                hot = len(conf_display[conf_display['Alerte'] == '🔥 ZONE CHAUDE'])
-                proche = len(conf_display[conf_display['Alerte'] == '⚠️ Proche'])
-                buy_z = len(conf_display[conf_display['Signal'] == '🟢 BUY ZONE'])
-                sell_z = len(conf_display[conf_display['Signal'] == '🔴 SELL ZONE'])
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("🔥 Zones Chaudes", hot)
-                mc2.metric("⚠️ Zones Proches", proche)
-                mc3.metric("🟢 BUY Zones", buy_z)
-                mc4.metric("🔴 SELL Zones", sell_z)
-                
-                st.dataframe(
-                    conf_display,
-                    column_config={
-                        "Actif": st.column_config.TextColumn("Actif", width="small"),
-                        "Signal": st.column_config.TextColumn("Signal", width="small"),
-                        "Niveau": st.column_config.TextColumn("Niveau", width="small"),
-                        "Type": st.column_config.TextColumn("Type", width="small"),
-                        "Timeframes": st.column_config.TextColumn("Timeframes", width="medium"),
-                        "Nb TF": st.column_config.NumberColumn("Nb TF", width="small"),
-                        "Force Totale": st.column_config.NumberColumn("Force Totale", width="small"),
-                        "Distance %": st.column_config.TextColumn("Distance %", width="small"),
-                        "Alerte": st.column_config.TextColumn("Alerte", width="small"),
-                    },
-                    hide_index=True,
-                    use_container_width=True,
-                    height=min(len(conf_display) * 35 + 38, 700)
-                )
-            else:
-                st.info("Aucune confluence détectée avec les paramètres actuels. Essayez d'augmenter le seuil de confluence.")
-
-            # --- BOUTONS D'EXPORT ---
-            st.subheader("📋 Options d'Exportation du Rapport")
-            with st.expander("Cliquez ici pour télécharger les résultats"):
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    pdf_bytes = create_pdf_report(report_dict, conf_filtered)
-                    st.download_button(
-                        label="📄 Télécharger le Rapport (PDF)",
-                        data=pdf_bytes,
-                        file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-
-                with col2:
-                    csv_bytes = create_csv_report(report_dict, conf_filtered)
-                    st.download_button(
-                        label="📊 Télécharger les Données (CSV)",
-                        data=csv_bytes,
-                        file_name=f"donnees_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-
-            # --- TABLEAUX PAR TIMEFRAME ---
-            st.divider()
-            st.subheader("📅 Analyse 4 Heures (H4)")
-            st.dataframe(
-                df_h4.sort_values(by='Actif').reset_index(drop=True),
-                column_config={
-                    "Actif": st.column_config.TextColumn("Actif", width="small"),
-                    "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
-                    "Support": st.column_config.TextColumn("Support", width="small"),
-                    "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
-                    "Dist. (S) %": st.column_config.TextColumn("Dist. S %", width="small"),
-                    "Dist. S ATR": st.column_config.TextColumn("Dist. S ATR", width="small"),
-                    "Résistance": st.column_config.TextColumn("Résistance", width="small"),
-                    "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
-                    "Dist. (R) %": st.column_config.TextColumn("Dist. R %", width="small"),
-                    "Dist. R ATR": st.column_config.TextColumn("Dist. R ATR", width="small"),
-                },
-                hide_index=True,
-                use_container_width=True,
-                height=min(len(df_h4) * 35 + 38, 600)
-            )
-            
-            st.subheader("📅 Analyse Journalière (Daily)")
-            st.dataframe(
-                df_daily.sort_values(by='Actif').reset_index(drop=True),
-                column_config={
-                    "Actif": st.column_config.TextColumn("Actif", width="small"),
-                    "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
-                    "Support": st.column_config.TextColumn("Support", width="small"),
-                    "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
-                    "Dist. (S) %": st.column_config.TextColumn("Dist. S %", width="small"),
-                    "Dist. S ATR": st.column_config.TextColumn("Dist. S ATR", width="small"),
-                    "Résistance": st.column_config.TextColumn("Résistance", width="small"),
-                    "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
-                    "Dist. (R) %": st.column_config.TextColumn("Dist. R %", width="small"),
-                    "Dist. R ATR": st.column_config.TextColumn("Dist. R ATR", width="small"),
-                },
-                hide_index=True,
-                use_container_width=True,
-                height=min(len(df_daily) * 35 + 38, 600)
-            )
-            
-            st.subheader("📅 Analyse Hebdomadaire (Weekly)")
-            st.dataframe(
-                df_weekly.sort_values(by='Actif').reset_index(drop=True),
-                column_config={
-                    "Actif": st.column_config.TextColumn("Actif", width="small"),
-                    "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
-                    "Support": st.column_config.TextColumn("Support", width="small"),
-                    "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
-                    "Dist. (S) %": st.column_config.TextColumn("Dist. S %", width="small"),
-                    "Dist. S ATR": st.column_config.TextColumn("Dist. S ATR", width="small"),
-                    "Résistance": st.column_config.TextColumn("Résistance", width="small"),
-                    "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
-                    "Dist. (R) %": st.column_config.TextColumn("Dist. R %", width="small"),
-                    "Dist. R ATR": st.column_config.TextColumn("Dist. R ATR", width="small"),
-                },
-                hide_index=True,
-                use_container_width=True,
-                height=min(len(df_weekly) * 35 + 38, 600)
-            )
+            _display_results(st.session_state['scan_results'])
 
 elif not symbols_to_scan:
     st.info("Veuillez sélectionner des actifs à scanner ou cocher la case 'Scanner tous les actifs'.")
 else:
     st.info("Cliquez sur 'Lancer le Scan Complet' pour commencer.")
+
+# ── Ré-affichage persistant après rerun (ex: clic téléchargement) ──
+if 'scan_results' in st.session_state and not scan_button:
+    _display_results(st.session_state['scan_results'])
