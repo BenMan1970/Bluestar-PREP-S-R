@@ -292,6 +292,22 @@ class PDF(FPDF):
                 self.cell(col_widths.get(col_name, 20), 6, str(row[col_name]), border=1, align='C', new_x='RIGHT', new_y='TOP')
             self.ln()
 
+def strip_emojis_df(df):
+    """Remplace tous les emojis et caractères non-latin1 d'un DataFrame pour FPDF."""
+    emoji_map = {
+        '🟢': '[BUY]', '🔴': '[SELL]', '🔥': '[CHAUD]', '⚠️': '[PROCHE]',
+        '📈': '', '📉': '', '↔️': '', '✅': '[OK]', '❌': '[X]',
+    }
+    clean = df.copy()
+    for col in clean.select_dtypes(include='object').columns:
+        for emoji, replacement in emoji_map.items():
+            clean[col] = clean[col].astype(str).str.replace(emoji, replacement, regex=False)
+        # Fallback: encode to latin-1, drop unencodable chars
+        clean[col] = clean[col].apply(
+            lambda x: x.encode('latin-1', errors='ignore').decode('latin-1')
+        )
+    return clean
+
 def create_pdf_report(results_dict, confluences_df=None):
     """Crée un rapport PDF à partir du dictionnaire de résultats."""
     pdf = PDF('L', 'mm', 'A4')
@@ -299,11 +315,7 @@ def create_pdf_report(results_dict, confluences_df=None):
     
     # Ajouter les confluences en premier si disponibles
     if confluences_df is not None and not confluences_df.empty:
-        # Nettoyer les emojis pour le PDF
-        clean_df = confluences_df.copy()
-        if 'Alerte' in clean_df.columns:
-            clean_df['Alerte'] = clean_df['Alerte'].str.replace('🔥', '[CHAUD]', regex=False)
-            clean_df['Alerte'] = clean_df['Alerte'].str.replace('⚠️', '[PROCHE]', regex=False)
+        clean_df = strip_emojis_df(confluences_df)
         
         pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
         pdf.chapter_body(clean_df)
@@ -313,7 +325,7 @@ def create_pdf_report(results_dict, confluences_df=None):
 
     for timeframe_key, df in results_dict.items():
         pdf.chapter_title(title_map[timeframe_key])
-        pdf.chapter_body(df)
+        pdf.chapter_body(strip_emojis_df(df))
         pdf.ln(10)
 
     return bytes(pdf.output())
