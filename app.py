@@ -15,31 +15,38 @@ st.set_page_config(
     layout="wide"
 )
 
-# CSS pour forcer l'affichage complet des tableaux sans barre de défilement
+# CSS
 st.markdown("""
     <style>
-    /* Supprimer la barre de défilement horizontale des dataframes */
-    [data-testid="stDataFrame"] > div {
-        overflow-x: visible !important;
-        overflow-y: visible !important;
+    [data-testid="stDataFrame"] > div { overflow-x: visible !important; overflow-y: visible !important; }
+    [data-testid="stDataFrame"] iframe { width: 100% !important; height: auto !important; }
+    ::-webkit-scrollbar { width: 0px !important; height: 0px !important; }
+
+    /* Bouton SCAN rouge centré */
+    div[data-testid="stButton"] > button[kind="primary"] {
+        background-color: #D32F2F !important;
+        color: white !important;
+        border: 1px solid #B71C1C !important;
+        font-size: 18px !important;
+        font-weight: 700 !important;
+        padding: 14px 40px !important;
+        border-radius: 8px !important;
+        transition: all 0.2s;
     }
-    
-    /* S'assurer que le contenu est complètement visible */
-    [data-testid="stDataFrame"] iframe {
-        width: 100% !important;
-        height: auto !important;
-    }
-    
-    /* Enlever les scrollbars */
-    ::-webkit-scrollbar {
-        width: 0px !important;
-        height: 0px !important;
+    div[data-testid="stButton"] > button[kind="primary"]:hover {
+        background-color: #B71C1C !important;
+        box-shadow: 0 4px 16px rgba(211,47,47,0.5) !important;
     }
     </style>
 """, unsafe_allow_html=True)
 
 st.title("📡 Scanner S/R Exhaustif (H4, D1, W)")
-st.markdown("Génère une liste complète des zones de Support/Résistance pour une analyse de confluences approfondie.")
+st.markdown("Génère les zones de Support/Résistance clés avec **distance en ATR**, force et confluences multi-timeframes.")
+
+# --- BOUTON SCAN CENTRÉ EN HAUT EN ROUGE ---
+col_l, col_c, col_r = st.columns([2, 1, 2])
+with col_c:
+    scan_button = st.button("🚀 LANCER LE SCAN", type="primary", use_container_width=True)
 
 # --- Fonctions de l'API OANDA ---
 @st.cache_data(ttl=3600)
@@ -139,6 +146,21 @@ def find_strong_sr_zones(df, current_price, zone_percentage_width=0.5, min_touch
     
     return supports, resistances
 
+
+def compute_atr(df, period=14):
+    """Calcule l'ATR sur les dernières bougies pour contextualiser la distance."""
+    if df is None or len(df) < period + 1:
+        return None
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
+
 def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1.0):
     """Détecte les confluences entre timeframes"""
     if not zones_dict or current_price is None:
@@ -181,14 +203,21 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                 total_strength = confluence_group['strength'].sum()
                 dist_pct = abs(current_price - avg_level) / current_price * 100
                 
+                zone_type = confluence_group.iloc[0]['type']
+                signal = '🟢 BUY ZONE' if zone_type == 'Support' else '🔴 SELL ZONE'
+                nb_tf = len(timeframes)
+                tf_label = ' + '.join(sorted(timeframes))
+                alerte = '🔥 ZONE CHAUDE' if dist_pct < 0.5 else ('⚠️ Proche' if dist_pct < 1.5 else '')
                 confluences.append({
                     'Actif': symbol,
+                    'Signal': signal,
                     'Niveau': f"{avg_level:.5f}",
-                    'Type': confluence_group.iloc[0]['type'],
-                    'Timeframes': ' + '.join(sorted(timeframes)),
+                    'Type': zone_type,
+                    'Timeframes': tf_label,
+                    'Nb TF': nb_tf,
                     'Force Totale': int(total_strength),
                     'Distance %': f"{dist_pct:.2f}%",
-                    'Alerte': '🔥 ZONE CHAUDE' if dist_pct < 0.5 else '⚠️ Proche' if dist_pct < 1.5 else ''
+                    'Alerte': alerte
                 })
                 
                 # Marquer les indices utilisés
@@ -228,25 +257,29 @@ class PDF(FPDF):
         # Largeurs spécifiques pour le tableau de confluences
         if 'Timeframes' in df.columns:
             col_widths = {
-                'Actif': 20, 
-                'Niveau': 22, 
-                'Type': 22, 
-                'Timeframes': 42,
-                'Force Totale': 24, 
-                'Distance %': 20, 
-                'Alerte': 40
+                'Actif': 18,
+                'Signal': 24,
+                'Niveau': 20,
+                'Type': 20,
+                'Timeframes': 38,
+                'Nb TF': 12,
+                'Force Totale': 20,
+                'Distance %': 18,
+                'Alerte': 26,
             }
         else:
             # Largeurs pour les autres tableaux
             col_widths = {
-                'Actif': 25, 
-                'Prix Actuel': 25, 
-                'Support': 25, 
-                'Force (S)': 25,
-                'Dist. (S) %': 20, 
-                'Résistance': 25, 
-                'Force (R)': 25, 
-                'Dist. (R) %': 20
+                'Actif': 20,
+                'Prix Actuel': 20,
+                'Support': 20,
+                'Force (S)': 20,
+                'Dist. (S) %': 16,
+                'Dist. S ATR': 16,
+                'Résistance': 20,
+                'Force (R)': 20,
+                'Dist. (R) %': 16,
+                'Dist. R ATR': 16,
             }
         
         for col_name in df.columns:
@@ -322,7 +355,7 @@ with st.sidebar:
     
     st.header("2. Sélection des Actifs")
     all_symbols = sorted([
-        "XAU_USD", "XPT_USD", "US30_USD", "NAS100_USD", "SPX500_USD",
+        "XAU_USD", "XAG_USD", "XPT_USD", "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR",
         "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD", 
         "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_NZD", "EUR_CAD", "EUR_CHF", 
         "GBP_JPY", "GBP_AUD", "GBP_NZD", "GBP_CAD", "GBP_CHF", 
@@ -332,7 +365,7 @@ with st.sidebar:
     ])
     
     st.info("Cochez la case pour scanner tous les actifs.")
-    select_all = st.checkbox("Scanner tous les actifs (33)", value=True)
+    select_all = st.checkbox("Scanner tous les actifs (35)", value=True)
     
     if select_all:
         symbols_to_scan = all_symbols
@@ -344,8 +377,9 @@ with st.sidebar:
     zone_width = st.slider("Largeur de zone (%)", 0.1, 2.0, 0.5, 0.1, help="Largeur de la zone pour regrouper les pivots.")
     min_touches = st.slider("Force minimale (touches)", 2, 10, 3, 1, help="Nombre de contacts minimum pour valider une zone.")
     confluence_threshold = st.slider("Seuil de confluence (%)", 0.3, 2.0, 1.0, 0.1, help="Distance max pour considérer une confluence entre TFs.")
+    max_dist_filter = st.slider("Afficher zones < (%)", 1.0, 10.0, 3.0, 0.5, help="Masquer les confluences trop éloignées du prix.")
     
-    scan_button = st.button("🚀 Lancer le Scan Complet", type="primary", use_container_width=True)
+    # Bouton déplacé en haut de la page (voir ci-dessus)
 
 # --- LOGIQUE PRINCIPALE ---
 if scan_button and symbols_to_scan:
@@ -388,15 +422,20 @@ if scan_button and symbols_to_scan:
                         dist_s = (abs(current_price - sup['level']) / current_price) * 100 if sup is not None else np.nan
                         dist_r = (abs(current_price - res['level']) / current_price) * 100 if res is not None else np.nan
                         
+                        atr_val = compute_atr(df, period=14)
+                        dist_s_atr = round(abs(current_price - sup['level']) / atr_val, 1) if (sup is not None and atr_val and atr_val > 0) else np.nan
+                        dist_r_atr = round(abs(current_price - res['level']) / atr_val, 1) if (res is not None and atr_val and atr_val > 0) else np.nan
                         results[timeframe.capitalize()].append({
-                            'Actif': symbol.replace('_', '/'), 
-                            'Prix Actuel': f"{current_price:.5f}" if current_price is not None else 'N/A', 
-                            'Support': f"{sup['level']:.5f}" if sup is not None else 'N/A', 
-                            'Force (S)': f"{int(sup['strength'])} touches" if sup is not None else 'N/A', 
-                            'Dist. (S) %': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A', 
-                            'Résistance': f"{res['level']:.5f}" if res is not None else 'N/A', 
-                            'Force (R)': f"{int(res['strength'])} touches" if res is not None else 'N/A', 
-                            'Dist. (R) %': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A'
+                            'Actif': symbol.replace('_', '/'),
+                            'Prix Actuel': f"{current_price:.5f}" if current_price is not None else 'N/A',
+                            'Support': f"{sup['level']:.5f}" if sup is not None else 'N/A',
+                            'Force (S)': f"{int(sup['strength'])} touches" if sup is not None else 'N/A',
+                            'Dist. (S) %': f"{dist_s:.2f}%" if not np.isnan(dist_s) else 'N/A',
+                            'Dist. S ATR': f"{dist_s_atr:.1f}x" if not np.isnan(dist_s_atr) else 'N/A',
+                            'Résistance': f"{res['level']:.5f}" if res is not None else 'N/A',
+                            'Force (R)': f"{int(res['strength'])} touches" if res is not None else 'N/A',
+                            'Dist. (R) %': f"{dist_r:.2f}%" if not np.isnan(dist_r) else 'N/A',
+                            'Dist. R ATR': f"{dist_r_atr:.1f}x" if not np.isnan(dist_r_atr) else 'N/A',
                         })
             
             progress_bar.empty()
@@ -425,20 +464,38 @@ if scan_button and symbols_to_scan:
                 st.markdown("**Ces zones sont validées par plusieurs timeframes - HAUTE PROBABILITÉ**")
                 
                 # Afficher avec height fixe pour éviter le scroll
+                # Filtrer les zones trop lointaines et trier par proximité
+                confluences_df['_dist_num'] = confluences_df['Distance %'].str.replace('%','').astype(float)
+                conf_filtered = confluences_df[confluences_df['_dist_num'] <= max_dist_filter].drop(columns=['_dist_num'])
+                conf_display = conf_filtered.sort_values(by=['Alerte', 'Force Totale'], ascending=[False, False]).reset_index(drop=True)
+                
+                # Métriques résumées
+                hot = len(conf_display[conf_display['Alerte'] == '🔥 ZONE CHAUDE'])
+                proche = len(conf_display[conf_display['Alerte'] == '⚠️ Proche'])
+                buy_z = len(conf_display[conf_display['Signal'] == '🟢 BUY ZONE'])
+                sell_z = len(conf_display[conf_display['Signal'] == '🔴 SELL ZONE'])
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("🔥 Zones Chaudes", hot)
+                mc2.metric("⚠️ Zones Proches", proche)
+                mc3.metric("🟢 BUY Zones", buy_z)
+                mc4.metric("🔴 SELL Zones", sell_z)
+                
                 st.dataframe(
-                    confluences_df.sort_values(by='Force Totale', ascending=False).reset_index(drop=True),
+                    conf_display,
                     column_config={
                         "Actif": st.column_config.TextColumn("Actif", width="small"),
+                        "Signal": st.column_config.TextColumn("Signal", width="small"),
                         "Niveau": st.column_config.TextColumn("Niveau", width="small"),
                         "Type": st.column_config.TextColumn("Type", width="small"),
                         "Timeframes": st.column_config.TextColumn("Timeframes", width="medium"),
-                        "Force Totale": st.column_config.TextColumn("Force Totale", width="small"),
+                        "Nb TF": st.column_config.NumberColumn("Nb TF", width="small"),
+                        "Force Totale": st.column_config.NumberColumn("Force Totale", width="small"),
                         "Distance %": st.column_config.TextColumn("Distance %", width="small"),
-                        "Alerte": st.column_config.TextColumn("Alerte", width="large"),
+                        "Alerte": st.column_config.TextColumn("Alerte", width="small"),
                     },
                     hide_index=True,
                     use_container_width=True,
-                    height=min(len(confluences_df) * 35 + 38, 600)  # Hauteur adaptative
+                    height=min(len(conf_display) * 35 + 38, 700)
                 )
             else:
                 st.info("Aucune confluence détectée avec les paramètres actuels. Essayez d'augmenter le seuil de confluence.")
@@ -478,10 +535,12 @@ if scan_button and symbols_to_scan:
                     "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
                     "Support": st.column_config.TextColumn("Support", width="small"),
                     "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
-                    "Dist. (S) %": st.column_config.TextColumn("Dist. (S) %", width="small"),
+                    "Dist. (S) %": st.column_config.TextColumn("Dist. S %", width="small"),
+                    "Dist. S ATR": st.column_config.TextColumn("Dist. S ATR", width="small"),
                     "Résistance": st.column_config.TextColumn("Résistance", width="small"),
                     "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
-                    "Dist. (R) %": st.column_config.TextColumn("Dist. (R) %", width="small"),
+                    "Dist. (R) %": st.column_config.TextColumn("Dist. R %", width="small"),
+                    "Dist. R ATR": st.column_config.TextColumn("Dist. R ATR", width="small"),
                 },
                 hide_index=True,
                 use_container_width=True,
@@ -496,10 +555,12 @@ if scan_button and symbols_to_scan:
                     "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
                     "Support": st.column_config.TextColumn("Support", width="small"),
                     "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
-                    "Dist. (S) %": st.column_config.TextColumn("Dist. (S) %", width="small"),
+                    "Dist. (S) %": st.column_config.TextColumn("Dist. S %", width="small"),
+                    "Dist. S ATR": st.column_config.TextColumn("Dist. S ATR", width="small"),
                     "Résistance": st.column_config.TextColumn("Résistance", width="small"),
                     "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
-                    "Dist. (R) %": st.column_config.TextColumn("Dist. (R) %", width="small"),
+                    "Dist. (R) %": st.column_config.TextColumn("Dist. R %", width="small"),
+                    "Dist. R ATR": st.column_config.TextColumn("Dist. R ATR", width="small"),
                 },
                 hide_index=True,
                 use_container_width=True,
@@ -514,10 +575,12 @@ if scan_button and symbols_to_scan:
                     "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
                     "Support": st.column_config.TextColumn("Support", width="small"),
                     "Force (S)": st.column_config.TextColumn("Force (S)", width="medium"),
-                    "Dist. (S) %": st.column_config.TextColumn("Dist. (S) %", width="small"),
+                    "Dist. (S) %": st.column_config.TextColumn("Dist. S %", width="small"),
+                    "Dist. S ATR": st.column_config.TextColumn("Dist. S ATR", width="small"),
                     "Résistance": st.column_config.TextColumn("Résistance", width="small"),
                     "Force (R)": st.column_config.TextColumn("Force (R)", width="medium"),
-                    "Dist. (R) %": st.column_config.TextColumn("Dist. (R) %", width="small"),
+                    "Dist. (R) %": st.column_config.TextColumn("Dist. R %", width="small"),
+                    "Dist. R ATR": st.column_config.TextColumn("Dist. R ATR", width="small"),
                 },
                 hide_index=True,
                 use_container_width=True,
