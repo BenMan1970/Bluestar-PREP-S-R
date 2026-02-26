@@ -462,6 +462,13 @@ if scan_button and symbols_to_scan:
                 all_confluences.extend(confluences)
             
             confluences_df = pd.DataFrame(all_confluences)
+
+            # Filtrer les zones trop lointaines — appliqué au PDF ET à l'affichage
+            if not confluences_df.empty:
+                confluences_df['_dist_num'] = confluences_df['Distance %'].str.replace('%', '').astype(float)
+                conf_filtered = confluences_df[confluences_df['_dist_num'] <= max_dist_filter].drop(columns=['_dist_num'])
+            else:
+                conf_filtered = pd.DataFrame()
             
             # Préparer les DataFrames pour export
             df_h4 = pd.DataFrame(results['H4'])
@@ -470,15 +477,11 @@ if scan_button and symbols_to_scan:
             report_dict = {'H4': df_h4, 'Daily': df_daily, 'Weekly': df_weekly}
 
             # --- AFFICHAGE DES CONFLUENCES EN PREMIER ---
-            if not confluences_df.empty:
+            if not conf_filtered.empty:
                 st.divider()
                 st.subheader("🔥 ZONES DE CONFLUENCE MULTI-TIMEFRAMES")
                 st.markdown("**Ces zones sont validées par plusieurs timeframes - HAUTE PROBABILITÉ**")
                 
-                # Afficher avec height fixe pour éviter le scroll
-                # Filtrer les zones trop lointaines et trier par proximité
-                confluences_df['_dist_num'] = confluences_df['Distance %'].str.replace('%','').astype(float)
-                conf_filtered = confluences_df[confluences_df['_dist_num'] <= max_dist_filter].drop(columns=['_dist_num'])
                 conf_display = conf_filtered.sort_values(by=['Alerte', 'Force Totale'], ascending=[False, False]).reset_index(drop=True)
                 
                 # Métriques résumées
@@ -518,7 +521,7 @@ if scan_button and symbols_to_scan:
                 col1, col2 = st.columns(2)
 
                 with col1:
-                    pdf_bytes = create_pdf_report(report_dict, confluences_df)
+                    pdf_bytes = create_pdf_report(report_dict, conf_filtered)
                     st.download_button(
                         label="📄 Télécharger le Rapport (PDF)",
                         data=pdf_bytes,
@@ -528,7 +531,7 @@ if scan_button and symbols_to_scan:
                     )
 
                 with col2:
-                    csv_bytes = create_csv_report(report_dict, confluences_df)
+                    csv_bytes = create_csv_report(report_dict, conf_filtered)
                     st.download_button(
                         label="📊 Télécharger les Données (CSV)",
                         data=csv_bytes,
