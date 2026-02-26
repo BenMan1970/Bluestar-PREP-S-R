@@ -248,48 +248,59 @@ class PDF(FPDF):
     def chapter_body(self, df):
         if df.empty:
             self.set_font('Helvetica', '', 10)
-            self.multi_cell(0, 10, "Aucune donnée à afficher pour ce timeframe.")
+            self.multi_cell(0, 10, "Aucune donnee a afficher pour ce timeframe.")
             self.ln()
             return
 
-        self.set_font('Helvetica', 'B', 8)
-        
-        # Largeurs spécifiques pour le tableau de confluences
+        # Tableau de confluences (9 colonnes) — police 7/6
         if 'Timeframes' in df.columns:
             col_widths = {
-                'Actif': 18,
-                'Signal': 24,
+                'Actif': 20,
+                'Signal': 22,
                 'Niveau': 20,
                 'Type': 20,
-                'Timeframes': 38,
-                'Nb TF': 12,
-                'Force Totale': 20,
-                'Distance %': 18,
-                'Alerte': 26,
+                'Timeframes': 44,
+                'Nb TF': 10,
+                'Force Totale': 18,
+                'Distance %': 16,
+                'Alerte': 22,
             }
+            hdr_font, row_font, row_h = 7, 6, 5
         else:
-            # Largeurs pour les autres tableaux
+            # Tableaux TF (10 colonnes) — police 6/5.5 pour tout faire rentrer
             col_widths = {
-                'Actif': 20,
-                'Prix Actuel': 20,
-                'Support': 20,
-                'Force (S)': 20,
-                'Dist. (S) %': 16,
-                'Dist. S ATR': 16,
-                'Résistance': 20,
-                'Force (R)': 20,
-                'Dist. (R) %': 16,
-                'Dist. R ATR': 16,
+                'Actif': 22,
+                'Prix Actuel': 23,
+                'Support': 23,
+                'Force (S)': 22,
+                'Dist. (S) %': 15,
+                'Dist. S ATR': 15,
+                'Resistance': 23,
+                'Résistance': 23,
+                'Force (R)': 22,
+                'Dist. (R) %': 15,
+                'Dist. R ATR': 15,
             }
-        
+            hdr_font, row_font, row_h = 6, 6, 5
+
+        self.set_font('Helvetica', 'B', hdr_font)
         for col_name in df.columns:
-            self.cell(col_widths.get(col_name, 20), 7, col_name, border=1, align='C', new_x='RIGHT', new_y='TOP')
+            w = col_widths.get(col_name, 18)
+            # Tronquer le header si nécessaire pour éviter tout débordement
+            hdr = col_name[:14] if len(col_name) > 14 else col_name
+            self.cell(w, 6, hdr, border=1, align='C', new_x='RIGHT', new_y='TOP')
         self.ln()
-        
-        self.set_font('Helvetica', '', 7)
+
+        self.set_font('Helvetica', '', row_font)
         for index, row in df.iterrows():
             for col_name in df.columns:
-                self.cell(col_widths.get(col_name, 20), 6, str(row[col_name]), border=1, align='C', new_x='RIGHT', new_y='TOP')
+                w = col_widths.get(col_name, 18)
+                val = str(row[col_name])
+                # Tronquer les valeurs trop longues
+                max_chars = int(w / 1.4)
+                if len(val) > max_chars:
+                    val = val[:max_chars - 1] + '.'
+                self.cell(w, row_h, val, border=1, align='C', new_x='RIGHT', new_y='TOP')
             self.ln()
 
 def strip_emojis_df(df):
@@ -311,6 +322,7 @@ def strip_emojis_df(df):
 def create_pdf_report(results_dict, confluences_df=None):
     """Crée un rapport PDF à partir du dictionnaire de résultats."""
     pdf = PDF('L', 'mm', 'A4')
+    pdf.set_margins(5, 10, 5)  # left, top, right → 287mm usable
     pdf.add_page()
     
     # Ajouter les confluences en premier si disponibles
