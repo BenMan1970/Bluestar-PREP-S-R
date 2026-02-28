@@ -867,7 +867,9 @@ class PDF(FPDF):
     def chapter_body(self, df):
         if df.empty:
             self.set_font('Helvetica', '', 10)
-            self.multi_cell(0, 10, "Aucune donnee a afficher.")
+            self.set_x(self.l_margin)
+            usable_w = self.w - self.l_margin - self.r_margin
+            self.multi_cell(usable_w, 10, "Aucune donnee a afficher.")
             self.ln()
             return
 
@@ -932,9 +934,11 @@ def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomali
     if anomalies:
         pdf.chapter_title('ALERTES QUALITE DES DONNEES')
         pdf.set_font('Helvetica', 'I', 8)
+        usable_w = pdf.w - pdf.l_margin - pdf.r_margin
         for a in anomalies:
             line = _safe_pdf_str(f"  {a['actif']} : {a['msg']}")
-            pdf.multi_cell(0, 5, line)
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(usable_w, 5, line)
         pdf.ln(5)
 
     if summaries:
@@ -1298,4 +1302,3 @@ if "scan_results" in st.session_state and not scan_button:
         st.session_state["scan_results"],
         st.session_state["scan_results"].get("max_dist", 3.0),
     )
-             
