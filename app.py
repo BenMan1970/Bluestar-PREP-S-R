@@ -992,6 +992,230 @@ def create_csv_report(results_dict, confluences_df=None):
 
 
 # ══════════════════════════════════════════════════════════════════
+# EXPORT LLM BRIEF (Markdown structuré, filtré, ~50 tokens/actif)
+# ══════════════════════════════════════════════════════════════════
+def create_llm_brief(summaries, confluences_df,
+                     max_dist=2.0, min_score=100.0,
+                     allowed_statuts=("Vierge", "Testee")):
+    """
+    Génère un brief Markdown ultra-compact et structuré pour LLM.
+
+    Filtres appliqués :
+    - Distance du prix < max_dist %
+    - Score >= min_score
+    - Statut dans allowed_statuts (Vierge / Testée par défaut)
+    - Confluences uniquement (multi-TF = signal fiable)
+
+    Format de sortie par actif :
+    ### EUR/USD | Prix: 1.18172 | H4:↑ D:↓ W:↑
+    - SELL 1.18152 | Sc:291 | Vierge | 0.02% | H4+D+W ⚡
+    - BUY  1.16761 | Sc:359 | Vierge | 1.19% | H4+D+W ⚠
+    """
+    TREND_ARROW = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
+    STATUS_LABEL = {"Vierge": "V", "Testee": "T", "Consommee": "C"}
+    ALERT_LABEL  = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠", "": ""}
+
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    lines = [
+        "# BRIEF S/R — Scanner v4",
+        f"_Généré le {now}_",
+        "",
+        "## INSTRUCTIONS POUR LLM",
+        "Ce brief contient les zones Support/Résistance les plus fiables détectées",
+        "par un scanner multi-timeframes (H4 + Daily + Weekly) sur 35 actifs Forex/Indices/Métaux.",
+        "",
+        "**Légende :**",
+        "- `BUY` / `SELL` : direction de la zone",
+        "- `Sc` : Score pondéré (Force × Poids_TF × NbTF × Facteur_Age). >300=institutionnel, 100-300=fort",
+        "- `V` = Vierge (jamais testée — plus fiable) | `T` = Testée (respectée) | `C` = Consommée (éviter)",
+        "- `Dist%` : distance du prix actuel à la zone",
+        "- `TFs` : timeframes en confluence (H4/D/W)",
+        "- `⚡` = zone chaude (<0.5% du prix) | `⚠` = proche (<1.5%)",
+        "",
+        f"**Filtres actifs** : Dist < {max_dist}% | Score ≥ {min_score} | Statuts : {', '.join(allowed_statuts)}",
+        "",
+        "---",
+        "",
+    ]
+
+    if confluences_df is None or confluences_df.empty:
+        lines.append("_Aucune confluence disponible._")
+        return "\n".join(lines).encode("utf-8")
+
+    # Construire un dict actif → zones filtrées
+    actif_zones = {}
+    for _, row in confluences_df.iterrows():
+        try:
+            dist_val = float(str(row.get("Distance %", "999")).replace("%", ""))
+        except Exception:
+            dist_val = 999.0
+
+        score_val = float(row.get("Score", 0))
+        statut    = str(row.get("Statut", ""))
+
+        if dist_val > max_dist:
+            continue
+        if score_val < min_score:
+            continue
+        if statut not in allowed_statuts:
+            continue
+
+        actif = str(row.get("Actif", ""))
+        if actif not in actif_zones:
+            actif_zones[actif] = []
+        actif_zones[actif].append({
+            "signal":   str(row.get("Signal", "")),
+            "niveau":   str(row.get("Niveau", "")),
+            "score":    score_val,
+            "statut":   statut,
+            "dist":     dist_val,
+            "tfs":      str(row.get("Timeframes", "")),
+            "nb_tf":    int(row.get("Nb TF", 0)),
+            "alerte":   str(row.get("Alerte", "")),
+        })
+
+    # Trier les actifs par zone la plus haute score
+    actif_max_score = {
+        actif: max(z["score"] for z in zones)
+        for actif, zones in actif_zones.items()
+    }
+    sorted_actifs = sorted(actif_max_score, key=lambda a: actif_max_score[a], reverse=True)
+
+    # Construire le brief par actif
+    summary_map = {s["symbol"]: s for s in summaries}
+
+    total_zones = 0
+    for actif in sorted_actifs:
+        zones = sorted(actif_zones[actif], key=lambda z: z["score"], reverse=True)
+        s     = summary_map.get(actif, {})
+
+        t_h4 = TREND_ARROW.get(s.get("trend_h4",    "NEUTRE"), "→")
+        t_d  = TREND_ARROW.get(s.get("trend_daily",  "NEUTRE"), "→")
+        t_w  = TREND_ARROW.get(s.get("trend_weekly", "NEUTRE"), "→")
+
+        # Prix actuel depuis le résumé de position
+        ctx = s.get("price_context", "")
+
+        lines.append(f"### {actif} | H4:{t_h4} D:{t_d} W:{t_w}")
+        if ctx:
+            lines.append(f"> {ctx}")
+
+        for z in zones:
+            signal_short = "BUY " if "BUY"  in z["signal"] else "SELL"
+            st_short     = STATUS_LABEL.get(z["statut"], z["statut"])
+            al_short     = ALERT_LABEL.get(z["alerte"], "")
+            # Simplifier le label TF : "Daily + H4 + Weekly" → "H4+D+W"
+            tf_short = (z["tfs"]
+                        .replace("Daily", "D")
+                        .replace("Weekly", "W")
+                        .replace(" + ", "+"))
+            line = (
+                f"- {signal_short} `{z['niveau']}` | "
+                f"Sc:{z['score']:.0f} | {st_short} | "
+                f"{z['dist']:.2f}% | {tf_short} {al_short}"
+            )
+            lines.append(line)
+            total_zones += 1
+
+        lines.append("")
+
+    lines += [
+        "---",
+        f"_Total zones retenues : {total_zones} sur {len(sorted_actifs)} actifs_",
+        "",
+        "## PROMPT SUGGÉRÉ POUR LLM",
+        "```",
+        "Tu es un analyste technique expert en trading Forex/Indices.",
+        "Voici un brief S/R multi-timeframes généré automatiquement.",
+        "Pour chaque actif pertinent :",
+        "1. Identifie les setups les plus immédiats (⚡ zones chaudes en priorité)",
+        "2. Vérifie la cohérence tendance vs direction de zone (ex: BUY en tendance haussière)",
+        "3. Priorise les zones Vierge (V) sur 3 TF avec Score > 200",
+        "4. Propose un plan de trade structuré : entrée, SL (au-delà de la zone), TP (prochain niveau)",
+        "```",
+    ]
+
+    return "\n".join(lines).encode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════
+# EXPORT JSON STRUCTURÉ
+# ══════════════════════════════════════════════════════════════════
+def create_json_export(summaries, confluences_df,
+                       max_dist=5.0, min_score=50.0):
+    """
+    Export JSON structuré avec toutes les confluences et le contexte
+    par actif. Pas filtré aussi agressivement que le brief LLM —
+    utile pour un LLM avec grande fenêtre de contexte ou pour
+    pipeline de traitement programmatique.
+    """
+    import json
+
+    output = {
+        "generated_at": datetime.now().isoformat(),
+        "scanner_version": "v4",
+        "description": (
+            "Support/Resistance multi-timeframe scanner. "
+            "Scores weighted by TF (H4=1x, Daily=2x, Weekly=3x) and age decay. "
+            "Status: Vierge=never tested (most reliable), Testee=respected, Consommee=broken."
+        ),
+        "filters_applied": {"max_dist_pct": max_dist, "min_score": min_score},
+        "assets": []
+    }
+
+    summary_map = {s["symbol"]: s for s in summaries}
+
+    if confluences_df is None or confluences_df.empty:
+        return json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
+
+    # Grouper les confluences par actif
+    actif_groups = {}
+    for _, row in confluences_df.iterrows():
+        try:
+            dist_val  = float(str(row.get("Distance %", "999")).replace("%", ""))
+            score_val = float(row.get("Score", 0))
+        except Exception:
+            dist_val, score_val = 999.0, 0.0
+
+        if dist_val > max_dist or score_val < min_score:
+            continue
+
+        actif = str(row.get("Actif", ""))
+        if actif not in actif_groups:
+            actif_groups[actif] = []
+        actif_groups[actif].append({
+            "signal":       str(row.get("Signal", "")).replace("🟢 ", "").replace("🔴 ", ""),
+            "type":         str(row.get("Type", "")),
+            "level":        str(row.get("Niveau", "")),
+            "timeframes":   str(row.get("Timeframes", "")),
+            "nb_tf":        int(row.get("Nb TF", 0)),
+            "total_touches":int(row.get("Force Totale", 0)),
+            "score":        round(score_val, 1),
+            "status":       str(row.get("Statut", "")),
+            "distance_pct": round(dist_val, 3),
+            "alert":        str(row.get("Alerte", "")).replace("🔥 ", "").replace("⚠️ ", ""),
+        })
+
+    for actif, zones in sorted(actif_groups.items(),
+                                key=lambda x: max(z["score"] for z in x[1]),
+                                reverse=True):
+        s = summary_map.get(actif, {})
+        output["assets"].append({
+            "symbol":    actif,
+            "trend": {
+                "H4":     s.get("trend_h4",    "NEUTRE"),
+                "Daily":  s.get("trend_daily",  "NEUTRE"),
+                "Weekly": s.get("trend_weekly", "NEUTRE"),
+            },
+            "price_context": s.get("price_context", ""),
+            "zones": sorted(zones, key=lambda z: z["score"], reverse=True),
+        })
+
+    return json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════
 # AFFICHAGE STREAMLIT
 # ══════════════════════════════════════════════════════════════════
 def _display_results(sr, max_dist_filter):
@@ -1049,11 +1273,13 @@ def _display_results(sr, max_dist_filter):
 
     st.subheader("📋 Exportation du Rapport")
     with st.expander("Cliquez ici pour télécharger les résultats"):
+
+        # ── Ligne 1 : PDF + CSV ───────────────────────────────────
         col1, col2 = st.columns(2)
         with col1:
             pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
             st.download_button(
-                "📄 Télécharger le Rapport (PDF)",
+                "📄 Rapport PDF (complet)",
                 data=pdf_bytes,
                 file_name=f"rapport_sr_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
                 mime="application/pdf",
@@ -1062,12 +1288,91 @@ def _display_results(sr, max_dist_filter):
         with col2:
             csv_bytes = create_csv_report(rep_dict, conf_full)
             st.download_button(
-                "📊 Télécharger les Données (CSV)",
+                "📊 Données brutes CSV",
                 data=csv_bytes,
                 file_name=f"donnees_sr_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv",
                 width='stretch',
             )
+
+        st.divider()
+        st.markdown("**🤖 Exports optimisés LLM**")
+        st.caption(
+            "Le Brief Markdown est filtré et structuré pour être collé directement "
+            "dans ChatGPT, Claude ou Gemini. Le JSON convient aux pipelines automatisés."
+        )
+
+        # ── Paramètres filtres LLM ────────────────────────────────
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            llm_max_dist = st.slider(
+                "Dist. max (%) pour le brief LLM", 0.5, 5.0, 2.0, 0.5,
+                help="Zones au-delà de cette distance sont exclues du brief LLM."
+            )
+        with fc2:
+            llm_min_score = st.slider(
+                "Score minimum (brief LLM)", 50, 300, 100, 25,
+                help="Zones sous ce score sont exclues du brief LLM."
+            )
+        with fc3:
+            llm_statuts_raw = st.multiselect(
+                "Statuts autorisés (brief LLM)",
+                options=["Vierge", "Testee", "Consommee"],
+                default=["Vierge", "Testee"],
+                help="Consommee = zone cassée, généralement à éviter."
+            )
+        llm_statuts = tuple(llm_statuts_raw) if llm_statuts_raw else ("Vierge", "Testee")
+
+        # ── Ligne 2 : Brief LLM + JSON ────────────────────────────
+        col3, col4 = st.columns(2)
+        with col3:
+            md_bytes = create_llm_brief(
+                summaries, conf_full,
+                max_dist=llm_max_dist,
+                min_score=llm_min_score,
+                allowed_statuts=llm_statuts,
+            )
+            st.download_button(
+                "🤖 Brief LLM (Markdown filtré)",
+                data=md_bytes,
+                file_name=f"brief_llm_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
+                mime="text/markdown",
+                width='stretch',
+            )
+        with col4:
+            json_bytes = create_json_export(
+                summaries, conf_full,
+                max_dist=max_dist_filter,
+                min_score=50.0,
+            )
+            st.download_button(
+                "🔧 Export JSON structuré",
+                data=json_bytes,
+                file_name=f"sr_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                width='stretch',
+            )
+
+        # ── Aperçu du brief LLM dans l'interface ─────────────────
+        st.divider()
+        st.markdown("**👁️ Aperçu du Brief LLM**")
+        st.caption(f"Filtres : Dist < {llm_max_dist}% | Score ≥ {llm_min_score} | {', '.join(llm_statuts)}")
+        try:
+            brief_preview = md_bytes.decode("utf-8")
+            # Compter les zones retenues (lignes commençant par "- BUY" ou "- SELL")
+            n_zones = sum(1 for l in brief_preview.split("\n")
+                          if l.strip().startswith("- BUY") or l.strip().startswith("- SELL"))
+            n_actifs = brief_preview.count("### ")
+            st.info(f"**{n_actifs} actifs** avec **{n_zones} zones** dans le brief LLM "
+                    f"(≈ {n_zones * 15 + n_actifs * 10:,} tokens estimés)")
+            st.text_area(
+                "Brief LLM (copiable directement)",
+                value=brief_preview,
+                height=400,
+                label_visibility="collapsed",
+            )
+        except Exception:
+            st.warning("Aperçu non disponible.")
 
     def _filter_and_sort(df, max_pct):
         if df.empty:
@@ -1154,6 +1459,13 @@ with st.sidebar:
     st.caption("✅ Prominence ATR + largeur zone ATR-based")
     st.caption("✅ Plage prix valides (XAU/XAG/XPT/Indices)")
     st.caption("✅ Fix PDF Unicode (accents + emojis)")
+
+    st.divider()
+    st.caption("**Exports disponibles :**")
+    st.caption("📄 PDF complet — rapport détaillé toutes zones")
+    st.caption("📊 CSV brut — toutes données pour analyse perso")
+    st.caption("🤖 Brief LLM — Markdown filtré, ~50 tokens/actif")
+    st.caption("🔧 JSON structuré — pour pipelines automatisés")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1302,3 +1614,4 @@ if "scan_results" in st.session_state and not scan_button:
         st.session_state["scan_results"],
         st.session_state["scan_results"].get("max_dist", 3.0),
     )
+ 
