@@ -58,27 +58,53 @@ ALL_SYMBOLS = [
     "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR",
 ]
 
-# Largeur de zone adaptative par instrument
+# ── CORRECTIF 3 : Largeur de zone élargie pour indices ───────────
 ZONE_WIDTH_MAP = {
-    "US30_USD": 0.15, "NAS100_USD": 0.15, "SPX500_USD": 0.15, "DE30_EUR": 0.15,
-    "XAU_USD":  0.20, "XAG_USD":   0.25, "XPT_USD":   0.25,
+    "US30_USD":   0.30,   # élargi (était 0.15)
+    "NAS100_USD": 0.30,   # élargi (était 0.15)
+    "SPX500_USD": 0.20,   # élargi (était 0.15)
+    "DE30_EUR":   0.20,   # élargi (était 0.15)
+    "XAU_USD":    0.20,
+    "XAG_USD":    0.25,
+    "XPT_USD":    0.25,
 }
 DEFAULT_ZONE_WIDTH = 0.5
 
 # Seuils de distance max POUR LE PDF — adaptatifs par type d'actif
-# (le filtre visuel Streamlit reste configurable séparément)
 PDF_DIST_THRESHOLDS = {
     "US30_USD": 5.0, "NAS100_USD": 5.0, "SPX500_USD": 5.0, "DE30_EUR": 5.0,
     "XAU_USD": 10.0, "XAG_USD":  10.0, "XPT_USD":   10.0,
 }
-DEFAULT_PDF_DIST = 8.0   # Forex majeurs et croisés
+DEFAULT_PDF_DIST = 8.0
 
-# Post-fusion : zones distantes de moins de X% sont fusionnées
-POST_MERGE_THRESHOLD = 0.30   # 0.30% pour Forex, ajusté ci-dessous pour les autres
+# ── CORRECTIF 5 : Distance absolue max par instrument ────────────
+ABSOLUTE_MAX_DIST = {
+    "XAU_USD": 8.0,  "XAG_USD": 8.0,  "XPT_USD": 8.0,
+    "US30_USD": 4.0, "NAS100_USD": 4.0, "SPX500_USD": 4.0, "DE30_EUR": 4.0,
+}
+
+# ── CORRECTIF 4 : Post-fusion réduite pour indices ───────────────
+POST_MERGE_THRESHOLD = 0.30
 
 POST_MERGE_MAP = {
-    "US30_USD": 0.10, "NAS100_USD": 0.10, "SPX500_USD": 0.10, "DE30_EUR": 0.10,
-    "XAU_USD":  0.15, "XAG_USD":   0.20, "XPT_USD":   0.20,
+    "US30_USD":   0.05,   # réduit (était 0.10)
+    "NAS100_USD": 0.05,   # réduit (était 0.10)
+    "SPX500_USD": 0.08,   # réduit (était 0.10)
+    "DE30_EUR":   0.08,   # réduit (était 0.10)
+    "XAU_USD":    0.15,
+    "XAG_USD":    0.20,
+    "XPT_USD":    0.20,
+}
+
+# ── CORRECTIF 3 : Seuil de confluence adaptatif par instrument ───
+CONFLUENCE_THRESHOLD_MAP = {
+    "US30_USD":   1.5,
+    "NAS100_USD": 1.5,
+    "SPX500_USD": 1.2,
+    "DE30_EUR":   1.2,
+    "XAU_USD":    1.5,
+    "XAG_USD":    1.5,
+    "XPT_USD":    1.5,
 }
 
 
@@ -151,6 +177,38 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
 
 
 # ══════════════════════════════════════════════════════════════════
+# CORRECTIF 1 — Validation prix live vs dernier close H4
+# ══════════════════════════════════════════════════════════════════
+def validate_live_price(live_price, symbol, base_url, access_token):
+    """
+    Vérifie que le prix live ne s'écarte pas de plus de 15% du dernier
+    close H4. Si c'est le cas (données aberrantes), on utilise le close
+    comme fallback et on logue un avertissement.
+    Retourne : (prix_validé, message_alerte_ou_None)
+    """
+    if live_price is None:
+        return None, None
+
+    df_check = get_oanda_data(base_url, access_token, symbol, "h4", limit=10)
+    if df_check is None or df_check.empty:
+        return live_price, None
+
+    last_close = df_check["close"].iloc[-1]
+    if last_close <= 0:
+        return live_price, None
+
+    deviation = abs(live_price - last_close) / last_close * 100
+    if deviation > 15.0:
+        msg = (
+            f"Prix live {live_price:.5f} écarté de {deviation:.1f}% "
+            f"du dernier close H4 ({last_close:.5f}) — fallback sur close H4"
+        )
+        return last_close, msg
+
+    return live_price, None
+
+
+# ══════════════════════════════════════════════════════════════════
 # MOTEUR D'ANALYSE — FONCTIONS UTILITAIRES
 # ══════════════════════════════════════════════════════════════════
 def get_adaptive_distance(timeframe):
@@ -186,14 +244,12 @@ def compute_trend(df, sma_period=20):
     sma     = close.rolling(sma_period).mean().iloc[-1]
     current = close.iloc[-1]
 
-    # Pente normalisée sur les 5 dernières bougies
     slope_pct = (close.iloc[-1] - close.iloc[-6]) / close.iloc[-6] * 100
 
-    # Structure des highs/lows sur 10 bougies
     highs = df["high"].iloc[-10:]
     lows  = df["low"].iloc[-10:]
-    hh    = highs.iloc[-1] > highs.iloc[0]   # higher high
-    ll    = lows.iloc[-1]  < lows.iloc[0]    # lower low
+    hh    = highs.iloc[-1] > highs.iloc[0]
+    ll    = lows.iloc[-1]  < lows.iloc[0]
 
     above_sma = current > sma
     below_sma = current < sma
@@ -216,16 +272,7 @@ def compute_trend(df, sma_period=20):
 def compute_relevance_score(strength, dist_pct, nb_tf):
     """
     Score composite de pertinence opérationnelle d'une zone S/R.
-
     Formule : (Force × Nb_Timeframes) / Distance_%
-    — Récompense les zones solides et multi-confirmées
-    — Pénalise fortement les zones éloignées
-
-    Seuils interprétatifs :
-      > 200  : Zone critique, très haute probabilité de réaction
-      100-200: Zone prioritaire
-       20-100: Zone importante à surveiller
-       < 20  : Zone secondaire / historique
     """
     d = max(dist_pct, 0.01)
     return round((strength * nb_tf) / d, 1)
@@ -234,8 +281,6 @@ def compute_relevance_score(strength, dist_pct, nb_tf):
 def post_merge_zones(zones_list, threshold_pct=0.30):
     """
     Fusionne les zones dont les niveaux sont à moins de threshold_pct% d'écart.
-    Additionne les touches pour refléter la densité réelle de réactions.
-    Passe itérative jusqu'à stabilité.
     """
     if len(zones_list) <= 1:
         return zones_list
@@ -270,44 +315,55 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
     return zones_list
 
 
-def flag_data_anomaly(symbol, current_price, support_levels):
+# ══════════════════════════════════════════════════════════════════
+# CORRECTIF 2 — Détection d'anomalie renforcée (seuil 3.0 → 1.8)
+# ══════════════════════════════════════════════════════════════════
+def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
     """
-    Détecte si le prix actuel est statistiquement aberrant par rapport
-    aux zones historiques (ex : prix > 3× la médiane des supports).
+    Détecte les prix aberrants par deux méthodes complémentaires :
+    1. Ratio prix / médiane des supports > 1.8 (était 3.0)
+    2. Écart prix live vs dernier close > 10%
     Retourne un message d'alerte ou None.
     """
-    if len(support_levels) < 3:
-        return None
-    median_sup = np.median(support_levels)
-    if median_sup <= 0:
-        return None
-    ratio = current_price / median_sup
-    if ratio > 3.0:
-        return (
-            f"Prix actuel {current_price:.2f} = {ratio:.1f}x la médiane des supports "
-            f"({median_sup:.2f}) — données à vérifier ou rally exceptionnel"
-        )
-    return None
+    messages = []
+
+    # Méthode 1 : ratio vs médiane des supports
+    if len(support_levels) >= 3:
+        median_sup = np.median(support_levels)
+        if median_sup > 0:
+            ratio = current_price / median_sup
+            if ratio > 1.8:   # seuil abaissé de 3.0 à 1.8
+                messages.append(
+                    f"Prix {current_price:.2f} = {ratio:.1f}x la médiane des supports "
+                    f"({median_sup:.2f}) — données à vérifier ou rally exceptionnel"
+                )
+
+    # Méthode 2 : écart prix live vs dernier close (nouveau)
+    if last_candle_close and last_candle_close > 0:
+        dev = abs(current_price - last_candle_close) / last_candle_close * 100
+        if dev > 10.0:
+            messages.append(
+                f"Prix live {current_price:.2f} s'écarte de {dev:.1f}% "
+                f"du dernier close ({last_candle_close:.2f})"
+            )
+
+    return " | ".join(messages) if messages else None
 
 
 def get_price_context(current_price, supports, resistances):
     """
     Génère un résumé textuel court de la position du prix
     par rapport aux zones les plus proches.
-    Utilise toujours le support le plus HAUT (le plus proche sous le prix)
-    et la résistance la plus BASSE (la plus proche au-dessus).
     """
     parts = []
 
     if not supports.empty:
-        # Support le plus proche = niveau le plus élevé parmi les supports
         nearest_sup = supports.loc[supports["level"].idxmax()]
         dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
         tag    = "SUR support" if dist_s < 0.5 else "S proche"
         parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
 
     if not resistances.empty:
-        # Résistance la plus proche = niveau le plus bas parmi les résistances
         nearest_res = resistances.loc[resistances["level"].idxmin()]
         dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
         tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
@@ -323,10 +379,7 @@ def find_strong_sr_zones(df, current_price, zone_percentage_width=0.5,
                           min_touches=2, timeframe="daily",
                           post_merge_threshold=0.30):
     """
-    Détecte les zones S/R par pivot clustering.
-    Améliorations v2 :
-    - Post-fusion des zones trop proches (évite les doublons)
-    - Retourne TOUTES les zones valides (supports ET résistances)
+    Détecte les zones S/R par pivot clustering avec post-fusion.
     """
     if df is None or df.empty or len(df) < 20:
         return pd.DataFrame(), pd.DataFrame()
@@ -343,7 +396,6 @@ def find_strong_sr_zones(df, current_price, zone_percentage_width=0.5,
     if all_pivots.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Regroupement initial par proximité
     zones, current_zone = [], [all_pivots.iloc[0]]
     for price in all_pivots.iloc[1:]:
         zone_avg = np.mean(current_zone)
@@ -361,7 +413,6 @@ def find_strong_sr_zones(df, current_price, zone_percentage_width=0.5,
     if not strong:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Post-fusion : élimine les doublons à moins de post_merge_threshold%
     strong = post_merge_zones(strong, threshold_pct=post_merge_threshold)
 
     df_zones    = pd.DataFrame(strong).sort_values("level").reset_index(drop=True)
@@ -440,20 +491,31 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
 def scan_single_symbol(args):
     """
     Scan complet H4 + Daily + Weekly pour un symbole.
-    Retourne : rows par TF, zones, prix courant, tendances, anomalie.
+    Intègre les correctifs 1, 2, 3, 4, 5.
     """
     symbol, base_url, access_token, account_id, zone_width, min_touches = args
 
-    current_price  = get_oanda_current_price(base_url, access_token, account_id, symbol)
+    # ── CORRECTIF 1 : Validation du prix live ────────────────────
+    raw_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
+    current_price, price_alert_msg = validate_live_price(
+        raw_price, symbol, base_url, access_token
+    )
+
     adaptive_width = ZONE_WIDTH_MAP.get(symbol, zone_width)
     merge_thresh   = POST_MERGE_MAP.get(symbol, POST_MERGE_THRESHOLD)
     pdf_dist_max   = PDF_DIST_THRESHOLDS.get(symbol, DEFAULT_PDF_DIST)
+    abs_dist_max   = ABSOLUTE_MAX_DIST.get(symbol, 99.0)   # CORRECTIF 5
 
     rows           = {"H4": None, "Daily": None, "Weekly": None}
     zones_d        = {}
     trends         = {}
     all_sup_levels = []
+    last_h4_close  = None   # CORRECTIF 2
     anomaly_msg    = None
+
+    # Ajouter alerte prix aberrant s'il y en a une
+    if price_alert_msg:
+        anomaly_msg = price_alert_msg
 
     for tf_key, tf_cap in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
         df = get_oanda_data(base_url, access_token, symbol, tf_key, limit=500)
@@ -462,10 +524,12 @@ def scan_single_symbol(args):
 
         cp = current_price if current_price is not None else df["close"].iloc[-1]
 
-        # Tendance structurelle
+        # ── CORRECTIF 2 : Stocker le dernier close H4 ────────────
+        if tf_key == "h4":
+            last_h4_close = df["close"].iloc[-1]
+
         trends[tf_cap] = compute_trend(df)
 
-        # Zones S/R avec post-fusion
         supports, resistances = find_strong_sr_zones(
             df, cp,
             zone_percentage_width=adaptive_width,
@@ -477,20 +541,19 @@ def scan_single_symbol(args):
 
         atr_val = compute_atr(df, period=14)
 
-        # Accumule les supports pour détection d'anomalie
         if not supports.empty:
             all_sup_levels.extend(supports["level"].tolist())
 
-        # Contexte prix uniquement sur Daily (le plus stable)
         price_ctx = ""
         if tf_key == "daily":
             price_ctx = get_price_context(cp, supports, resistances)
-            # Stocké dans zones_d pour le résumé
             zones_d["_price_ctx"] = price_ctx
 
         sym_d = symbol.replace("_", "/")
 
-        def make_row(zone, ztype, _cp=cp, _atr=atr_val, _pdf_max=pdf_dist_max):
+        # ── CORRECTIF 5 : Distance absolue max dans make_row ─────
+        def make_row(zone, ztype, _cp=cp, _atr=atr_val,
+                     _pdf_max=pdf_dist_max, _abs_max=abs_dist_max):
             lvl      = zone["level"]
             strength = int(zone["strength"])
             dist_pct = abs(_cp - lvl) / _cp * 100
@@ -506,7 +569,8 @@ def scan_single_symbol(args):
                 "Dist. ATR":   f"{dist_atr:.1f}x" if not np.isnan(dist_atr) else "N/A",
                 "Score":       score,
                 "_dist_num":   dist_pct,
-                "_in_pdf":     dist_pct <= _pdf_max,
+                # Filtre PDF : distance configurable ET distance absolue max
+                "_in_pdf":     dist_pct <= _pdf_max and dist_pct <= _abs_max,
             }
 
         tf_rows = (
@@ -516,9 +580,17 @@ def scan_single_symbol(args):
         if tf_rows:
             rows[tf_cap] = tf_rows
 
-    # Détection d'anomalie sur l'ensemble des supports trouvés
+    # ── CORRECTIF 2 : Détection anomalie renforcée ───────────────
     if all_sup_levels and current_price:
-        anomaly_msg = flag_data_anomaly(symbol, current_price, all_sup_levels)
+        new_anomaly = flag_data_anomaly(
+            symbol, current_price, all_sup_levels, last_h4_close
+        )
+        if new_anomaly:
+            # Combiner avec l'alerte prix si elle existe déjà
+            if anomaly_msg:
+                anomaly_msg = f"{anomaly_msg} | {new_anomaly}"
+            else:
+                anomaly_msg = new_anomaly
 
     return symbol, rows, zones_d, current_price, trends, anomaly_msg
 
@@ -526,13 +598,7 @@ def scan_single_symbol(args):
 # ══════════════════════════════════════════════════════════════════
 # GÉNÉRATION PDF
 # ══════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════
-# PDF — pattern identique à l'original qui fonctionnait
-# ══════════════════════════════════════════════════════════════════
-
 def strip_emojis_df(df):
-    """Nettoyage emoji + encodage latin-1 — identique à l'original."""
     emoji_map = {
         '🟢': '[BUY]', '🔴': '[SELL]', '🔥': '[CHAUD]', '⚠️': '[PROCHE]',
         '📈': '', '📉': '', '↔️': '', '✅': '[OK]', '❌': '[X]',
@@ -569,7 +635,6 @@ class PDF(FPDF):
         self.ln(4)
 
     def chapter_summary(self, summaries):
-        """Résumé par actif : tendances + top zones. Style texte simple."""
         self.set_font('Helvetica', 'B', 10)
         self.cell(0, 7, 'RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)',
                   border=0, align='L', new_x='LMARGIN', new_y='NEXT')
@@ -611,7 +676,6 @@ class PDF(FPDF):
             self.ln(1)
 
     def chapter_body(self, df):
-        """Identique à l'original + colonne Score + alternance de couleur."""
         if df.empty:
             self.set_font('Helvetica', '', 10)
             self.multi_cell(0, 10, "Aucune donnee a afficher.")
@@ -619,7 +683,6 @@ class PDF(FPDF):
             return
 
         if 'Timeframes' in df.columns:
-            # Confluences
             col_widths = {
                 'Actif': 22, 'Signal': 28, 'Niveau': 24, 'Type': 24,
                 'Timeframes': 60, 'Nb TF': 13, 'Force Totale': 22,
@@ -627,7 +690,6 @@ class PDF(FPDF):
             }
             font_size = 7
         else:
-            # Tableau S/R par TF
             col_widths = {
                 'Actif': 28, 'Prix Actuel': 28, 'Type': 22,
                 'Niveau': 28, 'Force': 24,
@@ -635,13 +697,11 @@ class PDF(FPDF):
             }
             font_size = 7
 
-        # Filtre les colonnes réellement présentes dans le df
         cols    = [c for c in col_widths if c in df.columns]
         total_w = sum(col_widths[c] for c in cols)
         usable_w = self.w - self.l_margin - self.r_margin
         x_start  = self.l_margin + max(0, (usable_w - total_w) / 2)
 
-        # En-tête
         self.set_font('Helvetica', 'B', font_size)
         self.set_x(x_start)
         for col_name in cols:
@@ -650,7 +710,6 @@ class PDF(FPDF):
                       new_x='RIGHT', new_y='TOP')
         self.ln()
 
-        # Lignes de données
         self.set_font('Helvetica', '', font_size)
         for i, (_, row) in enumerate(df.iterrows()):
             self.set_x(x_start)
@@ -666,7 +725,6 @@ class PDF(FPDF):
 
 
 def _apply_pdf_filter(df):
-    """Garde uniquement les lignes _in_pdf=True et supprime les colonnes internes."""
     if df.empty:
         return df
     if "_in_pdf" in df.columns:
@@ -675,10 +733,6 @@ def _apply_pdf_filter(df):
 
 
 def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomalies=None):
-    """
-    Génère le PDF — structure identique à l'original (simple, sans try/except inutiles).
-    Sections additionnelles : alertes qualité + résumé par actif.
-    """
     summaries = summaries or []
     anomalies = anomalies or []
 
@@ -687,7 +741,6 @@ def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomali
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # ── Alertes qualité données ──────────────────────────────────
     if anomalies:
         pdf.chapter_title('ALERTES QUALITE DES DONNEES')
         pdf.set_font('Helvetica', 'I', 8)
@@ -697,12 +750,10 @@ def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomali
             pdf.multi_cell(0, 5, line)
         pdf.ln(5)
 
-    # ── Résumé par actif ─────────────────────────────────────────
     if summaries:
         pdf.chapter_summary(summaries)
         pdf.add_page()
 
-    # ── Confluences multi-TF ─────────────────────────────────────
     if confluences_df is not None and not confluences_df.empty:
         pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
         clean_conf = strip_emojis_df(confluences_df.copy())
@@ -712,7 +763,6 @@ def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomali
         pdf.chapter_body(clean_conf)
         pdf.ln(10)
 
-    # ── Tables par timeframe ─────────────────────────────────────
     title_map = {
         'H4':     'Analyse 4 Heures (H4)',
         'Daily':  'Analyse Journaliere (Daily)',
@@ -774,13 +824,11 @@ def _display_results(sr, max_dist_filter):
         "Score":       st.column_config.NumberColumn("Score ▼",   width="small"),
     }
 
-    # ── Alertes anomalies ────────────────────────────────────────
     if anomalies:
         with st.expander(f"⚡ {len(anomalies)} alerte(s) qualité des données", expanded=True):
             for a in anomalies:
                 st.warning(f"**{a['actif']}** : {a['msg']}")
 
-    # ── Confluences ──────────────────────────────────────────────
     if not conf_filt.empty:
         st.divider()
         st.subheader("🔥 ZONES DE CONFLUENCE MULTI-TIMEFRAMES")
@@ -808,7 +856,6 @@ def _display_results(sr, max_dist_filter):
         st.info("Aucune confluence détectée dans la plage de distance sélectionnée. "
                 "Essayez d'augmenter le filtre ou le seuil de confluence.")
 
-    # ── Export — même pattern que l'original ────────────────────
     st.subheader("📋 Exportation du Rapport")
     with st.expander("Cliquez ici pour télécharger les résultats"):
         col1, col2 = st.columns(2)
@@ -831,7 +878,6 @@ def _display_results(sr, max_dist_filter):
                 use_container_width=True,
             )
 
-    # ── Helper filtre visuel ─────────────────────────────────────
     def _filter_and_sort(df, max_pct):
         if df.empty:
             return df
@@ -846,7 +892,6 @@ def _display_results(sr, max_dist_filter):
             out = out.sort_values("Score", ascending=False)
         return out.reset_index(drop=True)
 
-    # ── Tables TF ────────────────────────────────────────────────
     st.divider()
     st.subheader("📅 Analyse 4 Heures (H4)")
     fd = _filter_and_sort(df_h4, max_dist_filter)
@@ -891,15 +936,15 @@ with st.sidebar:
     st.header("3. Paramètres de Détection")
     zone_width = st.slider(
         "Largeur de zone Forex (%)", 0.1, 2.0, 0.5, 0.1,
-        help="Les indices utilisent 0.15%, les métaux 0.20-0.25% automatiquement.",
+        help="Indices: 0.20-0.30% auto | Métaux: 0.20-0.25% auto",
     )
     min_touches = st.slider(
         "Force minimale (touches)", 2, 10, 3, 1,
         help="Nombre de contacts minimum pour valider une zone.",
     )
     confluence_threshold = st.slider(
-        "Seuil de confluence (%)", 0.3, 2.0, 1.0, 0.1,
-        help="Distance max entre deux niveaux pour les considérer confluents.",
+        "Seuil de confluence Forex (%)", 0.3, 2.0, 1.0, 0.1,
+        help="Indices/Métaux utilisent des seuils adaptatifs (1.2-1.5%) automatiquement.",
     )
     max_dist_filter = st.slider(
         "Afficher zones < (%) — filtre visuel uniquement", 1.0, 15.0, 3.0, 0.5,
@@ -915,8 +960,9 @@ with st.sidebar:
 
     st.divider()
     st.caption("**Filtrage PDF adaptatif :**")
-    st.caption("Forex : ≤ 8% | Indices : ≤ 5% | Métaux : ≤ 10%")
-    st.caption("**Post-fusion :** zones < 0.3% fusionnées (Forex)")
+    st.caption("Forex : ≤ 8% | Indices : ≤ 4% abs | Métaux : ≤ 8% abs")
+    st.caption("**Post-fusion :** 0.30% Forex | 0.05% Indices | 0.15-0.20% Métaux")
+    st.caption("**Confluence :** 1.0% Forex | 1.2% Indices EU | 1.5% US/Métaux")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -980,16 +1026,17 @@ if scan_button and symbols_to_scan:
             progress_bar.empty()
             st.success(f"✅ Scan terminé ! {len(symbols_to_scan)} actifs analysés.")
 
-            # ── Confluences ──────────────────────────────────────
+            # ── Confluences avec seuils adaptatifs (CORRECTIF 3) ──
             st.info("🔍 Analyse des confluences multi-timeframes…")
             all_confluences = []
             for sym in symbols_to_scan:
                 cp = prices_map.get(sym)
-                # Exclure la clé interne _price_ctx
                 zones_clean = {k: v for k, v in all_zones_map.get(sym, {}).items()
                                if not k.startswith("_")}
+                # Seuil adaptatif par instrument
+                sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, confluence_threshold)
                 confs = detect_confluences(
-                    sym.replace("_", "/"), zones_clean, cp, confluence_threshold
+                    sym.replace("_", "/"), zones_clean, cp, sym_threshold
                 )
                 all_confluences.extend(confs)
 
@@ -1008,21 +1055,19 @@ if scan_button and symbols_to_scan:
             else:
                 conf_filtered = pd.DataFrame()
 
-            # ── Résumés par actif ─────────────────────────────────
+            # ── Résumés par actif ──────────────────────────────────
             summaries = []
             for sym in symbols_to_scan:
                 sym_d  = sym.replace("_", "/")
                 trends = trends_map.get(sym, {})
                 cp     = prices_map.get(sym)
 
-                # Top 3 confluences triées par Score
                 top_zones = []
                 if not conf_full.empty and sym_d in conf_full["Actif"].values:
                     ac = conf_full[conf_full["Actif"] == sym_d].copy()
                     ac = ac.sort_values("Score", ascending=False)
                     top_zones = ac.head(3).to_dict("records")
 
-                # Contexte prix (Daily)
                 price_ctx = ""
                 d_zones = all_zones_map.get(sym, {})
                 if "_price_ctx" in d_zones:
@@ -1040,12 +1085,11 @@ if scan_button and symbols_to_scan:
                     "top_zones":     top_zones,
                 })
 
-            # ── DataFrames finaux ─────────────────────────────────
+            # ── DataFrames finaux ──────────────────────────────────
             df_h4     = pd.DataFrame(results_h4)
             df_daily  = pd.DataFrame(results_daily)
             df_weekly = pd.DataFrame(results_weekly)
 
-            # PDF : filtre adaptatif par actif
             rep_dict = {
                 "H4":     _apply_pdf_filter(df_h4),
                 "Daily":  _apply_pdf_filter(df_daily),
