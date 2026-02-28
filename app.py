@@ -526,160 +526,147 @@ def scan_single_symbol(args):
 # ══════════════════════════════════════════════════════════════════
 # GÉNÉRATION PDF
 # ══════════════════════════════════════════════════════════════════
-def _strip(s):
-    """Nettoyage emoji + encodage latin-1 pour FPDF."""
-    MAP = {
-        "🟢": "[BUY]",  "🔴": "[SELL]", "🔥": "[CHAUD]",
-        "⚠️": "[PROCHE]", "⚡": "[!]",  "📡": "",
-        "📅": "", "📈": "", "📉": "",
-    }
-    for k, v in MAP.items():
-        s = s.replace(k, v)
-    return s.encode("latin-1", errors="ignore").decode("latin-1")
 
+# ══════════════════════════════════════════════════════════════════
+# PDF — pattern identique à l'original qui fonctionnait
+# ══════════════════════════════════════════════════════════════════
 
 def strip_emojis_df(df):
+    """Nettoyage emoji + encodage latin-1 — identique à l'original."""
+    emoji_map = {
+        '🟢': '[BUY]', '🔴': '[SELL]', '🔥': '[CHAUD]', '⚠️': '[PROCHE]',
+        '📈': '', '📉': '', '↔️': '', '✅': '[OK]', '❌': '[X]',
+        '⚡': '[!]', '📡': '', '📅': '',
+    }
     clean = df.copy()
-    for col in clean.select_dtypes(include="object").columns:
-        clean[col] = clean[col].astype(str).apply(_strip)
+    for col in clean.select_dtypes(include='object').columns:
+        for emoji, replacement in emoji_map.items():
+            clean[col] = clean[col].astype(str).str.replace(emoji, replacement, regex=False)
+        clean[col] = clean[col].apply(
+            lambda x: x.encode('latin-1', errors='ignore').decode('latin-1')
+        )
     return clean
 
 
 class PDF(FPDF):
     def header(self):
-        self.set_font("Helvetica", "B", 14)
-        self.cell(0, 9, "Rapport de Scan Support/Resistance", border=0, align="C",
-                  new_x="LMARGIN", new_y="NEXT")
-        self.set_font("Helvetica", "", 8)
-        self.cell(0, 5, f"Généré le : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
-                  border=0, align="C", new_x="LMARGIN", new_y="NEXT")
-        self.ln(3)
+        self.set_font('Helvetica', 'B', 15)
+        self.cell(0, 10, 'Rapport de Scan Support/Resistance', border=0, align='C',
+                  new_x='LMARGIN', new_y='NEXT')
+        self.set_font('Helvetica', '', 8)
+        self.cell(0, 10, f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
+                  border=0, align='C', new_x='LMARGIN', new_y='NEXT')
+        self.ln(5)
 
     def footer(self):
-        self.set_y(-14)
-        self.set_font("Helvetica", "I", 7)
-        self.cell(0, 8, f"Page {self.page_no()}", border=0, align="C")
+        self.set_y(-15)
+        self.set_font('Helvetica', 'I', 8)
+        self.cell(0, 10, f'Page {self.page_no()}', border=0, align='C')
 
-    def section_title(self, title, size=11):
-        self.set_font("Helvetica", "B", size)
-        self.set_fill_color(230, 230, 230)
-        self.cell(0, 7, _strip(title), border=0, align="L", fill=True,
-                  new_x="LMARGIN", new_y="NEXT")
+    def chapter_title(self, title):
+        self.set_font('Helvetica', 'B', 12)
+        self.cell(0, 10, title, border=0, align='L', new_x='LMARGIN', new_y='NEXT')
+        self.ln(4)
+
+    def chapter_summary(self, summaries):
+        """Résumé par actif : tendances + top zones. Style texte simple."""
+        self.set_font('Helvetica', 'B', 10)
+        self.cell(0, 7, 'RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)',
+                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(2)
 
-    # ── Section 1 : Alertes qualité ──────────────────────────────
-    def write_anomalies(self, anomalies):
-        self.section_title("⚡ ALERTES QUALITE DES DONNEES", size=10)
-        self.set_font("Helvetica", "I", 8)
-        for a in anomalies:
-            line = _strip(f"  {a['actif']} : {a['msg']}")
-            self.multi_cell(0, 5, line, new_x="LMARGIN", new_y="NEXT")
-        self.ln(4)
-
-    # ── Section 2 : Résumé par actif ─────────────────────────────
-    def write_asset_summaries(self, summaries):
-        self.section_title("RESUME PAR ACTIF — TENDANCES + TOP ZONES", size=11)
-        self.set_font("Helvetica", "", 7)
-
         for s in summaries:
-            sym     = _strip(s["symbol"])
-            t_h4    = s.get("trend_h4",    "N/A")
-            t_d     = s.get("trend_daily",  "N/A")
-            t_w     = s.get("trend_weekly", "N/A")
-            ctx     = _strip(s.get("price_context", ""))
+            sym = s.get('symbol', '').encode('latin-1', errors='ignore').decode('latin-1')
+            t_h4 = s.get('trend_h4',    'N/A')
+            t_d  = s.get('trend_daily',  'N/A')
+            t_w  = s.get('trend_weekly', 'N/A')
+            ctx  = s.get('price_context', '').encode('latin-1', errors='ignore').decode('latin-1')
 
-            # Ligne titre de l'actif
-            self.set_font("Helvetica", "B", 8)
-            self.cell(0, 5,
-                      f"{sym}   H4: {t_h4}   Daily: {t_d}   Weekly: {t_w}",
-                      new_x="LMARGIN", new_y="NEXT")
+            self.set_font('Helvetica', 'B', 8)
+            line = f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}"
+            self.cell(0, 5, line, border=0, new_x='LMARGIN', new_y='NEXT')
 
             if ctx:
-                self.set_font("Helvetica", "I", 7)
-                self.cell(0, 4, f"  Position : {ctx[:110]}", new_x="LMARGIN", new_y="NEXT")
+                self.set_font('Helvetica', 'I', 7)
+                self.cell(0, 4, f"  Position : {ctx[:120]}",
+                          border=0, new_x='LMARGIN', new_y='NEXT')
 
-            # Top 3 zones
-            self.set_font("Helvetica", "", 7)
-            top = s.get("top_zones", [])
+            top = s.get('top_zones', [])
+            self.set_font('Helvetica', '', 7)
             if top:
                 for z in top:
-                    sig   = _strip(z.get("Signal",     ""))
-                    niv   = z.get("Niveau",     "")
-                    dist  = z.get("Distance %", "")
-                    score = z.get("Score",      "")
-                    tfs   = z.get("Timeframes", "")
-                    ale   = _strip(z.get("Alerte", ""))
-                    line  = f"  {sig}  Niv:{niv}  Dist:{dist}  Score:{score}  TF:{tfs}  {ale}"
-                    self.cell(0, 4, line[:130], new_x="LMARGIN", new_y="NEXT")
+                    sig   = str(z.get('Signal',     '')).replace('🟢','[BUY]').replace('🔴','[SELL]')
+                    sig   = sig.encode('latin-1', errors='ignore').decode('latin-1')
+                    niv   = str(z.get('Niveau',     ''))
+                    dist  = str(z.get('Distance %', ''))
+                    score = str(z.get('Score',      ''))
+                    tfs   = str(z.get('Timeframes', ''))
+                    ale   = str(z.get('Alerte', '')).replace('🔥','[CHAUD]').replace('⚠️','[PROCHE]')
+                    ale   = ale.encode('latin-1', errors='ignore').decode('latin-1')
+                    txt   = f"  {sig}  Niv:{niv}  Dist:{dist}  Score:{score}  TF:{tfs}  {ale}"
+                    self.cell(0, 4, txt[:130], border=0, new_x='LMARGIN', new_y='NEXT')
             else:
-                self.cell(0, 4, "  Aucune confluence detectee pour cet actif.", new_x="LMARGIN", new_y="NEXT")
+                self.cell(0, 4, "  Aucune confluence pour cet actif.",
+                          border=0, new_x='LMARGIN', new_y='NEXT')
             self.ln(1)
 
-        self.ln(4)
-
-    # ── Table générique ───────────────────────────────────────────
-    def write_table(self, df, table_type="sr"):
+    def chapter_body(self, df):
+        """Identique à l'original + colonne Score + alternance de couleur."""
         if df.empty:
-            self.set_font("Helvetica", "I", 8)
-            self.cell(0, 6, "Aucune donnee dans la plage de distance selectionnee.",
-                      new_x="LMARGIN", new_y="NEXT")
-            self.ln(2)
+            self.set_font('Helvetica', '', 10)
+            self.multi_cell(0, 10, "Aucune donnee a afficher.")
+            self.ln()
             return
 
-        if table_type == "confluence":
-            cols = ["Actif", "Signal", "Niveau", "Type", "Timeframes",
-                    "Nb TF", "Force Totale", "Score", "Distance %", "Alerte"]
-            widths = {
-                "Actif": 20, "Signal": 24, "Niveau": 22, "Type": 20,
-                "Timeframes": 52, "Nb TF": 11, "Force Totale": 19,
-                "Score": 14, "Distance %": 17, "Alerte": 48,
+        if 'Timeframes' in df.columns:
+            # Confluences
+            col_widths = {
+                'Actif': 22, 'Signal': 28, 'Niveau': 24, 'Type': 24,
+                'Timeframes': 60, 'Nb TF': 13, 'Force Totale': 22,
+                'Score': 16, 'Distance %': 20, 'Alerte': 56,
             }
+            font_size = 7
         else:
-            cols = ["Actif", "Prix Actuel", "Type", "Niveau",
-                    "Force", "Dist. %", "Dist. ATR", "Score"]
-            widths = {
-                "Actif": 24, "Prix Actuel": 24, "Type": 20,
-                "Niveau": 26, "Force": 22, "Dist. %": 16,
-                "Dist. ATR": 16, "Score": 14,
+            # Tableau S/R par TF
+            col_widths = {
+                'Actif': 28, 'Prix Actuel': 28, 'Type': 22,
+                'Niveau': 28, 'Force': 24,
+                'Dist. %': 18, 'Dist. ATR': 18, 'Score': 16,
             }
+            font_size = 7
 
-        cols      = [c for c in cols if c in df.columns]
-        total_w   = sum(widths.get(c, 14) for c in cols)
-        usable_w  = self.w - self.l_margin - self.r_margin
-        x0        = self.l_margin + max(0, (usable_w - total_w) / 2)
-        font_size = 6.5
+        # Filtre les colonnes réellement présentes dans le df
+        cols    = [c for c in col_widths if c in df.columns]
+        total_w = sum(col_widths[c] for c in cols)
+        usable_w = self.w - self.l_margin - self.r_margin
+        x_start  = self.l_margin + max(0, (usable_w - total_w) / 2)
 
         # En-tête
-        self.set_font("Helvetica", "B", font_size)
-        self.set_fill_color(210, 210, 210)
-        self.set_x(x0)
-        for col in cols:
-            w = widths.get(col, 14)
-            self.cell(w, 5, col, border=1, align="C", fill=True,
-                      new_x="RIGHT", new_y="TOP")
+        self.set_font('Helvetica', 'B', font_size)
+        self.set_x(x_start)
+        for col_name in cols:
+            w = col_widths[col_name]
+            self.cell(w, 6, col_name, border=1, align='C',
+                      new_x='RIGHT', new_y='TOP')
         self.ln()
 
-        # Lignes
-        self.set_font("Helvetica", "", font_size)
-        for row_i, (_, row) in enumerate(df.iterrows()):
-            # Alternance légère de couleur
-            self.set_fill_color(248, 248, 248) if row_i % 2 == 0 else self.set_fill_color(255, 255, 255)
-            self.set_x(x0)
-            for col in cols:
-                w   = widths.get(col, 14)
-                val = _strip(str(row.get(col, "")))
-                mc  = int(w / 1.15)
-                if len(val) > mc:
-                    val = val[:mc - 1] + "."
-                self.cell(w, 4.5, val, border=1, align="C", fill=True,
-                          new_x="RIGHT", new_y="TOP")
+        # Lignes de données
+        self.set_font('Helvetica', '', font_size)
+        for i, (_, row) in enumerate(df.iterrows()):
+            self.set_x(x_start)
+            for col_name in cols:
+                w        = col_widths[col_name]
+                val      = str(row[col_name])
+                max_chars = int(w / 1.25)
+                if len(val) > max_chars:
+                    val = val[:max_chars - 1] + '.'
+                self.cell(w, 5, val, border=1, align='C',
+                          new_x='RIGHT', new_y='TOP')
             self.ln()
 
-        self.ln(1)
 
-
-def _apply_pdf_filter(df, symbol=None):
-    """Garde uniquement les lignes marquées _in_pdf=True, puis supprime les colonnes internes."""
+def _apply_pdf_filter(df):
+    """Garde uniquement les lignes _in_pdf=True et supprime les colonnes internes."""
     if df.empty:
         return df
     if "_in_pdf" in df.columns:
@@ -687,97 +674,62 @@ def _apply_pdf_filter(df, symbol=None):
     return df.drop(columns=["_in_pdf", "_dist_num"], errors="ignore").reset_index(drop=True)
 
 
-def create_pdf_report(results_dict, confluences_df, summaries=None, anomalies=None):
+def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomalies=None):
     """
-    Génère le rapport PDF complet.
-    Entouré d'un try/except global : en cas d'erreur inattendue,
-    retourne un PDF d'une page indiquant l'erreur (jamais None).
+    Génère le PDF — structure identique à l'original (simple, sans try/except inutiles).
+    Sections additionnelles : alertes qualité + résumé par actif.
     """
     summaries = summaries or []
     anomalies = anomalies or []
 
-    try:
-        pdf = PDF("L", "mm", "A4")
-        pdf.set_margins(5, 12, 5)
-        pdf.set_auto_page_break(auto=True, margin=14)
+    pdf = PDF('L', 'mm', 'A4')
+    pdf.set_margins(5, 10, 5)
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # ── Alertes qualité données ──────────────────────────────────
+    if anomalies:
+        pdf.chapter_title('ALERTES QUALITE DES DONNEES')
+        pdf.set_font('Helvetica', 'I', 8)
+        for a in anomalies:
+            line = f"  {a['actif']} : {a['msg']}"
+            line = line.encode('latin-1', errors='ignore').decode('latin-1')
+            pdf.multi_cell(0, 5, line)
+        pdf.ln(5)
+
+    # ── Résumé par actif ─────────────────────────────────────────
+    if summaries:
+        pdf.chapter_summary(summaries)
         pdf.add_page()
 
-        # 1. Alertes qualité données
-        if anomalies:
-            try:
-                pdf.write_anomalies(anomalies)
-            except Exception:
-                pass  # section non critique
+    # ── Confluences multi-TF ─────────────────────────────────────
+    if confluences_df is not None and not confluences_df.empty:
+        pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
+        clean_conf = strip_emojis_df(confluences_df.copy())
+        clean_conf = clean_conf.drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
+        if "Score" in clean_conf.columns:
+            clean_conf = clean_conf.sort_values("Score", ascending=False)
+        pdf.chapter_body(clean_conf)
+        pdf.ln(10)
 
-        # 2. Résumé par actif
-        if summaries:
-            try:
-                pdf.write_asset_summaries(summaries)
-                pdf.add_page()
-            except Exception:
-                pass  # section non critique
+    # ── Tables par timeframe ─────────────────────────────────────
+    title_map = {
+        'H4':     'Analyse 4 Heures (H4)',
+        'Daily':  'Analyse Journaliere (Daily)',
+        'Weekly': 'Analyse Hebdomadaire (Weekly)',
+    }
+    for tf_key, df in results_dict.items():
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            continue
+        pdf.chapter_title(title_map.get(tf_key, tf_key))
+        clean_df = strip_emojis_df(df.copy())
+        clean_df = clean_df.drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
+        if "Score" in clean_df.columns:
+            clean_df = clean_df.sort_values("Score", ascending=False)
+        pdf.chapter_body(clean_df)
+        pdf.ln(10)
 
-        # 3. Confluences multi-TF
-        if confluences_df is not None and not confluences_df.empty:
-            try:
-                pdf.section_title("ZONES DE CONFLUENCE MULTI-TIMEFRAMES")
-                clean_conf = strip_emojis_df(confluences_df.copy())
-                if "Score" in clean_conf.columns:
-                    clean_conf = clean_conf.sort_values("Score", ascending=False)
-                # Supprimer colonnes internes si présentes
-                clean_conf = clean_conf.drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
-                pdf.write_table(clean_conf, table_type="confluence")
-                pdf.ln(5)
-            except Exception:
-                pass
-
-        # 4. Tables TF individuelles
-        tf_titles = {
-            "H4":     "ANALYSE 4 HEURES (H4)",
-            "Daily":  "ANALYSE JOURNALIERE (Daily)",
-            "Weekly": "ANALYSE HEBDOMADAIRE (Weekly)",
-        }
-        for tf_key, df in results_dict.items():
-            try:
-                if df is None or (hasattr(df, "empty") and df.empty):
-                    continue
-                pdf.section_title(tf_titles.get(tf_key, tf_key))
-                clean_df = strip_emojis_df(df.copy())
-                clean_df = clean_df.drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
-                if "Score" in clean_df.columns:
-                    clean_df = clean_df.sort_values("Score", ascending=False)
-                pdf.write_table(clean_df, table_type="sr")
-                pdf.ln(4)
-            except Exception:
-                pass
-
-        output = pdf.output()
-        # fpdf2 renvoie bytearray ou bytes selon la version
-        return bytes(output) if not isinstance(output, bytes) else output
-
-    except Exception as e:
-        # Fallback : PDF minimal avec message d'erreur
-        try:
-            err_pdf = PDF("L", "mm", "A4")
-            err_pdf.set_margins(10, 15, 10)
-            err_pdf.add_page()
-            err_pdf.set_font("Helvetica", "B", 12)
-            err_pdf.cell(0, 10, "Erreur lors de la generation du PDF",
-                         new_x="LMARGIN", new_y="NEXT")
-            err_pdf.set_font("Helvetica", "", 9)
-            err_pdf.multi_cell(0, 7, f"Detail : {str(e)[:300]}")
-            err_pdf.ln(5)
-            err_pdf.multi_cell(0, 7,
-                "Les donnees sont disponibles via l'export CSV. "
-                "Relancez le scan pour regenerer le PDF.")
-            out = err_pdf.output()
-            return bytes(out) if not isinstance(out, bytes) else out
-        except Exception:
-            # Dernier recours : PDF vide valide
-            return b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj " \
-                   b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj " \
-                   b"3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\n" \
-                   b"xref\n0 4\n0000000000 65535 f\ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n9\n%%EOF"
+    return bytes(pdf.output())
 
 
 def create_csv_report(results_dict, confluences_df=None):
@@ -856,39 +808,28 @@ def _display_results(sr, max_dist_filter):
         st.info("Aucune confluence détectée dans la plage de distance sélectionnée. "
                 "Essayez d'augmenter le filtre ou le seuil de confluence.")
 
-    # ── Export ───────────────────────────────────────────────────
+    # ── Export — même pattern que l'original ────────────────────
     st.subheader("📋 Exportation du Rapport")
-    with st.expander("Télécharger les résultats"):
-        ec1, ec2 = st.columns(2)
-        with ec1:
-            try:
-                pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
-            except Exception as _pdf_err:
-                pdf_bytes = None
-                st.error(f"Erreur PDF : {_pdf_err}")
-            if pdf_bytes:
-                st.download_button(
-                    "📄 Rapport PDF complet (filtré adaptatif)",
-                    data=pdf_bytes,
-                    file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            else:
-                st.warning("⚠️ Le PDF n'a pas pu être généré — utilisez le CSV.")
-        with ec2:
-            try:
-                csv_bytes = create_csv_report(rep_dict, conf_full)
-            except Exception:
-                csv_bytes = b""
-            if csv_bytes:
-                st.download_button(
-                    "📊 Données CSV (toutes zones)",
-                    data=csv_bytes,
-                    file_name=f"donnees_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+    with st.expander("Cliquez ici pour télécharger les résultats"):
+        col1, col2 = st.columns(2)
+        with col1:
+            pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
+            st.download_button(
+                "📄 Télécharger le Rapport (PDF)",
+                data=pdf_bytes,
+                file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        with col2:
+            csv_bytes = create_csv_report(rep_dict, conf_full)
+            st.download_button(
+                "📊 Télécharger les Données (CSV)",
+                data=csv_bytes,
+                file_name=f"donnees_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     # ── Helper filtre visuel ─────────────────────────────────────
     def _filter_and_sort(df, max_pct):
