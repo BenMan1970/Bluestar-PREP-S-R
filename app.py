@@ -113,39 +113,49 @@ CONFLUENCE_THRESHOLD_MAP = {
 # ══════════════════════════════════════════════════════════════════
 # UTILITAIRE PDF — CORRECTION BUG FPDFUnicodeEncodingException
 # ══════════════════════════════════════════════════════════════════
-# Les polices core fpdf2 (Helvetica, Times, Courier) utilisent l'encodage
-# latin-1 en interne. Tout caractère Unicode hors latin-1 lève une
-# FPDFUnicodeEncodingException. Cette fonction translitère les accents
-# français courants en ASCII puis encode proprement en latin-1.
-_ACCENT_MAP = str.maketrans({
-    'à': 'a', 'â': 'a', 'ä': 'a', 'á': 'a', 'ã': 'a',
-    'è': 'e', 'é': 'e', 'ê': 'e', 'ë': 'e',
-    'î': 'i', 'ï': 'i', 'í': 'i', 'ì': 'i',
-    'ô': 'o', 'ö': 'o', 'ó': 'o', 'ò': 'o', 'õ': 'o',
-    'ù': 'u', 'û': 'u', 'ü': 'u', 'ú': 'u',
-    'ç': 'c', 'ñ': 'n',
-    'À': 'A', 'Â': 'A', 'Ä': 'A', 'Á': 'A',
-    'È': 'E', 'É': 'E', 'Ê': 'E', 'Ë': 'E',
-    'Î': 'I', 'Ï': 'I', 'Í': 'I',
-    'Ô': 'O', 'Ö': 'O', 'Ó': 'O',
-    'Ù': 'U', 'Û': 'U', 'Ü': 'U', 'Ú': 'U',
-    'Ç': 'C', 'Ñ': 'N',
-    # Emojis fréquents dans les données
-    '🟢': '[BUY]', '🔴': '[SELL]', '🔥': '[CHAUD]', '⚠️': '[PROCHE]',
-    '📈': '', '📉': '', '↔️': '', '✅': '[OK]', '❌': '[X]',
-    '⚡': '[!]', '📡': '', '📅': '',
-})
+# str.maketrans() n'accepte que des clés à 1 seul codepoint.
+# Les emojis composés comme '⚠️' (2 codepoints) lèvent un ValueError.
+# → On sépare : _ACCENT_MAP (str.maketrans, 1 char) + _EMOJI_MAP (str.replace).
+
+# Accents uniquement — tous des caractères simples (1 codepoint)
+_ACCENT_MAP = str.maketrans(
+    'àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ',
+    'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN'
+)
+
+# Emojis et séquences multi-codepoints — traités par str.replace()
+_EMOJI_MAP = [
+    ('🟢', '[BUY]'),
+    ('🔴', '[SELL]'),
+    ('🔥', '[CHAUD]'),
+    ('⚠️', '[PROCHE]'),
+    ('⚠',  '[PROCHE]'),   # variante sans sélecteur de variation
+    ('📈', ''),
+    ('📉', ''),
+    ('↔️', ''),
+    ('↔',  ''),
+    ('✅', '[OK]'),
+    ('❌', '[X]'),
+    ('⚡', '[!]'),
+    ('📡', ''),
+    ('📅', ''),
+]
 
 def _safe_pdf_str(text: str) -> str:
     """
     Convertit une chaîne quelconque en chaîne sûre pour les polices
-    core fpdf2 (latin-1). Translitère les accents français, supprime
-    les emojis et encode en latin-1 avec remplacement du reste.
+    core fpdf2 (latin-1). Translitère les accents français (str.translate),
+    remplace les emojis (str.replace), puis encode en latin-1 avec
+    remplacement des caractères restants.
     """
     if not isinstance(text, str):
         text = str(text)
+    # 1. Translitérer les accents (clés single-char → safe pour maketrans)
     text = text.translate(_ACCENT_MAP)
-    # Supprimer tout caractère restant hors latin-1
+    # 2. Remplacer les emojis / séquences multi-codepoints
+    for emoji, replacement in _EMOJI_MAP:
+        text = text.replace(emoji, replacement)
+    # 3. Éliminer tout caractère restant hors latin-1
     return text.encode('latin-1', errors='replace').decode('latin-1')
 
 
@@ -1288,3 +1298,4 @@ if "scan_results" in st.session_state and not scan_button:
         st.session_state["scan_results"],
         st.session_state["scan_results"].get("max_dist", 3.0),
     )
+             
