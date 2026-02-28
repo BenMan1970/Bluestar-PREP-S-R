@@ -31,7 +31,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("📡 Scanner S/R Exhaustif — v4 (H4, D1, W)")
+st.title("📡 Scanner S/R Exhaustif - v4 (H4, D1, W)")
 st.markdown(
     "Zones S/R avec **swing HH/LL confirmé**, **score pondéré TF+âge**, "
     "**statut Vierge/Testée/Consommée**, **plage prix valides**."
@@ -39,7 +39,7 @@ st.markdown(
 
 col_l, col_c, col_r = st.columns([2, 1, 2])
 with col_c:
-    scan_button = st.button("🚀 LANCER LE SCAN", type="primary", use_container_width=True)
+    scan_button = st.button("🚀 LANCER LE SCAN", type="primary", width='stretch')
 
 # ══════════════════════════════════════════════════════════════════
 # CONSTANTES
@@ -63,7 +63,7 @@ ATR_ZONE_COEFF = {
 }
 DEFAULT_ATR_COEFF = 0.4  # Forex
 
-# ── NOUVEAU : Prominence ATR — filtre les micro-pivots (v3) ──────
+# ── NOUVEAU : Prominence ATR - filtre les micro-pivots (v3) ──────
 # Pivot valide = amplitude > ATR × coefficient
 PROMINENCE_COEFF = {
     "XAU_USD": 0.5, "XAG_USD": 0.5, "XPT_USD": 0.5,
@@ -191,7 +191,7 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
 
 
 # ══════════════════════════════════════════════════════════════════
-# NOUVEAU v3 : Validation prix — plage sanity + cohérence H4
+# NOUVEAU v3 : Validation prix - plage sanity + cohérence H4
 # ══════════════════════════════════════════════════════════════════
 def validate_live_price(live_price, symbol, base_url, access_token):
     """
@@ -205,7 +205,7 @@ def validate_live_price(live_price, symbol, base_url, access_token):
 
     alerts = []
 
-    # Étape 1 — plage de prix valide
+    # Étape 1 - plage de prix valide
     if symbol in PRICE_SANITY_RANGE:
         lo, hi = PRICE_SANITY_RANGE[symbol]
         if not (lo <= live_price <= hi):
@@ -213,9 +213,9 @@ def validate_live_price(live_price, symbol, base_url, access_token):
                 f"Prix live {live_price:.2f} hors plage valide [{lo:.0f}-{hi:.0f}] "
                 f"(prob. problème cents/unités OANDA)"
             )
-            live_price = None  # invalider — on utilisera le close H4
+            live_price = None  # invalider - on utilisera le close H4
 
-    # Étape 2 — cohérence vs dernier close H4
+    # Étape 2 - cohérence vs dernier close H4
     df_check = get_oanda_data(base_url, access_token, symbol, "h4", limit=10)
     if df_check is not None and not df_check.empty:
         last_close = df_check["close"].iloc[-1]
@@ -225,7 +225,7 @@ def validate_live_price(live_price, symbol, base_url, access_token):
                 lo, hi = PRICE_SANITY_RANGE[symbol]
                 if not (lo <= last_close <= hi):
                     alerts.append(
-                        f"Close H4 {last_close:.2f} aussi hors plage — "
+                        f"Close H4 {last_close:.2f} aussi hors plage - "
                         f"données OANDA non fiables pour cet instrument"
                     )
                     return None, " | ".join(alerts) if alerts else None
@@ -235,7 +235,7 @@ def validate_live_price(live_price, symbol, base_url, access_token):
                 if dev > 15.0:
                     alerts.append(
                         f"Prix live {live_price:.2f} écarté de {dev:.1f}% "
-                        f"du close H4 ({last_close:.2f}) — fallback close H4"
+                        f"du close H4 ({last_close:.2f}) - fallback close H4"
                     )
                     live_price = last_close
             else:
@@ -303,12 +303,12 @@ def compute_trend(df, sma_period=20):
     return "NEUTRE"
 
 
-# Poids par timeframe — Weekly touche vaut 3× H4
+# Poids par timeframe - Weekly touche vaut 3× H4
 TF_WEIGHT = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 
 def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_bars=500):
     """
-    v4 CHANTIER 2 — Score pondéré TF + décroissance temporelle.
+    v4 CHANTIER 2 - Score pondéré TF + décroissance temporelle.
 
     Formule :
       Score = (Force × Poids_TF × Nb_TF) × Facteur_Age
@@ -402,7 +402,7 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
             if ratio > 1.8:
                 messages.append(
                     f"Prix {current_price:.2f} = {ratio:.1f}x la médiane des supports "
-                    f"({median_sup:.2f}) — données à vérifier"
+                    f"({median_sup:.2f}) - données à vérifier"
                 )
     if last_candle_close and last_candle_close > 0:
         dev = abs(current_price - last_candle_close) / last_candle_close * 100
@@ -440,7 +440,7 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
       - high[i] > high[i-n:i]   (dominant sur N bougies avant)
       - high[i] > high[i+1:i+n+1] (dominant sur N bougies après)
       - close[i+1] < high[i]    (confirmation : la bougie suivante
-                                  clôture EN DESSOUS du pivot — le
+                                  clôture EN DESSOUS du pivot - le
                                   marché a bien rejeté ce niveau)
     Idem inversé pour Swing Low.
 
@@ -498,7 +498,7 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
 
 
 # ══════════════════════════════════════════════════════════════════
-# v4 CHANTIER 3 : Statut de zone — Vierge / Testée / Consommée
+# v4 CHANTIER 3 : Statut de zone - Vierge / Testée / Consommée
 # ══════════════════════════════════════════════════════════════════
 def classify_zone_status(level, zone_type, df, formation_idx,
                           atr_val=None, tolerance_coeff=0.25):
@@ -513,7 +513,7 @@ def classify_zone_status(level, zone_type, df, formation_idx,
                  n'a pas clôturé au-delà. Niveau respecté, toujours actif.
 
     CONSOMMÉE  : Le prix a clôturé au-delà de la zone (break confirmé
-                 par clôture). Le niveau a perdu sa nature originelle —
+                 par clôture). Le niveau a perdu sa nature originelle -
                  peut devenir opposé (support → résistance) mais est
                  moins fiable dans sa direction initiale.
 
@@ -556,7 +556,7 @@ def classify_zone_status(level, zone_type, df, formation_idx,
 
 
 # ══════════════════════════════════════════════════════════════════
-# v4 : Détection S/R — swing HH/LL + ATR width + statut zones
+# v4 : Détection S/R - swing HH/LL + ATR width + statut zones
 # ══════════════════════════════════════════════════════════════════
 def find_strong_sr_zones(df, current_price, atr_val=None,
                           zone_percentage_width=0.5,
@@ -902,12 +902,12 @@ def strip_emojis_df(df):
 class PDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 15)
-        self.cell(0, 10, 'Rapport de Scan Support/Resistance — v4', border=0, align='C',
+        self.cell(0, 10, 'Rapport de Scan Support/Resistance - v4', border=0, align='C',
                   new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
         self.cell(0, 6,
             f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
-            "v4 — Score = (Force x Poids_TF x NbTF) x Facteur_Age | Statut Vierge/Testee/Consommee",
+            "v4 - Score = (Force x Poids_TF x NbTF) x Facteur_Age | Statut Vierge/Testee/Consommee",
             border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
 
@@ -971,14 +971,14 @@ class PDF(FPDF):
             return
 
         if 'Timeframes' in df.columns:
-            # Table confluences — v4 : Statut après Score
+            # Table confluences - v4 : Statut après Score
             col_widths = {
                 'Actif': 20, 'Signal': 26, 'Niveau': 22, 'Type': 22,
                 'Timeframes': 50, 'Nb TF': 12, 'Force Totale': 20,
                 'Score': 18, 'Statut': 22, 'Distance %': 18, 'Alerte': 55,
             }
         else:
-            # Tables par TF — v4 : Statut après Score
+            # Tables par TF - v4 : Statut après Score
             col_widths = {
                 'Actif': 24, 'Prix Actuel': 24, 'Type': 20,
                 'Niveau': 24, 'Force': 20,
@@ -1141,7 +1141,7 @@ def _display_results(sr, max_dist_filter):
             "Score":        st.column_config.NumberColumn("Score ▼",      width="small"),
         }
         st.dataframe(disp, column_config=conf_cfg, hide_index=True,
-                     use_container_width=True, height=min(len(disp) * 35 + 38, 750))
+                     width='stretch', height=min(len(disp) * 35 + 38, 750))
     else:
         st.info("Aucune confluence dans la plage sélectionnée. Augmentez le filtre ou le seuil.")
 
@@ -1155,7 +1155,7 @@ def _display_results(sr, max_dist_filter):
                 data=pdf_bytes,
                 file_name=f"rapport_sr_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
                 mime="application/pdf",
-                use_container_width=True,
+                width='stretch',
             )
         with col2:
             csv_bytes = create_csv_report(rep_dict, conf_full)
@@ -1164,7 +1164,7 @@ def _display_results(sr, max_dist_filter):
                 data=csv_bytes,
                 file_name=f"donnees_sr_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv",
-                use_container_width=True,
+                width='stretch',
             )
 
     def _filter_and_sort(df, max_pct):
@@ -1183,17 +1183,17 @@ def _display_results(sr, max_dist_filter):
     st.subheader("📅 Analyse 4 Heures (H4)")
     fd = _filter_and_sort(df_h4, max_dist_filter)
     st.dataframe(fd, column_config=tf_cfg, hide_index=True,
-                 use_container_width=True, height=min(len(fd) * 35 + 38, 600))
+                 width='stretch', height=min(len(fd) * 35 + 38, 600))
 
     st.subheader("📅 Analyse Journalière (Daily)")
     fd = _filter_and_sort(df_daily, max_dist_filter)
     st.dataframe(fd, column_config=tf_cfg, hide_index=True,
-                 use_container_width=True, height=min(len(fd) * 35 + 38, 600))
+                 width='stretch', height=min(len(fd) * 35 + 38, 600))
 
     st.subheader("📅 Analyse Hebdomadaire (Weekly)")
     fd = _filter_and_sort(df_wk, max_dist_filter)
     st.dataframe(fd, column_config=tf_cfg, hide_index=True,
-                 use_container_width=True, height=min(len(fd) * 35 + 38, 600))
+                 width='stretch', height=min(len(fd) * 35 + 38, 600))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1234,7 +1234,7 @@ with st.sidebar:
         help="Indices/Métaux utilisent des seuils adaptatifs (1.2-1.5%) automatiquement.",
     )
     max_dist_filter = st.slider(
-        "Afficher zones < (%) — filtre visuel uniquement", 1.0, 15.0, 3.0, 0.5,
+        "Afficher zones < (%) - filtre visuel uniquement", 1.0, 15.0, 3.0, 0.5,
     )
 
     st.divider()
@@ -1245,7 +1245,7 @@ with st.sidebar:
     st.caption("⚪ < 30  : Zone secondaire")
 
     st.divider()
-    st.caption("**v4 — Améliorations moteur :**")
+    st.caption("**v4 - Améliorations moteur :**")
     st.caption("✅ Swing HH/LL confirmé (clôture suivante)")
     st.caption("✅ Score pondéré TF (Weekly=3× H4) + âge")
     st.caption("✅ Statut : Vierge / Testée / Consommée")
@@ -1307,7 +1307,7 @@ if scan_button and symbols_to_scan:
                         pass
 
             progress_bar.empty()
-            st.success(f"✅ Scan v4 terminé — {len(symbols_to_scan)} actifs analysés.")
+            st.success(f"✅ Scan v4 terminé - {len(symbols_to_scan)} actifs analysés.")
 
             st.info("🔍 Analyse des confluences multi-timeframes…")
             all_confluences = []
