@@ -293,21 +293,25 @@ def flag_data_anomaly(symbol, current_price, support_levels):
 def get_price_context(current_price, supports, resistances):
     """
     Génère un résumé textuel court de la position du prix
-    par rapport aux zones les plus proches (Daily).
+    par rapport aux zones les plus proches.
+    Utilise toujours le support le plus HAUT (le plus proche sous le prix)
+    et la résistance la plus BASSE (la plus proche au-dessus).
     """
     parts = []
 
     if not supports.empty:
-        ns     = supports.iloc[-1]
-        dist_s = abs(current_price - ns["level"]) / current_price * 100
+        # Support le plus proche = niveau le plus élevé parmi les supports
+        nearest_sup = supports.loc[supports["level"].idxmax()]
+        dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
         tag    = "SUR support" if dist_s < 0.5 else "S proche"
-        parts.append(f"{tag}: {ns['level']:.5f} (-{dist_s:.2f}%)")
+        parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
 
     if not resistances.empty:
-        nr     = resistances.iloc[0]
-        dist_r = abs(current_price - nr["level"]) / current_price * 100
+        # Résistance la plus proche = niveau le plus bas parmi les résistances
+        nearest_res = resistances.loc[resistances["level"].idxmin()]
+        dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
         tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
-        parts.append(f"{tag}: {nr['level']:.5f} (+{dist_r:.2f}%)")
+        parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
 
     return "  |  ".join(parts) if parts else "Zone intermédiaire"
 
@@ -683,47 +687,97 @@ def _apply_pdf_filter(df, symbol=None):
     return df.drop(columns=["_in_pdf", "_dist_num"], errors="ignore").reset_index(drop=True)
 
 
-def create_pdf_report(results_dict, confluences_df, summaries, anomalies):
-    pdf = PDF("L", "mm", "A4")
-    pdf.set_margins(5, 12, 5)
-    pdf.set_auto_page_break(auto=True, margin=14)
-    pdf.add_page()
+def create_pdf_report(results_dict, confluences_df, summaries=None, anomalies=None):
+    """
+    Génère le rapport PDF complet.
+    Entouré d'un try/except global : en cas d'erreur inattendue,
+    retourne un PDF d'une page indiquant l'erreur (jamais None).
+    """
+    summaries = summaries or []
+    anomalies = anomalies or []
 
-    # 1. Alertes qualité
-    if anomalies:
-        pdf.write_anomalies(anomalies)
-
-    # 2. Résumé par actif (tendances + top zones)
-    if summaries:
-        pdf.write_asset_summaries(summaries)
+    try:
+        pdf = PDF("L", "mm", "A4")
+        pdf.set_margins(5, 12, 5)
+        pdf.set_auto_page_break(auto=True, margin=14)
         pdf.add_page()
 
-    # 3. Confluences multi-TF
-    if confluences_df is not None and not confluences_df.empty:
-        pdf.section_title("ZONES DE CONFLUENCE MULTI-TIMEFRAMES (filtrees par distance adaptative)")
-        clean_conf = strip_emojis_df(confluences_df)
-        # Tri par Score décroissant
-        if "Score" in clean_conf.columns:
-            clean_conf = clean_conf.sort_values("Score", ascending=False)
-        pdf.write_table(clean_conf, table_type="confluence")
-        pdf.ln(5)
+        # 1. Alertes qualité données
+        if anomalies:
+            try:
+                pdf.write_anomalies(anomalies)
+            except Exception:
+                pass  # section non critique
 
-    # 4. Tables TF individuelles
-    tf_titles = {
-        "H4":     "ANALYSE 4 HEURES (H4)",
-        "Daily":  "ANALYSE JOURNALIERE (Daily)",
-        "Weekly": "ANALYSE HEBDOMADAIRE (Weekly)",
-    }
-    for tf_key, df in results_dict.items():
-        if not df.empty:
-            pdf.section_title(tf_titles.get(tf_key, tf_key))
-            clean_df = strip_emojis_df(df)
-            if "Score" in clean_df.columns:
-                clean_df = clean_df.sort_values("Score", ascending=False)
-            pdf.write_table(clean_df, table_type="sr")
-            pdf.ln(4)
+        # 2. Résumé par actif
+        if summaries:
+            try:
+                pdf.write_asset_summaries(summaries)
+                pdf.add_page()
+            except Exception:
+                pass  # section non critique
 
-    return bytes(pdf.output())
+        # 3. Confluences multi-TF
+        if confluences_df is not None and not confluences_df.empty:
+            try:
+                pdf.section_title("ZONES DE CONFLUENCE MULTI-TIMEFRAMES")
+                clean_conf = strip_emojis_df(confluences_df.copy())
+                if "Score" in clean_conf.columns:
+                    clean_conf = clean_conf.sort_values("Score", ascending=False)
+                # Supprimer colonnes internes si présentes
+                clean_conf = clean_conf.drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
+                pdf.write_table(clean_conf, table_type="confluence")
+                pdf.ln(5)
+            except Exception:
+                pass
+
+        # 4. Tables TF individuelles
+        tf_titles = {
+            "H4":     "ANALYSE 4 HEURES (H4)",
+            "Daily":  "ANALYSE JOURNALIERE (Daily)",
+            "Weekly": "ANALYSE HEBDOMADAIRE (Weekly)",
+        }
+        for tf_key, df in results_dict.items():
+            try:
+                if df is None or (hasattr(df, "empty") and df.empty):
+                    continue
+                pdf.section_title(tf_titles.get(tf_key, tf_key))
+                clean_df = strip_emojis_df(df.copy())
+                clean_df = clean_df.drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
+                if "Score" in clean_df.columns:
+                    clean_df = clean_df.sort_values("Score", ascending=False)
+                pdf.write_table(clean_df, table_type="sr")
+                pdf.ln(4)
+            except Exception:
+                pass
+
+        output = pdf.output()
+        # fpdf2 renvoie bytearray ou bytes selon la version
+        return bytes(output) if not isinstance(output, bytes) else output
+
+    except Exception as e:
+        # Fallback : PDF minimal avec message d'erreur
+        try:
+            err_pdf = PDF("L", "mm", "A4")
+            err_pdf.set_margins(10, 15, 10)
+            err_pdf.add_page()
+            err_pdf.set_font("Helvetica", "B", 12)
+            err_pdf.cell(0, 10, "Erreur lors de la generation du PDF",
+                         new_x="LMARGIN", new_y="NEXT")
+            err_pdf.set_font("Helvetica", "", 9)
+            err_pdf.multi_cell(0, 7, f"Detail : {str(e)[:300]}")
+            err_pdf.ln(5)
+            err_pdf.multi_cell(0, 7,
+                "Les donnees sont disponibles via l'export CSV. "
+                "Relancez le scan pour regenerer le PDF.")
+            out = err_pdf.output()
+            return bytes(out) if not isinstance(out, bytes) else out
+        except Exception:
+            # Dernier recours : PDF vide valide
+            return b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj " \
+                   b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj " \
+                   b"3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\n" \
+                   b"xref\n0 4\n0000000000 65535 f\ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n9\n%%EOF"
 
 
 def create_csv_report(results_dict, confluences_df=None):
@@ -748,14 +802,14 @@ def create_csv_report(results_dict, confluences_df=None):
 # AFFICHAGE STREAMLIT
 # ══════════════════════════════════════════════════════════════════
 def _display_results(sr, max_dist_filter):
-    df_h4    = sr["df_h4"]
-    df_daily = sr["df_daily"]
-    df_wk    = sr["df_weekly"]
-    conf_full = sr["conf_full"]
-    conf_filt = sr["conf_filtered"]
-    rep_dict  = sr["report_dict"]
-    summaries = sr["summaries"]
-    anomalies = sr["anomaly_flags"]
+    df_h4     = sr.get("df_h4",         pd.DataFrame())
+    df_daily  = sr.get("df_daily",       pd.DataFrame())
+    df_wk     = sr.get("df_weekly",      pd.DataFrame())
+    conf_full = sr.get("conf_full",      pd.DataFrame())
+    conf_filt = sr.get("conf_filtered",  pd.DataFrame())
+    rep_dict  = sr.get("report_dict",    {})
+    summaries = sr.get("summaries",      [])
+    anomalies = sr.get("anomaly_flags",  [])
 
     tf_cfg = {
         "Actif":       st.column_config.TextColumn("Actif",       width="small"),
@@ -807,23 +861,34 @@ def _display_results(sr, max_dist_filter):
     with st.expander("Télécharger les résultats"):
         ec1, ec2 = st.columns(2)
         with ec1:
-            pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
-            st.download_button(
-                "📄 Rapport PDF complet (filtré adaptatif)",
-                data=pdf_bytes,
-                file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
+            try:
+                pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
+            except Exception as _pdf_err:
+                pdf_bytes = None
+                st.error(f"Erreur PDF : {_pdf_err}")
+            if pdf_bytes:
+                st.download_button(
+                    "📄 Rapport PDF complet (filtré adaptatif)",
+                    data=pdf_bytes,
+                    file_name=f"rapport_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            else:
+                st.warning("⚠️ Le PDF n'a pas pu être généré — utilisez le CSV.")
         with ec2:
-            csv_bytes = create_csv_report(rep_dict, conf_full)
-            st.download_button(
-                "📊 Données CSV (toutes zones)",
-                data=csv_bytes,
-                file_name=f"donnees_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            try:
+                csv_bytes = create_csv_report(rep_dict, conf_full)
+            except Exception:
+                csv_bytes = b""
+            if csv_bytes:
+                st.download_button(
+                    "📊 Données CSV (toutes zones)",
+                    data=csv_bytes,
+                    file_name=f"donnees_sr_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
     # ── Helper filtre visuel ─────────────────────────────────────
     def _filter_and_sort(df, max_pct):
