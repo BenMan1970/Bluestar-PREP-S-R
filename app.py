@@ -54,25 +54,18 @@ ALL_SYMBOLS = [
     "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR",
 ]
 
-# ── NOUVEAU : Coefficients ATR pour largeur de zone (v3) ─────────
-# Zone width = ATR × coefficient (remplace le % fixe)
-# Forex : 0.4 ATR | Indices : 0.3 ATR | Métaux : 0.5 ATR
 ATR_ZONE_COEFF = {
     "XAU_USD": 0.5, "XAG_USD": 0.5, "XPT_USD": 0.5,
     "US30_USD": 0.3, "NAS100_USD": 0.3, "SPX500_USD": 0.3, "DE30_EUR": 0.3,
 }
-DEFAULT_ATR_COEFF = 0.4  # Forex
+DEFAULT_ATR_COEFF = 0.4
 
-# ── NOUVEAU : Prominence ATR - filtre les micro-pivots (v3) ──────
-# Pivot valide = amplitude > ATR × coefficient
 PROMINENCE_COEFF = {
     "XAU_USD": 0.5, "XAG_USD": 0.5, "XPT_USD": 0.5,
     "US30_USD": 0.4, "NAS100_USD": 0.4, "SPX500_USD": 0.4, "DE30_EUR": 0.4,
 }
-DEFAULT_PROMINENCE_COEFF = 0.3  # Forex
+DEFAULT_PROMINENCE_COEFF = 0.3
 
-# ── NOUVEAU : Plages de prix valides par instrument (v3) ─────────
-# Détecte les prix OANDA aberrants (problème cents/unités)
 PRICE_SANITY_RANGE = {
     "XAU_USD":    (1500.0,  4000.0),
     "XAG_USD":    (15.0,    60.0),
@@ -83,10 +76,9 @@ PRICE_SANITY_RANGE = {
     "DE30_EUR":   (8000.0,  30000.0),
 }
 
-# Fallback largeur zone % (si ATR indisponible)
 ZONE_WIDTH_FALLBACK = {
-    "US30_USD":   0.50,   # élargi v3
-    "NAS100_USD": 0.50,   # élargi v3
+    "US30_USD":   0.50,
+    "NAS100_USD": 0.50,
     "SPX500_USD": 0.25,
     "DE30_EUR":   0.25,
     "XAU_USD":    0.20,
@@ -95,31 +87,66 @@ ZONE_WIDTH_FALLBACK = {
 }
 DEFAULT_ZONE_WIDTH = 0.5
 
-# Seuils PDF adaptatifs
 PDF_DIST_THRESHOLDS = {
     "US30_USD": 5.0, "NAS100_USD": 5.0, "SPX500_USD": 5.0, "DE30_EUR": 5.0,
     "XAU_USD": 8.0, "XAG_USD": 8.0, "XPT_USD": 8.0,
 }
 DEFAULT_PDF_DIST = 8.0
 
-# Distance absolue max (garde-fou supplémentaire)
 ABSOLUTE_MAX_DIST = {
     "XAU_USD": 8.0,  "XAG_USD": 8.0,  "XPT_USD": 8.0,
     "US30_USD": 4.0, "NAS100_USD": 4.0, "SPX500_USD": 4.0, "DE30_EUR": 4.0,
 }
 
-# Post-fusion
 POST_MERGE_THRESHOLD = 0.30
 POST_MERGE_MAP = {
     "US30_USD": 0.05, "NAS100_USD": 0.05, "SPX500_USD": 0.08, "DE30_EUR": 0.08,
     "XAU_USD": 0.15,  "XAG_USD": 0.20,   "XPT_USD": 0.20,
 }
 
-# Seuils confluence adaptatifs
 CONFLUENCE_THRESHOLD_MAP = {
     "US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, "DE30_EUR": 1.2,
     "XAU_USD": 1.5,  "XAG_USD": 1.5,   "XPT_USD": 1.5,
 }
+
+
+# ══════════════════════════════════════════════════════════════════
+# UTILITAIRE PDF — CORRECTION BUG FPDFUnicodeEncodingException
+# ══════════════════════════════════════════════════════════════════
+# Les polices core fpdf2 (Helvetica, Times, Courier) utilisent l'encodage
+# latin-1 en interne. Tout caractère Unicode hors latin-1 lève une
+# FPDFUnicodeEncodingException. Cette fonction translitère les accents
+# français courants en ASCII puis encode proprement en latin-1.
+_ACCENT_MAP = str.maketrans({
+    'à': 'a', 'â': 'a', 'ä': 'a', 'á': 'a', 'ã': 'a',
+    'è': 'e', 'é': 'e', 'ê': 'e', 'ë': 'e',
+    'î': 'i', 'ï': 'i', 'í': 'i', 'ì': 'i',
+    'ô': 'o', 'ö': 'o', 'ó': 'o', 'ò': 'o', 'õ': 'o',
+    'ù': 'u', 'û': 'u', 'ü': 'u', 'ú': 'u',
+    'ç': 'c', 'ñ': 'n',
+    'À': 'A', 'Â': 'A', 'Ä': 'A', 'Á': 'A',
+    'È': 'E', 'É': 'E', 'Ê': 'E', 'Ë': 'E',
+    'Î': 'I', 'Ï': 'I', 'Í': 'I',
+    'Ô': 'O', 'Ö': 'O', 'Ó': 'O',
+    'Ù': 'U', 'Û': 'U', 'Ü': 'U', 'Ú': 'U',
+    'Ç': 'C', 'Ñ': 'N',
+    # Emojis fréquents dans les données
+    '🟢': '[BUY]', '🔴': '[SELL]', '🔥': '[CHAUD]', '⚠️': '[PROCHE]',
+    '📈': '', '📉': '', '↔️': '', '✅': '[OK]', '❌': '[X]',
+    '⚡': '[!]', '📡': '', '📅': '',
+})
+
+def _safe_pdf_str(text: str) -> str:
+    """
+    Convertit une chaîne quelconque en chaîne sûre pour les polices
+    core fpdf2 (latin-1). Translitère les accents français, supprime
+    les emojis et encode en latin-1 avec remplacement du reste.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.translate(_ACCENT_MAP)
+    # Supprimer tout caractère restant hors latin-1
+    return text.encode('latin-1', errors='replace').decode('latin-1')
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -129,8 +156,8 @@ CONFLUENCE_THRESHOLD_MAP = {
 def determine_oanda_environment(access_token, account_id):
     headers = {"Authorization": f"Bearer {access_token}"}
     for name, url in [
-        ("Practice (Démo)", "https://api-fxpractice.oanda.com"),
-        ("Live (Réel)",     "https://api-fxtrade.oanda.com"),
+        ("Practice (Demo)", "https://api-fxpractice.oanda.com"),
+        ("Live (Reel)",     "https://api-fxtrade.oanda.com"),
     ]:
         try:
             r = requests.get(f"{url}/v3/accounts/{account_id}/summary",
@@ -191,42 +218,33 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
 
 
 # ══════════════════════════════════════════════════════════════════
-# NOUVEAU v3 : Validation prix - plage sanity + cohérence H4
+# VALIDATION PRIX
 # ══════════════════════════════════════════════════════════════════
 def validate_live_price(live_price, symbol, base_url, access_token):
-    """
-    Double validation :
-    1. Plage de prix connue par instrument (détecte aberrations OANDA cents/unités)
-    2. Écart max 15% vs dernier close H4
-    Retourne (prix_validé, alerte_ou_None)
-    """
     if live_price is None:
         return None, None
 
     alerts = []
 
-    # Étape 1 - plage de prix valide
     if symbol in PRICE_SANITY_RANGE:
         lo, hi = PRICE_SANITY_RANGE[symbol]
         if not (lo <= live_price <= hi):
             alerts.append(
                 f"Prix live {live_price:.2f} hors plage valide [{lo:.0f}-{hi:.0f}] "
-                f"(prob. problème cents/unités OANDA)"
+                f"(prob. probleme cents/unites OANDA)"
             )
-            live_price = None  # invalider - on utilisera le close H4
+            live_price = None
 
-    # Étape 2 - cohérence vs dernier close H4
     df_check = get_oanda_data(base_url, access_token, symbol, "h4", limit=10)
     if df_check is not None and not df_check.empty:
         last_close = df_check["close"].iloc[-1]
         if last_close > 0:
-            # Valider aussi le close H4 si plage disponible
             if symbol in PRICE_SANITY_RANGE:
                 lo, hi = PRICE_SANITY_RANGE[symbol]
                 if not (lo <= last_close <= hi):
                     alerts.append(
                         f"Close H4 {last_close:.2f} aussi hors plage - "
-                        f"données OANDA non fiables pour cet instrument"
+                        f"donnees OANDA non fiables pour cet instrument"
                     )
                     return None, " | ".join(alerts) if alerts else None
 
@@ -234,12 +252,12 @@ def validate_live_price(live_price, symbol, base_url, access_token):
                 dev = abs(live_price - last_close) / last_close * 100
                 if dev > 15.0:
                     alerts.append(
-                        f"Prix live {live_price:.2f} écarté de {dev:.1f}% "
+                        f"Prix live {live_price:.2f} ecarte de {dev:.1f}% "
                         f"du close H4 ({last_close:.2f}) - fallback close H4"
                     )
                     live_price = last_close
             else:
-                live_price = last_close  # fallback silencieux
+                live_price = last_close
 
     return live_price, " | ".join(alerts) if alerts else None
 
@@ -263,15 +281,9 @@ def compute_atr(df, period=14):
 
 
 def compute_trend(df, sma_period=20):
-    """
-    Tendance structurelle avec SMA adaptative.
-    v3 : seuil minimum abaissé à 15 bougies, SMA ajustée si peu de données.
-    Retourne 'HAUSSIER', 'BAISSIER' ou 'NEUTRE'
-    """
     if df is None or len(df) < 15:
         return "NEUTRE"
 
-    # Adapter la SMA si peu de bougies disponibles
     actual_period = min(sma_period, len(df) - 5)
     close   = df["close"]
     sma     = close.rolling(actual_period).mean().iloc[-1]
@@ -303,37 +315,9 @@ def compute_trend(df, sma_period=20):
     return "NEUTRE"
 
 
-# Poids par timeframe - Weekly touche vaut 3× H4
 TF_WEIGHT = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 
 def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_bars=500):
-    """
-    v4 CHANTIER 2 - Score pondéré TF + décroissance temporelle.
-
-    Formule :
-      Score = (Force × Poids_TF × Nb_TF) × Facteur_Age
-
-    Poids TF :
-      H4 = 1.0 | Daily = 2.0 | Weekly = 3.0
-      Une touche Weekly vaut structurellement 3× une touche H4.
-
-    Facteur Age (décroissance exponentielle douce) :
-      age_ratio = age_bars / total_bars  (0..1)
-      age_factor = exp(-1.5 × age_ratio)
-      → Zone très récente (age=0) : facteur = 1.0
-      → Zone mi-historique (age=50%) : facteur ≈ 0.47
-      → Zone très ancienne (age=100%) : facteur ≈ 0.22
-
-    Rationale : un niveau formé il y a 2 ans sur Weekly garde une
-    valeur structurelle, mais moins qu'un niveau récent non encore
-    testé. La décroissance douce (exp -1.5) évite l'effondrement brutal.
-
-    Seuils interprétatifs (inchangés pour comparabilité) :
-      > 300 : Zone institutionnelle majeure
-      100-300: Zone structurelle forte
-      30-100 : Zone technique valide
-      < 30   : Zone secondaire
-    """
     tf_w     = TF_WEIGHT.get(tf_name, 1.0)
     age_r    = age_bars / max(total_bars, 1)
     age_f    = float(np.exp(-1.5 * age_r))
@@ -342,15 +326,10 @@ def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_ba
 
 
 def post_merge_zones(zones_list, threshold_pct=0.30):
-    """
-    Fusionne les zones proches itérativement.
-    v4 : propage age_bars (min = le plus récent) et status
-    (priorité : Vierge > Testée > Consommée).
-    """
     if len(zones_list) <= 1:
         return zones_list
 
-    STATUS_PRIORITY = {"Vierge": 0, "Testée": 1, "Consommée": 2}
+    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Consommee": 2}
 
     changed = True
     while changed:
@@ -370,11 +349,9 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
                     changed = True
             used.add(i)
 
-            # Age = le plus récent du groupe (min age_bars)
             best_age   = min(z.get("age_bars", 0) for z in group)
-            # Statut = le meilleur du groupe (Vierge prioritaire)
             best_status = min(
-                (z.get("status", "Testée") for z in group),
+                (z.get("status", "Testee") for z in group),
                 key=lambda s: STATUS_PRIORITY.get(s, 1)
             )
             new_zones.append({
@@ -389,11 +366,6 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
 
 
 def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
-    """
-    Détection renforcée v3 :
-    - Ratio prix/médiane des supports > 1.8
-    - Écart prix live vs close > 10%
-    """
     messages = []
     if len(support_levels) >= 3:
         median_sup = np.median(support_levels)
@@ -401,14 +373,14 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
             ratio = current_price / median_sup
             if ratio > 1.8:
                 messages.append(
-                    f"Prix {current_price:.2f} = {ratio:.1f}x la médiane des supports "
-                    f"({median_sup:.2f}) - données à vérifier"
+                    f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
+                    f"({median_sup:.2f}) - donnees a verifier"
                 )
     if last_candle_close and last_candle_close > 0:
         dev = abs(current_price - last_candle_close) / last_candle_close * 100
         if dev > 10.0:
             messages.append(
-                f"Prix live {current_price:.2f} s'écarte de {dev:.1f}% "
+                f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
                 f"du dernier close ({last_candle_close:.2f})"
             )
     return " | ".join(messages) if messages else None
@@ -426,30 +398,13 @@ def get_price_context(current_price, supports, resistances):
         dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
         tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
         parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
-    return "  |  ".join(parts) if parts else "Zone intermédiaire"
+    return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
 # ══════════════════════════════════════════════════════════════════
-# v4 CHANTIER 1 : Détection swing HH/LL avec confirmation
+# DÉTECTION SWING HH/LL
 # ══════════════════════════════════════════════════════════════════
 def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
-    """
-    Détecte les vrais swings structurels Higher High / Lower Low.
-
-    Un Swing High valide nécessite :
-      - high[i] > high[i-n:i]   (dominant sur N bougies avant)
-      - high[i] > high[i+1:i+n+1] (dominant sur N bougies après)
-      - close[i+1] < high[i]    (confirmation : la bougie suivante
-                                  clôture EN DESSOUS du pivot - le
-                                  marché a bien rejeté ce niveau)
-    Idem inversé pour Swing Low.
-
-    Si ATR disponible, filtre supplémentaire : amplitude du swing
-    (high[i] - min(low[i-n:i+n])) > ATR × prominence_coeff.
-    Élimine les micro-consolidations plates.
-
-    Retourne deux Series (prix, index_dans_df) pour highs et lows.
-    """
     highs  = df["high"].values
     lows   = df["low"].values
     closes = df["close"].values
@@ -461,15 +416,13 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
         h = highs[i]
         l = lows[i]
 
-        # ── Swing High ────────────────────────────────────────────
         is_sh = (
             h > np.max(highs[i - n: i]) and
             h > np.max(highs[i + 1: i + n + 1]) and
-            closes[i + 1] < h          # confirmation bougie suivante
+            closes[i + 1] < h
         )
         if is_sh:
             if atr_val and atr_val > 0:
-                # Amplitude = distance entre le high et le low local
                 local_low  = np.min(lows[max(0, i - n): i + n + 1])
                 amplitude  = h - local_low
                 if amplitude < atr_val * prominence_coeff:
@@ -477,11 +430,10 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
         if is_sh:
             swing_high_idx.append(i)
 
-        # ── Swing Low ─────────────────────────────────────────────
         is_sl = (
             l < np.min(lows[i - n: i]) and
             l < np.min(lows[i + 1: i + n + 1]) and
-            closes[i + 1] > l          # confirmation bougie suivante
+            closes[i + 1] > l
         )
         if is_sl:
             if atr_val and atr_val > 0:
@@ -498,34 +450,12 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
 
 
 # ══════════════════════════════════════════════════════════════════
-# v4 CHANTIER 3 : Statut de zone - Vierge / Testée / Consommée
+# STATUT DE ZONE
 # ══════════════════════════════════════════════════════════════════
 def classify_zone_status(level, zone_type, df, formation_idx,
                           atr_val=None, tolerance_coeff=0.25):
-    """
-    Classifie chaque zone selon son historique post-formation :
-
-    VIERGE     : Le prix n'est jamais revenu tester la zone depuis sa
-                 formation. Niveau "propre", le plus fiable pour un
-                 premier test.
-
-    TESTÉE     : Le prix a approché la zone (< ATR × tolerance) mais
-                 n'a pas clôturé au-delà. Niveau respecté, toujours actif.
-
-    CONSOMMÉE  : Le prix a clôturé au-delà de la zone (break confirmé
-                 par clôture). Le niveau a perdu sa nature originelle -
-                 peut devenir opposé (support → résistance) mais est
-                 moins fiable dans sa direction initiale.
-
-    Paramètres :
-      level          : prix moyen de la zone
-      zone_type      : "Support" ou "Résistance"
-      df             : DataFrame complet
-      formation_idx  : index bougie la plus récente du groupe de pivots
-      tolerance      : ATR × tolerance_coeff = distance "proche" de la zone
-    """
     if formation_idx >= len(df) - 1:
-        return "Vierge"   # zone trop récente, pas encore testée
+        return "Vierge"
 
     tolerance = (atr_val * tolerance_coeff) if (atr_val and atr_val > 0) else (level * 0.003)
 
@@ -540,23 +470,21 @@ def classify_zone_status(level, zone_type, df, formation_idx,
         h = highs_after.iloc[i]
         l = lows_after.iloc[i]
 
-        # Prix s'est-il approché de la zone ?
         near_zone = abs(c - level) <= tolerance or (l <= level + tolerance and h >= level - tolerance)
 
         if near_zone:
             has_approach = True
 
-        # Clôture propre au-delà de la zone = CONSOMMÉE
         if zone_type == "Support" and c < level - tolerance:
-            return "Consommée"
-        if zone_type == "Résistance" and c > level + tolerance:
-            return "Consommée"
+            return "Consommee"
+        if zone_type == "Resistance" and c > level + tolerance:
+            return "Consommee"
 
-    return "Testée" if has_approach else "Vierge"
+    return "Testee" if has_approach else "Vierge"
 
 
 # ══════════════════════════════════════════════════════════════════
-# v4 : Détection S/R - swing HH/LL + ATR width + statut zones
+# DÉTECTION S/R
 # ══════════════════════════════════════════════════════════════════
 def find_strong_sr_zones(df, current_price, atr_val=None,
                           zone_percentage_width=0.5,
@@ -565,22 +493,6 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
                           min_touches=2, timeframe="daily",
                           post_merge_threshold=0.30,
                           swing_n=3):
-    """
-    Détection S/R v4 :
-
-    1. SWING HH/LL confirmé (chantier 1) : remplace find_peaks.
-       Seuls les pivots avec confirmation de clôture sont retenus.
-       Filtre ATR prominence sur amplitude du swing.
-
-    2. LARGEUR ZONE ATR-BASED (v3) : clustering par distance absolue
-       ATR × coeff plutôt qu'un % fixe.
-
-    3. STATUT DES ZONES (chantier 3) : chaque zone est classée
-       Vierge / Testée / Consommée selon son historique post-formation.
-
-    4. AGE (pour pondération score chantier 2) : nombre de bougies
-       depuis la formation de la zone.
-    """
     if df is None or df.empty or len(df) < 20:
         return pd.DataFrame(), pd.DataFrame()
     if current_price is None:
@@ -588,12 +500,10 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
 
     n_total = len(df)
 
-    # ── Détection swings HH/LL confirmés ─────────────────────────
     pivot_highs, pivot_lows = detect_swing_pivots(
         df, n=swing_n, atr_val=atr_val, prominence_coeff=prominence_coeff
     )
 
-    # Fallback sur find_peaks si trop peu de swings détectés
     if len(pivot_highs) + len(pivot_lows) < 3:
         distance = get_adaptive_distance(timeframe)
         if atr_val and atr_val > 0:
@@ -608,18 +518,16 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
     if pivot_highs.empty and pivot_lows.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Combiner highs + lows avec leur index de formation
     pivots_with_idx = []
     for idx, price in pivot_highs.items():
         pivots_with_idx.append((float(price), int(idx)))
     for idx, price in pivot_lows.items():
         pivots_with_idx.append((float(price), int(idx)))
 
-    pivots_with_idx.sort(key=lambda x: x[0])  # trier par prix
+    pivots_with_idx.sort(key=lambda x: x[0])
     if not pivots_with_idx:
         return pd.DataFrame(), pd.DataFrame()
 
-    # ── Clustering ATR-based ──────────────────────────────────────
     zones_raw   = []
     cur_group   = [pivots_with_idx[0]]
 
@@ -634,7 +542,6 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
             cur_group = [(price, idx)]
     zones_raw.append(cur_group)
 
-    # ── Construire zones avec force, age, statut ─────────────────
     strong = []
     for grp in zones_raw:
         if len(grp) < min_touches:
@@ -643,12 +550,10 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
         indices  = [i for _, i in grp]
         lvl      = float(np.mean(prices))
         strength = len(grp)
-        # Age = bougies depuis le pivot le plus RÉCENT du groupe
         last_idx = max(indices)
         age_bars = n_total - 1 - last_idx
 
-        # Statut de la zone
-        zone_type_tmp = "Support" if lvl < current_price else "Résistance"
+        zone_type_tmp = "Support" if lvl < current_price else "Resistance"
         status = classify_zone_status(
             lvl, zone_type_tmp, df, last_idx,
             atr_val=atr_val, tolerance_coeff=0.25
@@ -664,7 +569,6 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
     if not strong:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Post-fusion (conserve age et status du groupe dominant)
     strong = post_merge_zones(strong, threshold_pct=post_merge_threshold)
 
     df_zones    = pd.DataFrame(strong).sort_values("level").reset_index(drop=True)
@@ -688,7 +592,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                 "level":    z["level"],
                 "strength": z["strength"],
                 "age_bars": z.get("age_bars", 0),
-                "status":   z.get("status", "Testée"),
+                "status":   z.get("status", "Testee"),
                 "type":     "Support",
             })
         for _, z in resistances.iterrows():
@@ -697,8 +601,8 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                 "level":    z["level"],
                 "strength": z["strength"],
                 "age_bars": z.get("age_bars", 0),
-                "status":   z.get("status", "Testée"),
-                "type":     "Résistance",
+                "status":   z.get("status", "Testee"),
+                "type":     "Resistance",
             })
 
     if not all_zones:
@@ -707,7 +611,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
     zones_df     = pd.DataFrame(all_zones).sort_values("level")
     used_indices = set()
     confluences  = []
-    STATUS_PRIORITY = {"Vierge": 0, "Testée": 1, "Consommée": 2}
+    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Consommee": 2}
 
     for i, zone in zones_df.iterrows():
         if i in used_indices:
@@ -727,7 +631,6 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                 nb_tf      = len(timeframes)
                 dist_pct   = abs(current_price - avg_level) / current_price * 100
 
-                # Score pondéré : somme des scores individuels par TF (chantier 2)
                 total_score = 0.0
                 for _, row in group.iterrows():
                     total_score += compute_structural_score(
@@ -740,7 +643,6 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
 
                 total_strength = int(group["strength"].sum())
 
-                # Statut dominant du groupe (Vierge prioritaire)
                 best_status = min(
                     group["status"].tolist(),
                     key=lambda s: STATUS_PRIORITY.get(s, 1)
@@ -775,13 +677,11 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
 def scan_single_symbol(args):
     symbol, base_url, access_token, account_id, zone_width, min_touches = args
 
-    # Validation prix live (plage sanity + cohérence H4)
     raw_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
     current_price, price_alert_msg = validate_live_price(
         raw_price, symbol, base_url, access_token
     )
 
-    # Paramètres adaptatifs par instrument
     atr_zone_coeff    = ATR_ZONE_COEFF.get(symbol, DEFAULT_ATR_COEFF)
     prom_coeff        = PROMINENCE_COEFF.get(symbol, DEFAULT_PROMINENCE_COEFF)
     zone_w_fallback   = ZONE_WIDTH_FALLBACK.get(symbol, zone_width)
@@ -806,13 +706,10 @@ def scan_single_symbol(args):
         if tf_key == "h4":
             last_h4_close = df["close"].iloc[-1]
 
-        # Tendance avec SMA adaptative (v3)
         trends[tf_cap] = compute_trend(df)
 
-        # ATR pour ce timeframe
         atr_val = compute_atr(df, period=14)
 
-        # Détection S/R avec prominence ATR + largeur ATR (v3)
         supports, resistances = find_strong_sr_zones(
             df, cp,
             atr_val             = atr_val,
@@ -834,8 +731,7 @@ def scan_single_symbol(args):
 
         sym_d = symbol.replace("_", "/")
 
-        # Poids TF pour score pondéré (chantier 2)
-        tf_weight_name = tf_cap   # "H4", "Daily", "Weekly"
+        tf_weight_name = tf_cap
         n_total_bars   = len(df)
 
         def make_row(zone, ztype, _cp=cp, _atr=atr_val,
@@ -844,10 +740,9 @@ def scan_single_symbol(args):
             lvl      = zone["level"]
             strength = int(zone["strength"])
             age_bars = int(zone.get("age_bars", 0))
-            status   = zone.get("status", "Testée")
+            status   = zone.get("status", "Testee")
             dist_pct = abs(_cp - lvl) / _cp * 100
             dist_atr = round(abs(_cp - lvl) / _atr, 1) if (_atr and _atr > 0) else np.nan
-            # v4 : score pondéré TF + âge
             struct_score = compute_structural_score(strength, 1, _tf, age_bars, _ntot)
             return {
                 "Actif":       sym_d,
@@ -865,7 +760,7 @@ def scan_single_symbol(args):
 
         tf_rows = (
             [make_row(z, "Support")    for _, z in supports.iterrows()] +
-            [make_row(z, "Résistance") for _, z in resistances.iterrows()]
+            [make_row(z, "Resistance") for _, z in resistances.iterrows()]
         )
         if tf_rows:
             rows[tf_cap] = tf_rows
@@ -881,34 +776,30 @@ def scan_single_symbol(args):
 
 
 # ══════════════════════════════════════════════════════════════════
-# GÉNÉRATION PDF
+# GÉNÉRATION PDF  — entièrement reécrit avec _safe_pdf_str()
 # ══════════════════════════════════════════════════════════════════
 def strip_emojis_df(df):
-    emoji_map = {
-        '🟢': '[BUY]', '🔴': '[SELL]', '🔥': '[CHAUD]', '⚠️': '[PROCHE]',
-        '📈': '', '📉': '', '↔️': '', '✅': '[OK]', '❌': '[X]',
-        '⚡': '[!]', '📡': '', '📅': '',
-    }
+    """Nettoie un DataFrame pour l'export PDF : emojis + accents."""
     clean = df.copy()
     for col in clean.select_dtypes(include='object').columns:
-        for emoji, replacement in emoji_map.items():
-            clean[col] = clean[col].astype(str).str.replace(emoji, replacement, regex=False)
-        clean[col] = clean[col].apply(
-            lambda x: x.encode('latin-1', errors='ignore').decode('latin-1')
-        )
+        clean[col] = clean[col].astype(str).apply(_safe_pdf_str)
     return clean
 
 
 class PDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 15)
-        self.cell(0, 10, 'Rapport de Scan Support/Resistance - v4', border=0, align='C',
-                  new_x='LMARGIN', new_y='NEXT')
+        self.cell(0, 10,
+                  _safe_pdf_str('Rapport de Scan Support/Resistance - v4'),
+                  border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
         self.cell(0, 6,
-            f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
-            "v4 - Score = (Force x Poids_TF x NbTF) x Facteur_Age | Statut Vierge/Testee/Consommee",
-            border=0, align='C', new_x='LMARGIN', new_y='NEXT')
+                  _safe_pdf_str(
+                      f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
+                      "v4 - Score = (Force x Poids_TF x NbTF) x Facteur_Age | "
+                      "Statut Vierge/Testee/Consommee"
+                  ),
+                  border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
 
     def footer(self):
@@ -918,26 +809,28 @@ class PDF(FPDF):
 
     def chapter_title(self, title):
         self.set_font('Helvetica', 'B', 12)
-        self.cell(0, 10, title, border=0, align='L', new_x='LMARGIN', new_y='NEXT')
+        self.cell(0, 10, _safe_pdf_str(title),
+                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
 
     def chapter_summary(self, summaries):
         self.set_font('Helvetica', 'B', 10)
-        self.cell(0, 7, 'RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)',
+        self.cell(0, 7,
+                  _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'),
                   border=0, align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(2)
 
         for s in summaries:
-            sym = s.get('symbol', '').encode('latin-1', errors='ignore').decode('latin-1')
-            t_h4 = s.get('trend_h4',    'N/A')
-            t_d  = s.get('trend_daily',  'N/A')
-            t_w  = s.get('trend_weekly', 'N/A')
-            ctx  = s.get('price_context', '').encode('latin-1', errors='ignore').decode('latin-1')
+            sym  = _safe_pdf_str(s.get('symbol', ''))
+            t_h4 = _safe_pdf_str(s.get('trend_h4',    'N/A'))
+            t_d  = _safe_pdf_str(s.get('trend_daily',  'N/A'))
+            t_w  = _safe_pdf_str(s.get('trend_weekly', 'N/A'))
+            ctx  = _safe_pdf_str(s.get('price_context', ''))
 
             self.set_font('Helvetica', 'B', 8)
             self.cell(0, 5,
-                f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}",
-                border=0, new_x='LMARGIN', new_y='NEXT')
+                      _safe_pdf_str(f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}"),
+                      border=0, new_x='LMARGIN', new_y='NEXT')
 
             if ctx:
                 self.set_font('Helvetica', 'I', 7)
@@ -948,14 +841,12 @@ class PDF(FPDF):
             self.set_font('Helvetica', '', 7)
             if top:
                 for z in top:
-                    sig  = str(z.get('Signal', '')).replace('🟢','[BUY]').replace('🔴','[SELL]')
-                    sig  = sig.encode('latin-1', errors='ignore').decode('latin-1')
-                    niv  = str(z.get('Niveau',     ''))
-                    dist = str(z.get('Distance %', ''))
-                    sc   = str(z.get('Score',      ''))
-                    tfs  = str(z.get('Timeframes', ''))
-                    ale  = str(z.get('Alerte', '')).replace('🔥','[CHAUD]').replace('⚠️','[PROCHE]')
-                    ale  = ale.encode('latin-1', errors='ignore').decode('latin-1')
+                    sig  = _safe_pdf_str(str(z.get('Signal', '')))
+                    niv  = _safe_pdf_str(str(z.get('Niveau',     '')))
+                    dist = _safe_pdf_str(str(z.get('Distance %', '')))
+                    sc   = _safe_pdf_str(str(z.get('Score',      '')))
+                    tfs  = _safe_pdf_str(str(z.get('Timeframes', '')))
+                    ale  = _safe_pdf_str(str(z.get('Alerte',     '')))
                     txt  = f"  {sig}  Niv:{niv}  Dist:{dist}  Score:{sc}  TF:{tfs}  {ale}"
                     self.cell(0, 4, txt[:130], border=0, new_x='LMARGIN', new_y='NEXT')
             else:
@@ -971,14 +862,12 @@ class PDF(FPDF):
             return
 
         if 'Timeframes' in df.columns:
-            # Table confluences - v4 : Statut après Score
             col_widths = {
                 'Actif': 20, 'Signal': 26, 'Niveau': 22, 'Type': 22,
                 'Timeframes': 50, 'Nb TF': 12, 'Force Totale': 20,
                 'Score': 18, 'Statut': 22, 'Distance %': 18, 'Alerte': 55,
             }
         else:
-            # Tables par TF - v4 : Statut après Score
             col_widths = {
                 'Actif': 24, 'Prix Actuel': 24, 'Type': 20,
                 'Niveau': 24, 'Force': 20,
@@ -994,8 +883,9 @@ class PDF(FPDF):
         self.set_font('Helvetica', 'B', font_size)
         self.set_x(x_start)
         for col_name in cols:
-            self.cell(col_widths[col_name], 6, col_name, border=1, align='C',
-                      new_x='RIGHT', new_y='TOP')
+            self.cell(col_widths[col_name], 6,
+                      _safe_pdf_str(col_name),
+                      border=1, align='C', new_x='RIGHT', new_y='TOP')
         self.ln()
 
         self.set_font('Helvetica', '', font_size)
@@ -1003,7 +893,7 @@ class PDF(FPDF):
             self.set_x(x_start)
             for col_name in cols:
                 w        = col_widths[col_name]
-                val      = str(row[col_name])
+                val      = _safe_pdf_str(str(row[col_name]))  # ← FIX CENTRAL
                 max_chars = int(w / 1.25)
                 if len(val) > max_chars:
                     val = val[:max_chars - 1] + '.'
@@ -1033,8 +923,7 @@ def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomali
         pdf.chapter_title('ALERTES QUALITE DES DONNEES')
         pdf.set_font('Helvetica', 'I', 8)
         for a in anomalies:
-            line = f"  {a['actif']} : {a['msg']}"
-            line = line.encode('latin-1', errors='ignore').decode('latin-1')
+            line = _safe_pdf_str(f"  {a['actif']} : {a['msg']}")
             pdf.multi_cell(0, 5, line)
         pdf.ln(5)
 
@@ -1101,7 +990,6 @@ def _display_results(sr, max_dist_filter):
     summaries = sr.get("summaries",      [])
     anomalies = sr.get("anomaly_flags",  [])
 
-    # v4 : Score pondéré TF + âge | Statut zone
     tf_cfg = {
         "Actif":       st.column_config.TextColumn("Actif",       width="small"),
         "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
@@ -1238,7 +1126,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("**Score v3 = Force × Nb TF** (structurel pur)")
+    st.caption("**Score v4 = (Force × Poids_TF × NbTF) × Facteur_Age**")
     st.caption("🔴 > 300 : Zone institutionnelle majeure")
     st.caption("🟠 100-300 : Zone structurelle forte")
     st.caption("🟡 30-100 : Zone technique valide")
@@ -1251,6 +1139,7 @@ with st.sidebar:
     st.caption("✅ Statut : Vierge / Testée / Consommée")
     st.caption("✅ Prominence ATR + largeur zone ATR-based")
     st.caption("✅ Plage prix valides (XAU/XAG/XPT/Indices)")
+    st.caption("✅ Fix PDF Unicode (accents + emojis)")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1300,7 +1189,7 @@ if scan_button and symbols_to_scan:
                                                   "msg":   anomaly_msg})
                         for tf_cap, tf_rows in rows.items():
                             if tf_rows:
-                                if tf_cap == "H4":     results_h4.extend(tf_rows)
+                                if tf_cap == "H4":      results_h4.extend(tf_rows)
                                 elif tf_cap == "Daily": results_daily.extend(tf_rows)
                                 elif tf_cap == "Weekly": results_weekly.extend(tf_rows)
                     except Exception:
