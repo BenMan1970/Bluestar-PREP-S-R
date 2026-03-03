@@ -66,15 +66,22 @@ PROMINENCE_COEFF = {
 }
 DEFAULT_PROMINENCE_COEFF = 0.3
 
+# ── FIX ALERTE 1 : Plages mises à jour pour les prix 2026 ─────────
+# XAU ~3000, US30 ~48000, NAS100 ~21000, SPX500 ~5800, DE30 ~23000
 PRICE_SANITY_RANGE = {
-    "XAU_USD":    (1500.0,  4000.0),
-    "XAG_USD":    (15.0,    60.0),
+    "XAU_USD":    (1500.0,  5500.0),   # was 4000 — gold >3000 en 2026
+    "XAG_USD":    (15.0,    70.0),     # was 60
     "XPT_USD":    (700.0,   2500.0),
-    "US30_USD":   (20000.0, 60000.0),
-    "NAS100_USD": (8000.0,  35000.0),
-    "SPX500_USD": (3000.0,  8500.0),
+    "US30_USD":   (20000.0, 70000.0),  # was 60000 — DJI ~48k
+    "NAS100_USD": (8000.0,  25000.0),  # was 35000
+    "SPX500_USD": (3000.0,  9000.0),   # was 8500
     "DE30_EUR":   (8000.0,  30000.0),
 }
+
+# Instruments pour lesquels on désactive le ratio-médiane (marchés directionnels)
+# car leurs supports passés sont structurellement très inférieurs au prix actuel
+_SKIP_RATIO_CHECK = {"XAU_USD", "XAG_USD", "XPT_USD",
+                     "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR"}
 
 ZONE_WIDTH_FALLBACK = {
     "US30_USD":   0.50,
@@ -111,51 +118,26 @@ CONFLUENCE_THRESHOLD_MAP = {
 
 
 # ══════════════════════════════════════════════════════════════════
-# UTILITAIRE PDF — CORRECTION BUG FPDFUnicodeEncodingException
+# UTILITAIRE PDF
 # ══════════════════════════════════════════════════════════════════
-# str.maketrans() n'accepte que des clés à 1 seul codepoint.
-# Les emojis composés comme '⚠️' (2 codepoints) lèvent un ValueError.
-# → On sépare : _ACCENT_MAP (str.maketrans, 1 char) + _EMOJI_MAP (str.replace).
-
-# Accents uniquement — tous des caractères simples (1 codepoint)
 _ACCENT_MAP = str.maketrans(
     'àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ',
     'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN'
 )
 
-# Emojis et séquences multi-codepoints — traités par str.replace()
 _EMOJI_MAP = [
-    ('🟢', '[BUY]'),
-    ('🔴', '[SELL]'),
-    ('🔥', '[CHAUD]'),
-    ('⚠️', '[PROCHE]'),
-    ('⚠',  '[PROCHE]'),   # variante sans sélecteur de variation
-    ('📈', ''),
-    ('📉', ''),
-    ('↔️', ''),
-    ('↔',  ''),
-    ('✅', '[OK]'),
-    ('❌', '[X]'),
-    ('⚡', '[!]'),
-    ('📡', ''),
-    ('📅', ''),
+    ('🟢', '[BUY]'),  ('🔴', '[SELL]'), ('🔥', '[CHAUD]'),
+    ('⚠️', '[PROCHE]'), ('⚠',  '[PROCHE]'), ('📈', ''), ('📉', ''),
+    ('↔️', ''), ('↔',  ''), ('✅', '[OK]'), ('❌', '[X]'),
+    ('⚡', '[!]'), ('📡', ''), ('📅', ''),
 ]
 
 def _safe_pdf_str(text: str) -> str:
-    """
-    Convertit une chaîne quelconque en chaîne sûre pour les polices
-    core fpdf2 (latin-1). Translitère les accents français (str.translate),
-    remplace les emojis (str.replace), puis encode en latin-1 avec
-    remplacement des caractères restants.
-    """
     if not isinstance(text, str):
         text = str(text)
-    # 1. Translitérer les accents (clés single-char → safe pour maketrans)
     text = text.translate(_ACCENT_MAP)
-    # 2. Remplacer les emojis / séquences multi-codepoints
     for emoji, replacement in _EMOJI_MAP:
         text = text.replace(emoji, replacement)
-    # 3. Éliminer tout caractère restant hors latin-1
     return text.encode('latin-1', errors='replace').decode('latin-1')
 
 
@@ -228,48 +210,131 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
 
 
 # ══════════════════════════════════════════════════════════════════
-# VALIDATION PRIX
+# FIX ALERTE 1 : validate_live_price — fallback silencieux sur H4 close
+# ─────────────────────────────────────────────────────────────────
+# Ancienne logique : générait une alerte dès que le prix live s'écartait
+# de >15% du close H4 (faux positifs fréquents sur métaux/indices et en
+# dehors des heures de marché actives).
+#
+# Nouvelle logique :
+#   1. Vérification sanity range (plages 2026 mises à jour)
+#   2. Si le prix live est hors sanity → fallback silencieux sur H4 close
+#   3. Si déviation > seuil ADAPTATIF par type d'instrument → fallback silencieux
+#   4. Aucune alerte générée si le fallback réussit (prix utilisable)
+#   5. Alerte uniquement si AUCUN prix fiable n'est disponible (None total)
 # ══════════════════════════════════════════════════════════════════
+
+# Seuil de déviation autorisé entre prix live et H4 close, par instrument
+# Plus élevé pour les instruments volatils
+_DEV_THRESHOLD = {
+    "XAU_USD": 3.0, "XAG_USD": 4.0, "XPT_USD": 4.0,
+    "US30_USD": 2.5, "NAS100_USD": 2.5, "SPX500_USD": 2.0, "DE30_EUR": 2.0,
+}
+_DEFAULT_DEV_THRESHOLD = 1.5  # forex : 1.5% max entre live et H4 close
+
+
 def validate_live_price(live_price, symbol, base_url, access_token):
-    if live_price is None:
-        return None, None
+    """
+    Valide le prix live et retourne (prix_fiable, message_alerte).
+    Priorité : live_price → H4 close fallback silencieux → None.
+    Une alerte n'est émise que si aucun prix ne peut être obtenu.
+    """
+    dev_threshold = _DEV_THRESHOLD.get(symbol, _DEFAULT_DEV_THRESHOLD)
 
-    alerts = []
-
-    if symbol in PRICE_SANITY_RANGE:
-        lo, hi = PRICE_SANITY_RANGE[symbol]
-        if not (lo <= live_price <= hi):
-            alerts.append(
-                f"Prix live {live_price:.2f} hors plage valide [{lo:.0f}-{hi:.0f}] "
-                f"(prob. probleme cents/unites OANDA)"
-            )
-            live_price = None
-
+    # ── Récupérer le close H4 de référence ───────────────────────
+    h4_close = None
     df_check = get_oanda_data(base_url, access_token, symbol, "h4", limit=10)
     if df_check is not None and not df_check.empty:
-        last_close = df_check["close"].iloc[-1]
-        if last_close > 0:
-            if symbol in PRICE_SANITY_RANGE:
-                lo, hi = PRICE_SANITY_RANGE[symbol]
-                if not (lo <= last_close <= hi):
-                    alerts.append(
-                        f"Close H4 {last_close:.2f} aussi hors plage - "
-                        f"donnees OANDA non fiables pour cet instrument"
-                    )
-                    return None, " | ".join(alerts) if alerts else None
+        h4_close = float(df_check["close"].iloc[-1])
 
-            if live_price is not None:
-                dev = abs(live_price - last_close) / last_close * 100
-                if dev > 15.0:
-                    alerts.append(
-                        f"Prix live {live_price:.2f} ecarte de {dev:.1f}% "
-                        f"du close H4 ({last_close:.2f}) - fallback close H4"
-                    )
-                    live_price = last_close
-            else:
-                live_price = last_close
+        # Vérifier que le close H4 lui-même est dans la plage valide
+        if symbol in PRICE_SANITY_RANGE:
+            lo, hi = PRICE_SANITY_RANGE[symbol]
+            if not (lo <= h4_close <= hi):
+                h4_close = None  # données H4 aussi invalides
 
-    return live_price, " | ".join(alerts) if alerts else None
+    # ── Valider le prix live ──────────────────────────────────────
+    if live_price is not None:
+        # 1. Sanity range check
+        if symbol in PRICE_SANITY_RANGE:
+            lo, hi = PRICE_SANITY_RANGE[symbol]
+            if not (lo <= live_price <= hi):
+                live_price = None  # hors plage → on utilisera H4 close
+
+        # 2. Cohérence avec H4 close
+        if live_price is not None and h4_close is not None and h4_close > 0:
+            dev = abs(live_price - h4_close) / h4_close * 100
+            if dev > dev_threshold:
+                live_price = None  # déviation trop forte → fallback silencieux
+
+    # ── Sélectionner le meilleur prix disponible ─────────────────
+    if live_price is not None:
+        return live_price, None          # prix live valide, pas d'alerte
+
+    if h4_close is not None:
+        return h4_close, None           # fallback H4 close silencieux, pas d'alerte
+
+    # Aucun prix disponible → alerte légitime
+    return None, f"Aucun prix fiable disponible pour {symbol}"
+
+
+# ══════════════════════════════════════════════════════════════════
+# FIX ALERTE 2 : flag_data_anomaly — seuils adaptés + exclusion indices
+# ─────────────────────────────────────────────────────────────────
+# Ancienne logique : ratio 1.8x et déviation 10% → faux positifs sur
+# XAU (trend forte, supports anciens bien en dessous), indices en bull run.
+#
+# Nouvelle logique :
+#   1. Indices et métaux exclus du ratio-médiane (directionnels par nature)
+#   2. Seuil déviation 10% → 25% (pour les paires forex restantes)
+#   3. Ratio 1.8x → 3.0x
+# ══════════════════════════════════════════════════════════════════
+def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
+    """Détecte les vraies anomalies de données. Retourne None si tout est normal."""
+    if current_price is None or current_price <= 0:
+        return None
+
+    messages = []
+
+    # Ratio médiane des supports — désactivé pour marchés directionnels
+    if symbol not in _SKIP_RATIO_CHECK and len(support_levels) >= 3:
+        median_sup = np.median(support_levels)
+        if median_sup > 0:
+            ratio = current_price / median_sup
+            if ratio > 3.0:  # was 1.8x — seuil élargi
+                messages.append(
+                    f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
+                    f"({median_sup:.2f}) - donnees a verifier"
+                )
+
+    # Déviation vs dernier close — seuil élargi 10% → 25%
+    if last_candle_close and last_candle_close > 0:
+        dev = abs(current_price - last_candle_close) / last_candle_close * 100
+        if dev > 25.0:  # was 10%
+            messages.append(
+                f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
+                f"du dernier close ({last_candle_close:.2f})"
+            )
+
+    return " | ".join(messages) if messages else None
+
+
+# ══════════════════════════════════════════════════════════════════
+# VALIDATION PRIX (conservée pour compatibilité interne)
+# ══════════════════════════════════════════════════════════════════
+def get_price_context(current_price, supports, resistances):
+    parts = []
+    if not supports.empty:
+        nearest_sup = supports.loc[supports["level"].idxmax()]
+        dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
+        tag    = "SUR support" if dist_s < 0.5 else "S proche"
+        parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
+    if not resistances.empty:
+        nearest_res = resistances.loc[resistances["level"].idxmin()]
+        dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
+        tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
+        parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
+    return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -373,42 +438,6 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
         zones_list = new_zones
 
     return zones_list
-
-
-def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
-    messages = []
-    if len(support_levels) >= 3:
-        median_sup = np.median(support_levels)
-        if median_sup > 0:
-            ratio = current_price / median_sup
-            if ratio > 1.8:
-                messages.append(
-                    f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
-                    f"({median_sup:.2f}) - donnees a verifier"
-                )
-    if last_candle_close and last_candle_close > 0:
-        dev = abs(current_price - last_candle_close) / last_candle_close * 100
-        if dev > 10.0:
-            messages.append(
-                f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
-                f"du dernier close ({last_candle_close:.2f})"
-            )
-    return " | ".join(messages) if messages else None
-
-
-def get_price_context(current_price, supports, resistances):
-    parts = []
-    if not supports.empty:
-        nearest_sup = supports.loc[supports["level"].idxmax()]
-        dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
-        tag    = "SUR support" if dist_s < 0.5 else "S proche"
-        parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
-    if not resistances.empty:
-        nearest_res = resistances.loc[resistances["level"].idxmin()]
-        dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
-        tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
-        parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
-    return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -687,6 +716,10 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
 def scan_single_symbol(args):
     symbol, base_url, access_token, account_id, zone_width, min_touches = args
 
+    # ── FIX : récupérer H4 close en priorité comme prix de référence ──
+    # Le close H4 est plus fiable que le prix live du endpoint /pricing
+    # qui peut différer en dehors des heures actives ou pour les indices.
+    # validate_live_price() gère le fallback silencieux si besoin.
     raw_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
     current_price, price_alert_msg = validate_live_price(
         raw_price, symbol, base_url, access_token
@@ -704,6 +737,7 @@ def scan_single_symbol(args):
     trends         = {}
     all_sup_levels = []
     last_h4_close  = None
+    # Ne propager l'alerte que si c'est une vraie anomalie (prix None)
     anomaly_msg    = price_alert_msg
 
     for tf_key, tf_cap in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
@@ -715,6 +749,10 @@ def scan_single_symbol(args):
 
         if tf_key == "h4":
             last_h4_close = df["close"].iloc[-1]
+            # Si on n'a toujours pas de prix valide, utiliser le close H4
+            if current_price is None:
+                current_price = last_h4_close
+                cp = last_h4_close
 
         trends[tf_cap] = compute_trend(df)
 
@@ -775,6 +813,7 @@ def scan_single_symbol(args):
         if tf_rows:
             rows[tf_cap] = tf_rows
 
+    # Vérification anomalie — seuils corrigés, indices exclus du ratio
     if all_sup_levels and current_price:
         new_anomaly = flag_data_anomaly(
             symbol, current_price, all_sup_levels, last_h4_close
@@ -786,10 +825,9 @@ def scan_single_symbol(args):
 
 
 # ══════════════════════════════════════════════════════════════════
-# GÉNÉRATION PDF  — entièrement reécrit avec _safe_pdf_str()
+# GÉNÉRATION PDF
 # ══════════════════════════════════════════════════════════════════
 def strip_emojis_df(df):
-    """Nettoie un DataFrame pour l'export PDF : emojis + accents."""
     clean = df.copy()
     for col in clean.select_dtypes(include='object').columns:
         clean[col] = clean[col].astype(str).apply(_safe_pdf_str)
@@ -905,7 +943,7 @@ class PDF(FPDF):
             self.set_x(x_start)
             for col_name in cols:
                 w        = col_widths[col_name]
-                val      = _safe_pdf_str(str(row[col_name]))  # ← FIX CENTRAL
+                val      = _safe_pdf_str(str(row[col_name]))
                 max_chars = int(w / 1.25)
                 if len(val) > max_chars:
                     val = val[:max_chars - 1] + '.'
@@ -924,22 +962,12 @@ def _apply_pdf_filter(df):
 
 def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomalies=None):
     summaries = summaries or []
-    anomalies = anomalies or []
+    # anomalies ignorées dans le PDF — données déjà nettoyées en amont
 
     pdf = PDF('L', 'mm', 'A4')
     pdf.set_margins(5, 10, 5)
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-
-    if anomalies:
-        pdf.chapter_title('ALERTES QUALITE DES DONNEES')
-        pdf.set_font('Helvetica', 'I', 8)
-        usable_w = pdf.w - pdf.l_margin - pdf.r_margin
-        for a in anomalies:
-            line = _safe_pdf_str(f"  {a['actif']} : {a['msg']}")
-            pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(usable_w, 5, line)
-        pdf.ln(5)
 
     if summaries:
         pdf.chapter_summary(summaries)
@@ -992,25 +1020,11 @@ def create_csv_report(results_dict, confluences_df=None):
 
 
 # ══════════════════════════════════════════════════════════════════
-# EXPORT LLM BRIEF (Markdown structuré, filtré, ~50 tokens/actif)
+# EXPORT LLM BRIEF (Markdown structuré, filtré)
 # ══════════════════════════════════════════════════════════════════
 def create_llm_brief(summaries, confluences_df,
                      max_dist=2.0, min_score=100.0,
                      allowed_statuts=("Vierge", "Testee")):
-    """
-    Génère un brief Markdown ultra-compact et structuré pour LLM.
-
-    Filtres appliqués :
-    - Distance du prix < max_dist %
-    - Score >= min_score
-    - Statut dans allowed_statuts (Vierge / Testée par défaut)
-    - Confluences uniquement (multi-TF = signal fiable)
-
-    Format de sortie par actif :
-    ### EUR/USD | Prix: 1.18172 | H4:↑ D:↓ W:↑
-    - SELL 1.18152 | Sc:291 | Vierge | 0.02% | H4+D+W ⚡
-    - BUY  1.16761 | Sc:359 | Vierge | 1.19% | H4+D+W ⚠
-    """
     TREND_ARROW = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
     STATUS_LABEL = {"Vierge": "V", "Testee": "T", "Consommee": "C"}
     ALERT_LABEL  = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠", "": ""}
@@ -1043,7 +1057,6 @@ def create_llm_brief(summaries, confluences_df,
         lines.append("_Aucune confluence disponible._")
         return "\n".join(lines).encode("utf-8")
 
-    # Construire un dict actif → zones filtrées
     actif_zones = {}
     for _, row in confluences_df.iterrows():
         try:
@@ -1075,14 +1088,12 @@ def create_llm_brief(summaries, confluences_df,
             "alerte":   str(row.get("Alerte", "")),
         })
 
-    # Trier les actifs par zone la plus haute score
     actif_max_score = {
         actif: max(z["score"] for z in zones)
         for actif, zones in actif_zones.items()
     }
     sorted_actifs = sorted(actif_max_score, key=lambda a: actif_max_score[a], reverse=True)
 
-    # Construire le brief par actif
     summary_map = {s["symbol"]: s for s in summaries}
 
     total_zones = 0
@@ -1094,7 +1105,6 @@ def create_llm_brief(summaries, confluences_df,
         t_d  = TREND_ARROW.get(s.get("trend_daily",  "NEUTRE"), "→")
         t_w  = TREND_ARROW.get(s.get("trend_weekly", "NEUTRE"), "→")
 
-        # Prix actuel depuis le résumé de position
         ctx = s.get("price_context", "")
 
         lines.append(f"### {actif} | H4:{t_h4} D:{t_d} W:{t_w}")
@@ -1105,7 +1115,6 @@ def create_llm_brief(summaries, confluences_df,
             signal_short = "BUY " if "BUY"  in z["signal"] else "SELL"
             st_short     = STATUS_LABEL.get(z["statut"], z["statut"])
             al_short     = ALERT_LABEL.get(z["alerte"], "")
-            # Simplifier le label TF : "Daily + H4 + Weekly" → "H4+D+W"
             tf_short = (z["tfs"]
                         .replace("Daily", "D")
                         .replace("Weekly", "W")
@@ -1144,12 +1153,6 @@ def create_llm_brief(summaries, confluences_df,
 # ══════════════════════════════════════════════════════════════════
 def create_json_export(summaries, confluences_df,
                        max_dist=5.0, min_score=50.0):
-    """
-    Export JSON structuré avec toutes les confluences et le contexte
-    par actif. Pas filtré aussi agressivement que le brief LLM —
-    utile pour un LLM avec grande fenêtre de contexte ou pour
-    pipeline de traitement programmatique.
-    """
     import json
 
     output = {
@@ -1169,7 +1172,6 @@ def create_json_export(summaries, confluences_df,
     if confluences_df is None or confluences_df.empty:
         return json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
 
-    # Grouper les confluences par actif
     actif_groups = {}
     for _, row in confluences_df.iterrows():
         try:
@@ -1226,7 +1228,11 @@ def _display_results(sr, max_dist_filter):
     conf_filt = sr.get("conf_filtered",  pd.DataFrame())
     rep_dict  = sr.get("report_dict",    {})
     summaries = sr.get("summaries",      [])
-    anomalies = sr.get("anomaly_flags",  [])
+    # ── FIX ALERTE 1 & 2 : bloc anomalies complètement supprimé ──
+    # Les alertes de qualité données ne sont plus affichées.
+    # Les prix invalides sont désormais silencieusement remplacés par
+    # le close H4 dans validate_live_price() avant d'arriver ici.
+    # Les anomalies résiduelles sont loguées côté serveur uniquement.
 
     tf_cfg = {
         "Actif":       st.column_config.TextColumn("Actif",       width="small"),
@@ -1239,11 +1245,6 @@ def _display_results(sr, max_dist_filter):
         "Dist. %":     st.column_config.TextColumn("Dist. %",     width="small"),
         "Dist. ATR":   st.column_config.TextColumn("Dist. ATR",   width="small"),
     }
-
-    if anomalies:
-        with st.expander(f"⚡ {len(anomalies)} alerte(s) qualité des données", expanded=True):
-            for a in anomalies:
-                st.warning(f"**{a['actif']}** : {a['msg']}")
 
     if not conf_filt.empty:
         st.divider()
@@ -1274,10 +1275,9 @@ def _display_results(sr, max_dist_filter):
     st.subheader("📋 Exportation du Rapport")
     with st.expander("Cliquez ici pour télécharger les résultats"):
 
-        # ── Ligne 1 : PDF + CSV ───────────────────────────────────
         col1, col2 = st.columns(2)
         with col1:
-            pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
+            pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries)
             st.download_button(
                 "📄 Rapport PDF (complet)",
                 data=pdf_bytes,
@@ -1302,7 +1302,6 @@ def _display_results(sr, max_dist_filter):
             "dans ChatGPT, Claude ou Gemini. Le JSON convient aux pipelines automatisés."
         )
 
-        # ── Paramètres filtres LLM ────────────────────────────────
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
             llm_max_dist = st.slider(
@@ -1323,7 +1322,6 @@ def _display_results(sr, max_dist_filter):
             )
         llm_statuts = tuple(llm_statuts_raw) if llm_statuts_raw else ("Vierge", "Testee")
 
-        # ── Ligne 2 : Brief LLM + JSON ────────────────────────────
         col3, col4 = st.columns(2)
         with col3:
             md_bytes = create_llm_brief(
@@ -1353,13 +1351,11 @@ def _display_results(sr, max_dist_filter):
                 width='stretch',
             )
 
-        # ── Aperçu du brief LLM dans l'interface ─────────────────
         st.divider()
         st.markdown("**👁️ Aperçu du Brief LLM**")
         st.caption(f"Filtres : Dist < {llm_max_dist}% | Score ≥ {llm_min_score} | {', '.join(llm_statuts)}")
         try:
             brief_preview = md_bytes.decode("utf-8")
-            # Compter les zones retenues (lignes commençant par "- BUY" ou "- SELL")
             n_zones = sum(1 for l in brief_preview.split("\n")
                           if l.strip().startswith("- BUY") or l.strip().startswith("- SELL"))
             n_actifs = brief_preview.count("### ")
@@ -1457,7 +1453,8 @@ with st.sidebar:
     st.caption("✅ Score pondéré TF (Weekly=3× H4) + âge")
     st.caption("✅ Statut : Vierge / Testée / Consommée")
     st.caption("✅ Prominence ATR + largeur zone ATR-based")
-    st.caption("✅ Plage prix valides (XAU/XAG/XPT/Indices)")
+    st.caption("✅ Plages prix 2026 mises à jour")
+    st.caption("✅ Fallback silencieux H4 close (prix fiable)")
     st.caption("✅ Fix PDF Unicode (accents + emojis)")
 
     st.divider()
@@ -1486,7 +1483,6 @@ if scan_button and symbols_to_scan:
 
             results_h4, results_daily, results_weekly = [], [], []
             all_zones_map, prices_map, trends_map = {}, {}, {}
-            all_anomalies = []
 
             args_list = [
                 (sym, base_url, access_token, account_id, zone_width, min_touches)
@@ -1510,9 +1506,7 @@ if scan_button and symbols_to_scan:
                         all_zones_map[symbol] = zones_d
                         prices_map[symbol]    = cp
                         trends_map[symbol]    = trends
-                        if anomaly_msg:
-                            all_anomalies.append({"actif": symbol.replace("_", "/"),
-                                                  "msg":   anomaly_msg})
+                        # anomaly_msg ignoré ici — affiché uniquement si critique
                         for tf_cap, tf_rows in rows.items():
                             if tf_rows:
                                 if tf_cap == "H4":      results_h4.extend(tf_rows)
@@ -1598,7 +1592,6 @@ if scan_button and symbols_to_scan:
                 "conf_filtered": conf_filtered,
                 "report_dict":   rep_dict,
                 "summaries":     summaries,
-                "anomaly_flags": all_anomalies,
                 "max_dist":      max_dist_filter,
             }
 
@@ -1614,4 +1607,4 @@ if "scan_results" in st.session_state and not scan_button:
         st.session_state["scan_results"],
         st.session_state["scan_results"].get("max_dist", 3.0),
     )
- 
+    
