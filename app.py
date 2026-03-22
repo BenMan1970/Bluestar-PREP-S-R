@@ -11,7 +11,7 @@ import concurrent.futures
 # ══════════════════════════════════════════════════════════════════
 # PAGE CONFIG & CSS
 # ══════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Scanner S/R Exhaustif", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Scanner Bluestar S/R", page_icon="📡", layout="wide")
 
 st.markdown("""
     <style>
@@ -19,27 +19,32 @@ st.markdown("""
     [data-testid="stDataFrame"] iframe { width: 100% !important; height: auto !important; }
     ::-webkit-scrollbar { width: 0px !important; height: 0px !important; }
     div[data-testid="stButton"] > button[kind="primary"] {
-        background-color: #D32F2F !important; color: white !important;
-        border: 1px solid #B71C1C !important; font-size: 18px !important;
-        font-weight: 700 !important; padding: 14px 40px !important;
-        border-radius: 8px !important; transition: all 0.2s;
+        background-color: #D32F2F;
+        color: white;
+        border: 1px solid #B71C1C;
+        transition: all 0.2s;
     }
     div[data-testid="stButton"] > button[kind="primary"]:hover {
-        background-color: #B71C1C !important;
-        box-shadow: 0 4px 16px rgba(211,47,47,0.5) !important;
+        background-color: #B71C1C;
+        border-color: #D32F2F;
+        box-shadow: 0 4px 12px rgba(211, 47, 47, 0.4);
     }
+    div[data-testid="stButton"] > button[kind="primary"]:active {
+        background-color: #D32F2F;
+        transform: scale(0.98);
+    }
+    div[data-testid="stButton"] > button { font-weight: 600; }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("📡 Scanner S/R Exhaustif - v4 (H4, D1, W)")
+st.title("📡 Scanner Bluestar Supports et Résistances")
 st.markdown(
     "Zones S/R avec **swing HH/LL confirmé**, **score pondéré TF+âge**, "
     "**statut Vierge/Testée/Consommée**, **plage prix valides**."
 )
 
-col_l, col_c, col_r = st.columns([2, 1, 2])
-with col_c:
-    scan_button = st.button("🚀 LANCER LE SCAN", type="primary", width='stretch')
+st.markdown("<br>", unsafe_allow_html=True)
+scan_button = st.button("🚀 LANCER LE SCAN COMPLET", type="primary", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════
 # CONSTANTES
@@ -66,20 +71,16 @@ PROMINENCE_COEFF = {
 }
 DEFAULT_PROMINENCE_COEFF = 0.3
 
-# ── FIX ALERTE 1 : Plages mises à jour pour les prix 2026 ─────────
-# XAU ~3000, US30 ~48000, NAS100 ~21000, SPX500 ~5800, DE30 ~23000
 PRICE_SANITY_RANGE = {
-    "XAU_USD":    (1500.0,  5500.0),   # was 4000 — gold >3000 en 2026
-    "XAG_USD":    (15.0,    70.0),     # was 60
+    "XAU_USD":    (1500.0,  5500.0),
+    "XAG_USD":    (15.0,    70.0),
     "XPT_USD":    (700.0,   2500.0),
-    "US30_USD":   (20000.0, 70000.0),  # was 60000 — DJI ~48k
-    "NAS100_USD": (8000.0,  25000.0),  # was 35000
-    "SPX500_USD": (3000.0,  9000.0),   # was 8500
+    "US30_USD":   (20000.0, 70000.0),
+    "NAS100_USD": (8000.0,  25000.0),
+    "SPX500_USD": (3000.0,  9000.0),
     "DE30_EUR":   (8000.0,  30000.0),
 }
 
-# Instruments pour lesquels on désactive le ratio-médiane (marchés directionnels)
-# car leurs supports passés sont structurellement très inférieurs au prix actuel
 _SKIP_RATIO_CHECK = {"XAU_USD", "XAG_USD", "XPT_USD",
                      "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR"}
 
@@ -147,18 +148,18 @@ def _safe_pdf_str(text: str) -> str:
 @st.cache_data(ttl=3600)
 def determine_oanda_environment(access_token, account_id):
     headers = {"Authorization": f"Bearer {access_token}"}
-    for name, url in [
-        ("Practice (Demo)", "https://api-fxpractice.oanda.com"),
-        ("Live (Reel)",     "https://api-fxtrade.oanda.com"),
+    for url in [
+        "https://api-fxpractice.oanda.com",
+        "https://api-fxtrade.oanda.com",
     ]:
         try:
             r = requests.get(f"{url}/v3/accounts/{account_id}/summary",
                              headers=headers, timeout=5)
             if r.status_code == 200:
-                return url, name
+                return url
         except requests.RequestException:
             continue
-    return None, None
+    return None
 
 
 @st.cache_data(ttl=600)
@@ -209,108 +210,64 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
         return None
 
 
-# ══════════════════════════════════════════════════════════════════
-# FIX ALERTE 1 : validate_live_price — fallback silencieux sur H4 close
-# ─────────────────────────────────────────────────────────────────
-# Ancienne logique : générait une alerte dès que le prix live s'écartait
-# de >15% du close H4 (faux positifs fréquents sur métaux/indices et en
-# dehors des heures de marché actives).
-#
-# Nouvelle logique :
-#   1. Vérification sanity range (plages 2026 mises à jour)
-#   2. Si le prix live est hors sanity → fallback silencieux sur H4 close
-#   3. Si déviation > seuil ADAPTATIF par type d'instrument → fallback silencieux
-#   4. Aucune alerte générée si le fallback réussit (prix utilisable)
-#   5. Alerte uniquement si AUCUN prix fiable n'est disponible (None total)
-# ══════════════════════════════════════════════════════════════════
-
-# Seuil de déviation autorisé entre prix live et H4 close, par instrument
-# Plus élevé pour les instruments volatils
 _DEV_THRESHOLD = {
     "XAU_USD": 3.0, "XAG_USD": 4.0, "XPT_USD": 4.0,
     "US30_USD": 2.5, "NAS100_USD": 2.5, "SPX500_USD": 2.0, "DE30_EUR": 2.0,
 }
-_DEFAULT_DEV_THRESHOLD = 1.5  # forex : 1.5% max entre live et H4 close
+_DEFAULT_DEV_THRESHOLD = 1.5
 
 
 def validate_live_price(live_price, symbol, base_url, access_token):
-    """
-    Valide le prix live et retourne (prix_fiable, message_alerte).
-    Priorité : live_price → H4 close fallback silencieux → None.
-    Une alerte n'est émise que si aucun prix ne peut être obtenu.
-    """
     dev_threshold = _DEV_THRESHOLD.get(symbol, _DEFAULT_DEV_THRESHOLD)
 
-    # ── Récupérer le close H4 de référence ───────────────────────
     h4_close = None
     df_check = get_oanda_data(base_url, access_token, symbol, "h4", limit=10)
     if df_check is not None and not df_check.empty:
         h4_close = float(df_check["close"].iloc[-1])
-
-        # Vérifier que le close H4 lui-même est dans la plage valide
         if symbol in PRICE_SANITY_RANGE:
             lo, hi = PRICE_SANITY_RANGE[symbol]
             if not (lo <= h4_close <= hi):
-                h4_close = None  # données H4 aussi invalides
+                h4_close = None
 
-    # ── Valider le prix live ──────────────────────────────────────
     if live_price is not None:
-        # 1. Sanity range check
         if symbol in PRICE_SANITY_RANGE:
             lo, hi = PRICE_SANITY_RANGE[symbol]
             if not (lo <= live_price <= hi):
-                live_price = None  # hors plage → on utilisera H4 close
+                live_price = None
 
-        # 2. Cohérence avec H4 close
         if live_price is not None and h4_close is not None and h4_close > 0:
             dev = abs(live_price - h4_close) / h4_close * 100
             if dev > dev_threshold:
-                live_price = None  # déviation trop forte → fallback silencieux
+                live_price = None
 
-    # ── Sélectionner le meilleur prix disponible ─────────────────
     if live_price is not None:
-        return live_price, None          # prix live valide, pas d'alerte
+        return live_price, None
 
     if h4_close is not None:
-        return h4_close, None           # fallback H4 close silencieux, pas d'alerte
+        return h4_close, None
 
-    # Aucun prix disponible → alerte légitime
     return None, f"Aucun prix fiable disponible pour {symbol}"
 
 
-# ══════════════════════════════════════════════════════════════════
-# FIX ALERTE 2 : flag_data_anomaly — seuils adaptés + exclusion indices
-# ─────────────────────────────────────────────────────────────────
-# Ancienne logique : ratio 1.8x et déviation 10% → faux positifs sur
-# XAU (trend forte, supports anciens bien en dessous), indices en bull run.
-#
-# Nouvelle logique :
-#   1. Indices et métaux exclus du ratio-médiane (directionnels par nature)
-#   2. Seuil déviation 10% → 25% (pour les paires forex restantes)
-#   3. Ratio 1.8x → 3.0x
-# ══════════════════════════════════════════════════════════════════
 def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
-    """Détecte les vraies anomalies de données. Retourne None si tout est normal."""
     if current_price is None or current_price <= 0:
         return None
 
     messages = []
 
-    # Ratio médiane des supports — désactivé pour marchés directionnels
     if symbol not in _SKIP_RATIO_CHECK and len(support_levels) >= 3:
         median_sup = np.median(support_levels)
         if median_sup > 0:
             ratio = current_price / median_sup
-            if ratio > 3.0:  # was 1.8x — seuil élargi
+            if ratio > 3.0:
                 messages.append(
                     f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
                     f"({median_sup:.2f}) - donnees a verifier"
                 )
 
-    # Déviation vs dernier close — seuil élargi 10% → 25%
     if last_candle_close and last_candle_close > 0:
         dev = abs(current_price - last_candle_close) / last_candle_close * 100
-        if dev > 25.0:  # was 10%
+        if dev > 25.0:
             messages.append(
                 f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
                 f"du dernier close ({last_candle_close:.2f})"
@@ -319,9 +276,6 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
     return " | ".join(messages) if messages else None
 
 
-# ══════════════════════════════════════════════════════════════════
-# VALIDATION PRIX (conservée pour compatibilité interne)
-# ══════════════════════════════════════════════════════════════════
 def get_price_context(current_price, supports, resistances):
     parts = []
     if not supports.empty:
@@ -440,9 +394,6 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
     return zones_list
 
 
-# ══════════════════════════════════════════════════════════════════
-# DÉTECTION SWING HH/LL
-# ══════════════════════════════════════════════════════════════════
 def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
     highs  = df["high"].values
     lows   = df["low"].values
@@ -488,9 +439,6 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
     return pivot_highs, pivot_lows
 
 
-# ══════════════════════════════════════════════════════════════════
-# STATUT DE ZONE
-# ══════════════════════════════════════════════════════════════════
 def classify_zone_status(level, zone_type, df, formation_idx,
                           atr_val=None, tolerance_coeff=0.25):
     if formation_idx >= len(df) - 1:
@@ -522,9 +470,6 @@ def classify_zone_status(level, zone_type, df, formation_idx,
     return "Testee" if has_approach else "Vierge"
 
 
-# ══════════════════════════════════════════════════════════════════
-# DÉTECTION S/R
-# ══════════════════════════════════════════════════════════════════
 def find_strong_sr_zones(df, current_price, atr_val=None,
                           zone_percentage_width=0.5,
                           atr_zone_coeff=0.4,
@@ -616,9 +561,6 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
     return supports, resistances
 
 
-# ══════════════════════════════════════════════════════════════════
-# CONFLUENCES MULTI-TIMEFRAMES
-# ══════════════════════════════════════════════════════════════════
 def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1.0):
     if not zones_dict or current_price is None:
         return []
@@ -710,16 +652,9 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
     return confluences
 
 
-# ══════════════════════════════════════════════════════════════════
-# SCAN PARALLÈLE PAR SYMBOLE
-# ══════════════════════════════════════════════════════════════════
 def scan_single_symbol(args):
     symbol, base_url, access_token, account_id, zone_width, min_touches = args
 
-    # ── FIX : récupérer H4 close en priorité comme prix de référence ──
-    # Le close H4 est plus fiable que le prix live du endpoint /pricing
-    # qui peut différer en dehors des heures actives ou pour les indices.
-    # validate_live_price() gère le fallback silencieux si besoin.
     raw_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
     current_price, price_alert_msg = validate_live_price(
         raw_price, symbol, base_url, access_token
@@ -737,7 +672,6 @@ def scan_single_symbol(args):
     trends         = {}
     all_sup_levels = []
     last_h4_close  = None
-    # Ne propager l'alerte que si c'est une vraie anomalie (prix None)
     anomaly_msg    = price_alert_msg
 
     for tf_key, tf_cap in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
@@ -749,7 +683,6 @@ def scan_single_symbol(args):
 
         if tf_key == "h4":
             last_h4_close = df["close"].iloc[-1]
-            # Si on n'a toujours pas de prix valide, utiliser le close H4
             if current_price is None:
                 current_price = last_h4_close
                 cp = last_h4_close
@@ -813,7 +746,6 @@ def scan_single_symbol(args):
         if tf_rows:
             rows[tf_cap] = tf_rows
 
-    # Vérification anomalie — seuils corrigés, indices exclus du ratio
     if all_sup_levels and current_price:
         new_anomaly = flag_data_anomaly(
             symbol, current_price, all_sup_levels, last_h4_close
@@ -838,13 +770,13 @@ class PDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 15)
         self.cell(0, 10,
-                  _safe_pdf_str('Rapport de Scan Support/Resistance - v4'),
+                  _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'),
                   border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
         self.cell(0, 6,
                   _safe_pdf_str(
                       f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
-                      "v4 - Score = (Force x Poids_TF x NbTF) x Facteur_Age | "
+                      "Score = (Force x Poids_TF x NbTF) x Facteur_Age | "
                       "Statut Vierge/Testee/Consommee"
                   ),
                   border=0, align='C', new_x='LMARGIN', new_y='NEXT')
@@ -962,7 +894,6 @@ def _apply_pdf_filter(df):
 
 def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomalies=None):
     summaries = summaries or []
-    # anomalies ignorées dans le PDF — données déjà nettoyées en amont
 
     pdf = PDF('L', 'mm', 'A4')
     pdf.set_margins(5, 10, 5)
@@ -1019,9 +950,6 @@ def create_csv_report(results_dict, confluences_df=None):
     return buf.getvalue()
 
 
-# ══════════════════════════════════════════════════════════════════
-# EXPORT LLM BRIEF (Markdown structuré, filtré)
-# ══════════════════════════════════════════════════════════════════
 def create_llm_brief(summaries, confluences_df,
                      max_dist=2.0, min_score=100.0,
                      allowed_statuts=("Vierge", "Testee")):
@@ -1032,7 +960,7 @@ def create_llm_brief(summaries, confluences_df,
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     lines = [
-        "# BRIEF S/R — Scanner v4",
+        "# BRIEF S/R — Scanner Bluestar",
         f"_Généré le {now}_",
         "",
         "## INSTRUCTIONS POUR LLM",
@@ -1148,16 +1076,13 @@ def create_llm_brief(summaries, confluences_df,
     return "\n".join(lines).encode("utf-8")
 
 
-# ══════════════════════════════════════════════════════════════════
-# EXPORT JSON STRUCTURÉ
-# ══════════════════════════════════════════════════════════════════
 def create_json_export(summaries, confluences_df,
                        max_dist=5.0, min_score=50.0):
     import json
 
     output = {
         "generated_at": datetime.now().isoformat(),
-        "scanner_version": "v4",
+        "scanner_version": "Bluestar",
         "description": (
             "Support/Resistance multi-timeframe scanner. "
             "Scores weighted by TF (H4=1x, Daily=2x, Weekly=3x) and age decay. "
@@ -1228,11 +1153,6 @@ def _display_results(sr, max_dist_filter):
     conf_filt = sr.get("conf_filtered",  pd.DataFrame())
     rep_dict  = sr.get("report_dict",    {})
     summaries = sr.get("summaries",      [])
-    # ── FIX ALERTE 1 & 2 : bloc anomalies complètement supprimé ──
-    # Les alertes de qualité données ne sont plus affichées.
-    # Les prix invalides sont désormais silencieusement remplacés par
-    # le close H4 dans validate_live_price() avant d'arriver ici.
-    # Les anomalies résiduelles sont loguées côté serveur uniquement.
 
     tf_cfg = {
         "Actif":       st.column_config.TextColumn("Actif",       width="small"),
@@ -1281,7 +1201,7 @@ def _display_results(sr, max_dist_filter):
             st.download_button(
                 "📄 Rapport PDF (complet)",
                 data=pdf_bytes,
-                file_name=f"rapport_sr_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                file_name=f"rapport_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
                 mime="application/pdf",
                 width='stretch',
             )
@@ -1290,7 +1210,7 @@ def _display_results(sr, max_dist_filter):
             st.download_button(
                 "📊 Données brutes CSV",
                 data=csv_bytes,
-                file_name=f"donnees_sr_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                file_name=f"donnees_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv",
                 width='stretch',
             )
@@ -1346,7 +1266,7 @@ def _display_results(sr, max_dist_filter):
             st.download_button(
                 "🔧 Export JSON structuré",
                 data=json_bytes,
-                file_name=f"sr_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                file_name=f"sr_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
                 mime="application/json",
                 width='stretch',
             )
@@ -1441,21 +1361,20 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("**Score v4 = (Force × Poids_TF × NbTF) × Facteur_Age**")
+    st.caption("**Score = (Force × Poids_TF × NbTF) × Facteur_Age**")
     st.caption("🔴 > 300 : Zone institutionnelle majeure")
     st.caption("🟠 100-300 : Zone structurelle forte")
     st.caption("🟡 30-100 : Zone technique valide")
     st.caption("⚪ < 30  : Zone secondaire")
 
     st.divider()
-    st.caption("**v4 - Améliorations moteur :**")
+    st.caption("**Améliorations moteur :**")
     st.caption("✅ Swing HH/LL confirmé (clôture suivante)")
     st.caption("✅ Score pondéré TF (Weekly=3× H4) + âge")
     st.caption("✅ Statut : Vierge / Testée / Consommée")
     st.caption("✅ Prominence ATR + largeur zone ATR-based")
     st.caption("✅ Plages prix 2026 mises à jour")
     st.caption("✅ Fallback silencieux H4 close (prix fiable)")
-    st.caption("✅ Fix PDF Unicode (accents + emojis)")
 
     st.divider()
     st.caption("**Exports disponibles :**")
@@ -1474,12 +1393,11 @@ if scan_button and symbols_to_scan:
     if not access_token or not account_id:
         st.warning("Configurez vos secrets OANDA avant de lancer le scan.")
     else:
-        base_url, env_name = determine_oanda_environment(access_token, account_id)
+        base_url = determine_oanda_environment(access_token, account_id)
         if not base_url:
             st.error("Identifiants OANDA invalides. Vérifiez vos secrets.")
         else:
-            st.info(f"Environnement détecté : **{env_name}**")
-            progress_bar = st.progress(0, text="Initialisation du scan v4…")
+            progress_bar = st.progress(0, text="Initialisation du scan…")
 
             results_h4, results_daily, results_weekly = [], [], []
             all_zones_map, prices_map, trends_map = {}, {}, {}
@@ -1499,14 +1417,13 @@ if scan_button and symbols_to_scan:
                     completed += 1
                     progress_bar.progress(
                         completed / total,
-                        text=f"Scan v4… ({completed}/{total}) {sym.replace('_', '/')}",
+                        text=f"Scan… ({completed}/{total}) {sym.replace('_', '/')}",
                     )
                     try:
                         symbol, rows, zones_d, cp, trends, anomaly_msg = future.result()
                         all_zones_map[symbol] = zones_d
                         prices_map[symbol]    = cp
                         trends_map[symbol]    = trends
-                        # anomaly_msg ignoré ici — affiché uniquement si critique
                         for tf_cap, tf_rows in rows.items():
                             if tf_rows:
                                 if tf_cap == "H4":      results_h4.extend(tf_rows)
@@ -1516,7 +1433,7 @@ if scan_button and symbols_to_scan:
                         pass
 
             progress_bar.empty()
-            st.success(f"✅ Scan v4 terminé - {len(symbols_to_scan)} actifs analysés.")
+            st.success(f"✅ Scan terminé — {len(symbols_to_scan)} actifs analysés.")
 
             st.info("🔍 Analyse des confluences multi-timeframes…")
             all_confluences = []
@@ -1600,11 +1517,10 @@ if scan_button and symbols_to_scan:
 elif not symbols_to_scan:
     st.info("Sélectionnez des actifs à scanner dans la barre latérale.")
 else:
-    st.info("Configurez les paramètres dans la barre latérale, puis cliquez sur **LANCER LE SCAN**.")
+    st.info("Configurez les paramètres dans la barre latérale, puis cliquez sur **LANCER LE SCAN COMPLET**.")
 
 if "scan_results" in st.session_state and not scan_button:
     _display_results(
         st.session_state["scan_results"],
         st.session_state["scan_results"].get("max_dist", 3.0),
     )
-    
