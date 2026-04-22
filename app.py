@@ -1,12 +1,14 @@
-import streamlit as st
-import pandas as pd
-import requests
-from scipy.signal import find_peaks
-import numpy as np
+import json
+import concurrent.futures
 from datetime import datetime
 from io import BytesIO
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 from fpdf import FPDF
-import concurrent.futures
+from scipy.signal import find_peaks
 
 # ══════════════════════════════════════════════════════════════════
 # PAGE CONFIG & CSS
@@ -47,42 +49,41 @@ st.markdown("<br>", unsafe_allow_html=True)
 scan_button = st.button("🚀 LANCER LE SCAN COMPLET", type="primary", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════
-# CONSTANTES
+# CONSTANTES — liste canonique 33 instruments
 # ══════════════════════════════════════════════════════════════════
 ALL_SYMBOLS = [
+    # 28 paires Forex
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD",
     "CAD_JPY", "CAD_CHF", "CHF_JPY", "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    "XAU_USD", "XAG_USD", "XPT_USD",
+    # 5 indices + 1 métal
+    "XAU_USD",
     "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR",
 ]
 
 ATR_ZONE_COEFF = {
-    "XAU_USD": 0.5, "XAG_USD": 0.5, "XPT_USD": 0.5,
+    "XAU_USD": 0.5,
     "US30_USD": 0.3, "NAS100_USD": 0.3, "SPX500_USD": 0.3, "DE30_EUR": 0.3,
 }
 DEFAULT_ATR_COEFF = 0.4
 
 PROMINENCE_COEFF = {
-    "XAU_USD": 0.5, "XAG_USD": 0.5, "XPT_USD": 0.5,
+    "XAU_USD": 0.5,
     "US30_USD": 0.4, "NAS100_USD": 0.4, "SPX500_USD": 0.4, "DE30_EUR": 0.4,
 }
 DEFAULT_PROMINENCE_COEFF = 0.3
 
 PRICE_SANITY_RANGE = {
     "XAU_USD":    (1500.0,  5500.0),
-    "XAG_USD":    (15.0,    70.0),
-    "XPT_USD":    (700.0,   2500.0),
     "US30_USD":   (20000.0, 70000.0),
     "NAS100_USD": (8000.0,  25000.0),
     "SPX500_USD": (3000.0,  9000.0),
     "DE30_EUR":   (8000.0,  30000.0),
 }
 
-_SKIP_RATIO_CHECK = {"XAU_USD", "XAG_USD", "XPT_USD",
-                     "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR"}
+_SKIP_RATIO_CHECK = {"XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR"}
 
 ZONE_WIDTH_FALLBACK = {
     "US30_USD":   0.50,
@@ -90,32 +91,37 @@ ZONE_WIDTH_FALLBACK = {
     "SPX500_USD": 0.25,
     "DE30_EUR":   0.25,
     "XAU_USD":    0.20,
-    "XAG_USD":    0.25,
-    "XPT_USD":    0.25,
 }
 DEFAULT_ZONE_WIDTH = 0.5
 
 PDF_DIST_THRESHOLDS = {
     "US30_USD": 5.0, "NAS100_USD": 5.0, "SPX500_USD": 5.0, "DE30_EUR": 5.0,
-    "XAU_USD": 8.0, "XAG_USD": 8.0, "XPT_USD": 8.0,
+    "XAU_USD": 8.0,
 }
 DEFAULT_PDF_DIST = 8.0
 
 ABSOLUTE_MAX_DIST = {
-    "XAU_USD": 8.0,  "XAG_USD": 8.0,  "XPT_USD": 8.0,
+    "XAU_USD": 8.0,
     "US30_USD": 4.0, "NAS100_USD": 4.0, "SPX500_USD": 4.0, "DE30_EUR": 4.0,
 }
 
 POST_MERGE_THRESHOLD = 0.30
 POST_MERGE_MAP = {
     "US30_USD": 0.05, "NAS100_USD": 0.05, "SPX500_USD": 0.08, "DE30_EUR": 0.08,
-    "XAU_USD": 0.15,  "XAG_USD": 0.20,   "XPT_USD": 0.20,
+    "XAU_USD": 0.15,
 }
 
 CONFLUENCE_THRESHOLD_MAP = {
     "US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, "DE30_EUR": 1.2,
-    "XAU_USD": 1.5,  "XAG_USD": 1.5,   "XPT_USD": 1.5,
+    "XAU_USD": 1.5,
 }
+
+# FIX : _DEV_THRESHOLD placé AVANT validate_live_price qui l'utilise
+_DEV_THRESHOLD = {
+    "XAU_USD": 3.0,
+    "US30_USD": 2.5, "NAS100_USD": 2.5, "SPX500_USD": 2.0, "DE30_EUR": 2.0,
+}
+_DEFAULT_DEV_THRESHOLD = 1.5
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -208,13 +214,6 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
         return None
     except requests.RequestException:
         return None
-
-
-_DEV_THRESHOLD = {
-    "XAU_USD": 3.0, "XAG_USD": 4.0, "XPT_USD": 4.0,
-    "US30_USD": 2.5, "NAS100_USD": 2.5, "SPX500_USD": 2.0, "DE30_EUR": 2.0,
-}
-_DEFAULT_DEV_THRESHOLD = 1.5
 
 
 def validate_live_price(live_price, symbol, base_url, access_token):
@@ -347,14 +346,18 @@ def compute_trend(df, sma_period=20):
 TF_WEIGHT = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 
 def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_bars=500):
-    tf_w     = TF_WEIGHT.get(tf_name, 1.0)
-    age_r    = age_bars / max(total_bars, 1)
-    age_f    = float(np.exp(-1.5 * age_r))
-    raw      = strength * tf_w * nb_tf
+    tf_w  = TF_WEIGHT.get(tf_name, 1.0)
+    age_r = age_bars / max(total_bars, 1)
+    age_f = float(np.exp(-1.5 * age_r))
+    raw   = strength * tf_w * nb_tf
     return round(raw * age_f, 1)
 
 
 def post_merge_zones(zones_list, threshold_pct=0.30):
+    """
+    FIX : la référence du groupe se recalcule à chaque ajout
+    pour éviter la dérive sur les bords.
+    """
     if len(zones_list) <= 1:
         return zones_list
 
@@ -371,6 +374,7 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
             for j in range(i + 1, len(zones_list)):
                 if j in used:
                     continue
+                # FIX : recalcul de la référence après chaque ajout
                 ref = np.mean([z["level"] for z in group])
                 if abs(zones_list[j]["level"] - ref) / ref * 100 <= threshold_pct:
                     group.append(zones_list[j])
@@ -378,7 +382,7 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
                     changed = True
             used.add(i)
 
-            best_age   = min(z.get("age_bars", 0) for z in group)
+            best_age = min(z.get("age_bars", 0) for z in group)
             best_status = min(
                 (z.get("status", "Testee") for z in group),
                 key=lambda s: STATUS_PRIORITY.get(s, 1)
@@ -413,8 +417,8 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
         )
         if is_sh:
             if atr_val and atr_val > 0:
-                local_low  = np.min(lows[max(0, i - n): i + n + 1])
-                amplitude  = h - local_low
+                local_low = np.min(lows[max(0, i - n): i + n + 1])
+                amplitude = h - local_low
                 if amplitude < atr_val * prominence_coeff:
                     is_sh = False
         if is_sh:
@@ -434,8 +438,10 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
         if is_sl:
             swing_low_idx.append(i)
 
-    pivot_highs = pd.Series(highs[swing_high_idx], index=swing_high_idx) if swing_high_idx else pd.Series(dtype=float)
-    pivot_lows  = pd.Series(lows[swing_low_idx],   index=swing_low_idx)  if swing_low_idx  else pd.Series(dtype=float)
+    pivot_highs = (pd.Series(highs[swing_high_idx], index=swing_high_idx)
+                   if swing_high_idx else pd.Series(dtype=float))
+    pivot_lows  = (pd.Series(lows[swing_low_idx],   index=swing_low_idx)
+                   if swing_low_idx  else pd.Series(dtype=float))
     return pivot_highs, pivot_lows
 
 
@@ -457,7 +463,8 @@ def classify_zone_status(level, zone_type, df, formation_idx,
         h = highs_after.iloc[i]
         l = lows_after.iloc[i]
 
-        near_zone = abs(c - level) <= tolerance or (l <= level + tolerance and h >= level - tolerance)
+        near_zone = (abs(c - level) <= tolerance or
+                     (l <= level + tolerance and h >= level - tolerance))
 
         if near_zone:
             has_approach = True
@@ -496,8 +503,10 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
             pk = {"distance": distance}
         r_idx, _ = find_peaks( df["high"].values, **pk)
         s_idx, _ = find_peaks(-df["low"].values,  **pk)
-        pivot_highs = pd.Series(df["high"].values[r_idx], index=r_idx) if len(r_idx) else pd.Series(dtype=float)
-        pivot_lows  = pd.Series(df["low"].values[s_idx],  index=s_idx) if len(s_idx) else pd.Series(dtype=float)
+        pivot_highs = (pd.Series(df["high"].values[r_idx], index=r_idx)
+                       if len(r_idx) else pd.Series(dtype=float))
+        pivot_lows  = (pd.Series(df["low"].values[s_idx],  index=s_idx)
+                       if len(s_idx) else pd.Series(dtype=float))
 
     if pivot_highs.empty and pivot_lows.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -512,13 +521,13 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
     if not pivots_with_idx:
         return pd.DataFrame(), pd.DataFrame()
 
-    zones_raw   = []
-    cur_group   = [pivots_with_idx[0]]
+    zones_raw = []
+    cur_group = [pivots_with_idx[0]]
 
     for price, idx in pivots_with_idx[1:]:
         avg = np.mean([p for p, _ in cur_group])
-        zone_width_abs = (atr_val * atr_zone_coeff) if (atr_val and atr_val > 0) \
-                         else (avg * zone_percentage_width / 100)
+        zone_width_abs = ((atr_val * atr_zone_coeff) if (atr_val and atr_val > 0)
+                          else (avg * zone_percentage_width / 100))
         if abs(price - avg) < zone_width_abs:
             cur_group.append((price, idx))
         else:
@@ -599,7 +608,8 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
             continue
 
         similar = zones_df[
-            (abs(zones_df["level"] - zone["level"]) / zone["level"] * 100 <= confluence_threshold) &
+            (abs(zones_df["level"] - zone["level"]) / zone["level"] * 100
+             <= confluence_threshold) &
             (zones_df.index != i)
         ]
 
@@ -608,17 +618,22 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
             timeframes = group["tf"].unique()
 
             if len(timeframes) >= 2:
-                avg_level  = group["level"].mean()
-                nb_tf      = len(timeframes)
-                dist_pct   = abs(current_price - avg_level) / current_price * 100
+                avg_level = group["level"].mean()
+                nb_tf     = len(timeframes)
+                dist_pct  = abs(current_price - avg_level) / current_price * 100
+
+                # FIX : les zones Consommées n'entrent PAS dans le calcul du score
+                group_active = group[group["status"] != "Consommee"]
+                if group_active.empty:
+                    group_active = group  # fallback si tout est consommé
 
                 total_score = 0.0
-                for _, row in group.iterrows():
+                for _, row in group_active.iterrows():
                     total_score += compute_structural_score(
                         int(row["strength"]),
                         nb_tf,
-                        tf_name  = row["tf"],
-                        age_bars = int(row.get("age_bars", 0)),
+                        tf_name    = row["tf"],
+                        age_bars   = int(row.get("age_bars", 0)),
                         total_bars = 500,
                     )
 
@@ -632,7 +647,8 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                 zone_type = group.iloc[0]["type"]
                 signal    = "🟢 BUY ZONE" if zone_type == "Support" else "🔴 SELL ZONE"
                 tf_label  = " + ".join(sorted(timeframes))
-                alerte    = "🔥 ZONE CHAUDE" if dist_pct < 0.5 else ("⚠️ Proche" if dist_pct < 1.5 else "")
+                alerte    = ("🔥 ZONE CHAUDE" if dist_pct < 0.5
+                             else ("⚠️ Proche" if dist_pct < 1.5 else ""))
 
                 confluences.append({
                     "Actif":        symbol,
@@ -660,12 +676,12 @@ def scan_single_symbol(args):
         raw_price, symbol, base_url, access_token
     )
 
-    atr_zone_coeff    = ATR_ZONE_COEFF.get(symbol, DEFAULT_ATR_COEFF)
-    prom_coeff        = PROMINENCE_COEFF.get(symbol, DEFAULT_PROMINENCE_COEFF)
-    zone_w_fallback   = ZONE_WIDTH_FALLBACK.get(symbol, zone_width)
-    merge_thresh      = POST_MERGE_MAP.get(symbol, POST_MERGE_THRESHOLD)
-    pdf_dist_max      = PDF_DIST_THRESHOLDS.get(symbol, DEFAULT_PDF_DIST)
-    abs_dist_max      = ABSOLUTE_MAX_DIST.get(symbol, 99.0)
+    atr_zone_coeff  = ATR_ZONE_COEFF.get(symbol, DEFAULT_ATR_COEFF)
+    prom_coeff      = PROMINENCE_COEFF.get(symbol, DEFAULT_PROMINENCE_COEFF)
+    zone_w_fallback = ZONE_WIDTH_FALLBACK.get(symbol, zone_width)
+    merge_thresh    = POST_MERGE_MAP.get(symbol, POST_MERGE_THRESHOLD)
+    pdf_dist_max    = PDF_DIST_THRESHOLDS.get(symbol, DEFAULT_PDF_DIST)
+    abs_dist_max    = ABSOLUTE_MAX_DIST.get(symbol, 99.0)
 
     rows           = {"H4": None, "Daily": None, "Weekly": None}
     zones_d        = {}
@@ -693,13 +709,13 @@ def scan_single_symbol(args):
 
         supports, resistances = find_strong_sr_zones(
             df, cp,
-            atr_val             = atr_val,
+            atr_val               = atr_val,
             zone_percentage_width = zone_w_fallback,
-            atr_zone_coeff      = atr_zone_coeff,
-            prominence_coeff    = prom_coeff,
-            min_touches         = min_touches,
-            timeframe           = tf_key,
-            post_merge_threshold = merge_thresh,
+            atr_zone_coeff        = atr_zone_coeff,
+            prominence_coeff      = prom_coeff,
+            min_touches           = min_touches,
+            timeframe             = tf_key,
+            post_merge_threshold  = merge_thresh,
         )
         zones_d[tf_cap] = (supports, resistances)
 
@@ -710,20 +726,19 @@ def scan_single_symbol(args):
             price_ctx = get_price_context(cp, supports, resistances)
             zones_d["_price_ctx"] = price_ctx
 
-        sym_d = symbol.replace("_", "/")
-
+        sym_d          = symbol.replace("_", "/")
         tf_weight_name = tf_cap
         n_total_bars   = len(df)
 
         def make_row(zone, ztype, _cp=cp, _atr=atr_val,
                      _pdf_max=pdf_dist_max, _abs_max=abs_dist_max,
                      _tf=tf_weight_name, _ntot=n_total_bars):
-            lvl      = zone["level"]
-            strength = int(zone["strength"])
-            age_bars = int(zone.get("age_bars", 0))
-            status   = zone.get("status", "Testee")
-            dist_pct = abs(_cp - lvl) / _cp * 100
-            dist_atr = round(abs(_cp - lvl) / _atr, 1) if (_atr and _atr > 0) else np.nan
+            lvl          = zone["level"]
+            strength     = int(zone["strength"])
+            age_bars     = int(zone.get("age_bars", 0))
+            status       = zone.get("status", "Testee")
+            dist_pct     = abs(_cp - lvl) / _cp * 100
+            dist_atr     = round(abs(_cp - lvl) / _atr, 1) if (_atr and _atr > 0) else np.nan
             struct_score = compute_structural_score(strength, 1, _tf, age_bars, _ntot)
             return {
                 "Actif":       sym_d,
@@ -751,7 +766,8 @@ def scan_single_symbol(args):
             symbol, current_price, all_sup_levels, last_h4_close
         )
         if new_anomaly:
-            anomaly_msg = f"{anomaly_msg} | {new_anomaly}" if anomaly_msg else new_anomaly
+            anomaly_msg = (f"{anomaly_msg} | {new_anomaly}"
+                           if anomaly_msg else new_anomaly)
 
     return symbol, rows, zones_d, current_price, trends, anomaly_msg
 
@@ -791,6 +807,20 @@ class PDF(FPDF):
         self.set_font('Helvetica', 'B', 12)
         self.cell(0, 10, _safe_pdf_str(title),
                   border=0, align='L', new_x='LMARGIN', new_y='NEXT')
+        self.ln(4)
+
+    def chapter_anomalies(self, anomalies: dict):
+        """FIX : affichage des anomalies de prix dans le PDF."""
+        if not anomalies:
+            return
+        self.set_font('Helvetica', 'B', 10)
+        self.cell(0, 7, _safe_pdf_str('ALERTES ANOMALIES PRIX'),
+                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')
+        self.ln(2)
+        self.set_font('Helvetica', '', 8)
+        for sym, msg in anomalies.items():
+            line = _safe_pdf_str(f"[!] {sym} : {msg}")
+            self.multi_cell(0, 5, line[:180])
         self.ln(4)
 
     def chapter_summary(self, summaries):
@@ -892,13 +922,20 @@ def _apply_pdf_filter(df):
     return df.drop(columns=["_in_pdf", "_dist_num"], errors="ignore").reset_index(drop=True)
 
 
-def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomalies=None):
+def create_pdf_report(results_dict, confluences_df=None,
+                      summaries=None, anomalies=None):
+    """FIX : anomalies maintenant affichées dans le PDF."""
     summaries = summaries or []
+    anomalies = anomalies or {}
 
     pdf = PDF('L', 'mm', 'A4')
     pdf.set_margins(5, 10, 5)
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+
+    # Anomalies en première page si présentes
+    if anomalies:
+        pdf.chapter_anomalies(anomalies)
 
     if summaries:
         pdf.chapter_summary(summaries)
@@ -953,7 +990,7 @@ def create_csv_report(results_dict, confluences_df=None):
 def create_llm_brief(summaries, confluences_df,
                      max_dist=2.0, min_score=100.0,
                      allowed_statuts=("Vierge", "Testee")):
-    TREND_ARROW = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
+    TREND_ARROW  = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
     STATUS_LABEL = {"Vierge": "V", "Testee": "T", "Consommee": "C"}
     ALERT_LABEL  = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠", "": ""}
 
@@ -965,7 +1002,7 @@ def create_llm_brief(summaries, confluences_df,
         "",
         "## INSTRUCTIONS POUR LLM",
         "Ce brief contient les zones Support/Résistance les plus fiables détectées",
-        "par un scanner multi-timeframes (H4 + Daily + Weekly) sur 35 actifs Forex/Indices/Métaux.",
+        "par un scanner multi-timeframes (H4 + Daily + Weekly) sur 33 actifs Forex/Indices/Métaux.",
         "",
         "**Légende :**",
         "- `BUY` / `SELL` : direction de la zone",
@@ -1006,21 +1043,22 @@ def create_llm_brief(summaries, confluences_df,
         if actif not in actif_zones:
             actif_zones[actif] = []
         actif_zones[actif].append({
-            "signal":   str(row.get("Signal", "")),
-            "niveau":   str(row.get("Niveau", "")),
-            "score":    score_val,
-            "statut":   statut,
-            "dist":     dist_val,
-            "tfs":      str(row.get("Timeframes", "")),
-            "nb_tf":    int(row.get("Nb TF", 0)),
-            "alerte":   str(row.get("Alerte", "")),
+            "signal":  str(row.get("Signal", "")),
+            "niveau":  str(row.get("Niveau", "")),
+            "score":   score_val,
+            "statut":  statut,
+            "dist":    dist_val,
+            "tfs":     str(row.get("Timeframes", "")),
+            "nb_tf":   int(row.get("Nb TF", 0)),
+            "alerte":  str(row.get("Alerte", "")),
         })
 
     actif_max_score = {
         actif: max(z["score"] for z in zones)
         for actif, zones in actif_zones.items()
     }
-    sorted_actifs = sorted(actif_max_score, key=lambda a: actif_max_score[a], reverse=True)
+    sorted_actifs = sorted(actif_max_score,
+                           key=lambda a: actif_max_score[a], reverse=True)
 
     summary_map = {s["symbol"]: s for s in summaries}
 
@@ -1078,15 +1116,14 @@ def create_llm_brief(summaries, confluences_df,
 
 def create_json_export(summaries, confluences_df,
                        max_dist=5.0, min_score=50.0):
-    import json
-
     output = {
-        "generated_at": datetime.now().isoformat(),
-        "scanner_version": "Bluestar",
+        "generated_at":     datetime.now().isoformat(),
+        "scanner_version":  "Bluestar",
         "description": (
             "Support/Resistance multi-timeframe scanner. "
             "Scores weighted by TF (H4=1x, Daily=2x, Weekly=3x) and age decay. "
-            "Status: Vierge=never tested (most reliable), Testee=respected, Consommee=broken."
+            "Status: Vierge=never tested (most reliable), "
+            "Testee=respected, Consommee=broken."
         ),
         "filters_applied": {"max_dist_pct": max_dist, "min_score": min_score},
         "assets": []
@@ -1112,24 +1149,26 @@ def create_json_export(summaries, confluences_df,
         if actif not in actif_groups:
             actif_groups[actif] = []
         actif_groups[actif].append({
-            "signal":       str(row.get("Signal", "")).replace("🟢 ", "").replace("🔴 ", ""),
-            "type":         str(row.get("Type", "")),
-            "level":        str(row.get("Niveau", "")),
-            "timeframes":   str(row.get("Timeframes", "")),
-            "nb_tf":        int(row.get("Nb TF", 0)),
-            "total_touches":int(row.get("Force Totale", 0)),
-            "score":        round(score_val, 1),
-            "status":       str(row.get("Statut", "")),
-            "distance_pct": round(dist_val, 3),
-            "alert":        str(row.get("Alerte", "")).replace("🔥 ", "").replace("⚠️ ", ""),
+            "signal":        str(row.get("Signal", "")).replace("🟢 ", "").replace("🔴 ", ""),
+            "type":          str(row.get("Type", "")),
+            "level":         str(row.get("Niveau", "")),
+            "timeframes":    str(row.get("Timeframes", "")),
+            "nb_tf":         int(row.get("Nb TF", 0)),
+            "total_touches": int(row.get("Force Totale", 0)),
+            "score":         round(score_val, 1),
+            "status":        str(row.get("Statut", "")),
+            "distance_pct":  round(dist_val, 3),
+            "alert":         str(row.get("Alerte", "")).replace("🔥 ", "").replace("⚠️ ", ""),
         })
 
-    for actif, zones in sorted(actif_groups.items(),
-                                key=lambda x: max(z["score"] for z in x[1]),
-                                reverse=True):
+    for actif, zones in sorted(
+        actif_groups.items(),
+        key=lambda x: max(z["score"] for z in x[1]),
+        reverse=True,
+    ):
         s = summary_map.get(actif, {})
         output["assets"].append({
-            "symbol":    actif,
+            "symbol": actif,
             "trend": {
                 "H4":     s.get("trend_h4",    "NEUTRE"),
                 "Daily":  s.get("trend_daily",  "NEUTRE"),
@@ -1146,13 +1185,24 @@ def create_json_export(summaries, confluences_df,
 # AFFICHAGE STREAMLIT
 # ══════════════════════════════════════════════════════════════════
 def _display_results(sr, max_dist_filter):
-    df_h4     = sr.get("df_h4",         pd.DataFrame())
-    df_daily  = sr.get("df_daily",       pd.DataFrame())
-    df_wk     = sr.get("df_weekly",      pd.DataFrame())
-    conf_full = sr.get("conf_full",      pd.DataFrame())
-    conf_filt = sr.get("conf_filtered",  pd.DataFrame())
-    rep_dict  = sr.get("report_dict",    {})
-    summaries = sr.get("summaries",      [])
+    df_h4     = sr.get("df_h4",        pd.DataFrame())
+    df_daily  = sr.get("df_daily",      pd.DataFrame())
+    df_wk     = sr.get("df_weekly",     pd.DataFrame())
+    conf_full = sr.get("conf_full",     pd.DataFrame())
+    conf_filt = sr.get("conf_filtered", pd.DataFrame())
+    rep_dict  = sr.get("report_dict",   {})
+    summaries = sr.get("summaries",     [])
+    anomalies = sr.get("anomalies",     {})
+
+    # FIX : recalcul du filtre de confluence avec le slider live
+    if not conf_full.empty:
+        tmp = conf_full.copy()
+        tmp["_dist_num"] = tmp["Distance %"].str.replace("%", "").astype(float)
+        conf_filt = (tmp[tmp["_dist_num"] <= max_dist_filter]
+                     .drop(columns=["_dist_num"])
+                     .reset_index(drop=True))
+    else:
+        conf_filt = pd.DataFrame()
 
     tf_cfg = {
         "Actif":       st.column_config.TextColumn("Actif",       width="small"),
@@ -1165,6 +1215,12 @@ def _display_results(sr, max_dist_filter):
         "Dist. %":     st.column_config.TextColumn("Dist. %",     width="small"),
         "Dist. ATR":   st.column_config.TextColumn("Dist. ATR",   width="small"),
     }
+
+    # FIX : affichage des anomalies dans l'UI
+    if anomalies:
+        with st.expander(f"⚠️ {len(anomalies)} anomalie(s) de prix détectée(s) — cliquer pour voir"):
+            for sym, msg in anomalies.items():
+                st.warning(f"**{sym}** : {msg}")
 
     if not conf_filt.empty:
         st.divider()
@@ -1182,7 +1238,8 @@ def _display_results(sr, max_dist_filter):
 
         conf_cfg = {
             **{k: st.column_config.TextColumn(k, width="small")
-               for k in ["Actif","Signal","Niveau","Type","Timeframes","Statut","Distance %","Alerte"]},
+               for k in ["Actif", "Signal", "Niveau", "Type",
+                         "Timeframes", "Statut", "Distance %", "Alerte"]},
             "Nb TF":        st.column_config.NumberColumn("Nb TF",        width="small"),
             "Force Totale": st.column_config.NumberColumn("Force Totale", width="small"),
             "Score":        st.column_config.NumberColumn("Score ▼",      width="small"),
@@ -1197,7 +1254,7 @@ def _display_results(sr, max_dist_filter):
 
         col1, col2 = st.columns(2)
         with col1:
-            pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries)
+            pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
             st.download_button(
                 "📄 Rapport PDF (complet)",
                 data=pdf_bytes,
@@ -1246,9 +1303,9 @@ def _display_results(sr, max_dist_filter):
         with col3:
             md_bytes = create_llm_brief(
                 summaries, conf_full,
-                max_dist=llm_max_dist,
-                min_score=llm_min_score,
-                allowed_statuts=llm_statuts,
+                max_dist        = llm_max_dist,
+                min_score       = llm_min_score,
+                allowed_statuts = llm_statuts,
             )
             st.download_button(
                 "🤖 Brief LLM (Markdown filtré)",
@@ -1260,8 +1317,8 @@ def _display_results(sr, max_dist_filter):
         with col4:
             json_bytes = create_json_export(
                 summaries, conf_full,
-                max_dist=max_dist_filter,
-                min_score=50.0,
+                max_dist  = max_dist_filter,
+                min_score = 50.0,
             )
             st.download_button(
                 "🔧 Export JSON structuré",
@@ -1276,8 +1333,8 @@ def _display_results(sr, max_dist_filter):
         st.caption(f"Filtres : Dist < {llm_max_dist}% | Score ≥ {llm_min_score} | {', '.join(llm_statuts)}")
         try:
             brief_preview = md_bytes.decode("utf-8")
-            n_zones = sum(1 for l in brief_preview.split("\n")
-                          if l.strip().startswith("- BUY") or l.strip().startswith("- SELL"))
+            n_zones  = sum(1 for l in brief_preview.split("\n")
+                           if l.strip().startswith("- BUY") or l.strip().startswith("- SELL"))
             n_actifs = brief_preview.count("### ")
             st.info(f"**{n_actifs} actifs** avec **{n_zones} zones** dans le brief LLM "
                     f"(≈ {n_zones * 15 + n_actifs * 10:,} tokens estimés)")
@@ -1375,6 +1432,7 @@ with st.sidebar:
     st.caption("✅ Prominence ATR + largeur zone ATR-based")
     st.caption("✅ Plages prix 2026 mises à jour")
     st.caption("✅ Fallback silencieux H4 close (prix fiable)")
+    st.caption("✅ Anomalies prix affichées dans UI + PDF")
 
     st.divider()
     st.caption("**Exports disponibles :**")
@@ -1400,7 +1458,10 @@ if scan_button and symbols_to_scan:
             progress_bar = st.progress(0, text="Initialisation du scan…")
 
             results_h4, results_daily, results_weekly = [], [], []
-            all_zones_map, prices_map, trends_map = {}, {}, {}
+            all_zones_map = {}
+            prices_map    = {}
+            trends_map    = {}
+            anomalies_map = {}   # FIX : collecte des anomalies
 
             args_list = [
                 (sym, base_url, access_token, account_id, zone_width, min_touches)
@@ -1424,16 +1485,28 @@ if scan_button and symbols_to_scan:
                         all_zones_map[symbol] = zones_d
                         prices_map[symbol]    = cp
                         trends_map[symbol]    = trends
+
+                        # FIX : on stocke les anomalies non nulles
+                        if anomaly_msg:
+                            anomalies_map[symbol.replace("_", "/")] = anomaly_msg
+
                         for tf_cap, tf_rows in rows.items():
                             if tf_rows:
-                                if tf_cap == "H4":      results_h4.extend(tf_rows)
-                                elif tf_cap == "Daily": results_daily.extend(tf_rows)
-                                elif tf_cap == "Weekly": results_weekly.extend(tf_rows)
+                                if tf_cap == "H4":
+                                    results_h4.extend(tf_rows)
+                                elif tf_cap == "Daily":
+                                    results_daily.extend(tf_rows)
+                                elif tf_cap == "Weekly":
+                                    results_weekly.extend(tf_rows)
                     except Exception:
                         pass
 
             progress_bar.empty()
             st.success(f"✅ Scan terminé — {len(symbols_to_scan)} actifs analysés.")
+
+            # FIX : affichage immédiat des anomalies après le scan
+            if anomalies_map:
+                st.warning(f"⚠️ {len(anomalies_map)} anomalie(s) détectée(s) — voir le détail ci-dessous.")
 
             st.info("🔍 Analyse des confluences multi-timeframes…")
             all_confluences = []
@@ -1475,7 +1548,7 @@ if scan_button and symbols_to_scan:
                     top_zones = ac.head(3).to_dict("records")
 
                 price_ctx = ""
-                d_zones = all_zones_map.get(sym, {})
+                d_zones   = all_zones_map.get(sym, {})
                 if "_price_ctx" in d_zones:
                     price_ctx = d_zones["_price_ctx"]
                 elif "Daily" in d_zones and cp:
@@ -1509,6 +1582,7 @@ if scan_button and symbols_to_scan:
                 "conf_filtered": conf_filtered,
                 "report_dict":   rep_dict,
                 "summaries":     summaries,
+                "anomalies":     anomalies_map,   # FIX : stocké en session
                 "max_dist":      max_dist_filter,
             }
 
@@ -1517,10 +1591,14 @@ if scan_button and symbols_to_scan:
 elif not symbols_to_scan:
     st.info("Sélectionnez des actifs à scanner dans la barre latérale.")
 else:
-    st.info("Configurez les paramètres dans la barre latérale, puis cliquez sur **LANCER LE SCAN COMPLET**.")
+    st.info(
+        "Configurez les paramètres dans la barre latérale, "
+        "puis cliquez sur **LANCER LE SCAN COMPLET**."
+    )
 
+# FIX : slider live utilisé (max_dist_filter), pas la valeur figée du session_state
 if "scan_results" in st.session_state and not scan_button:
     _display_results(
         st.session_state["scan_results"],
-        st.session_state["scan_results"].get("max_dist", 3.0),
+        max_dist_filter,   # ← valeur live du slider sidebar
     )
