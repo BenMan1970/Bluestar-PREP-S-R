@@ -362,25 +362,38 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
     return " | ".join(messages) if messages else None
 
 
-def get_price_context(current_price, supports, resistances):
+def get_price_context(current_price, supports, resistances, max_dist_pct: float = 5.0):
     """
     MEDIUM #3 FIX — Guard current_price nul ou None.
-    nlargest/nsmallest déjà en place (v2). On ajoute la protection
-    contre current_price=0 qui donnait une division par zéro dans dist_s/dist_r.
+    BUG VISIBLE FIX — Filtre de distance max_dist_pct avant nlargest/nsmallest.
+    Problème original : nlargest(1) sur TOUS les supports retournait le support
+    le plus haut même à 2.44% ou plus — incohérent avec le filtre confluence à 2%.
+    Désormais on ne retient que les niveaux dans un rayon de max_dist_pct (5% par défaut).
+    Si aucun niveau proche → "Zone intermediaire" au lieu d'un niveau trompeur.
     """
     if not current_price or current_price <= 0:
         return "Prix indisponible"
     parts = []
     if not supports.empty:
-        nearest_sup = supports.nlargest(1, "level").iloc[0]
-        dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
-        tag    = "SUR support" if dist_s < 0.5 else "S proche"
-        parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
+        # Filtrer les supports dans le rayon max_dist_pct
+        sup_nearby = supports[
+            abs(supports["level"] - current_price) / current_price * 100 <= max_dist_pct
+        ]
+        if not sup_nearby.empty:
+            nearest_sup = sup_nearby.nlargest(1, "level").iloc[0]
+            dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
+            tag    = "SUR support" if dist_s < 0.5 else "S proche"
+            parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
     if not resistances.empty:
-        nearest_res = resistances.nsmallest(1, "level").iloc[0]
-        dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
-        tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
-        parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
+        # Filtrer les résistances dans le rayon max_dist_pct
+        res_nearby = resistances[
+            abs(resistances["level"] - current_price) / current_price * 100 <= max_dist_pct
+        ]
+        if not res_nearby.empty:
+            nearest_res = res_nearby.nsmallest(1, "level").iloc[0]
+            dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
+            tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
+            parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
     return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
