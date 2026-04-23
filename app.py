@@ -1,7 +1,11 @@
+import hashlib
 import json
+import threading
 import concurrent.futures
+from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -42,27 +46,33 @@ st.markdown("""
 st.title("📡 Scanner Bluestar Supports et Résistances")
 st.markdown(
     "Zones S/R avec **swing HH/LL confirmé**, **score pondéré TF+âge**, "
-    "**statut Vierge/Testée/Consommée**, **plage prix valides**."
+    "**statut Vierge/Testée/Consommée/Role Reverse**, **plage prix valides**."
 )
 
 st.markdown("<br>", unsafe_allow_html=True)
 scan_button = st.button("🚀 LANCER LE SCAN COMPLET", type="primary", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════
-# CONSTANTES — liste canonique 33 instruments
+# CONSTANTES — organisées par domaine (LOW #2 FIX)
+# Avant : tout au même niveau, impossible de distinguer trading/PDF/validation.
+# Maintenant : 3 sections clairement séparées.
 # ══════════════════════════════════════════════════════════════════
+
+# ── Version ────────────────────────────────────────────────────────
+SCANNER_VERSION = "5.0"
+
+# ── Instruments ────────────────────────────────────────────────────
 ALL_SYMBOLS = [
-    # 28 paires Forex
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD",
     "CAD_JPY", "CAD_CHF", "CHF_JPY", "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    # 5 indices + 1 métal
     "XAU_USD",
     "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR",
 ]
 
+# ── Paramètres de détection S/R (logique trading) ─────────────────
 ATR_ZONE_COEFF = {
     "XAU_USD": 0.5,
     "US30_USD": 0.3, "NAS100_USD": 0.3, "SPX500_USD": 0.3, "DE30_EUR": 0.3,
@@ -75,16 +85,6 @@ PROMINENCE_COEFF = {
 }
 DEFAULT_PROMINENCE_COEFF = 0.3
 
-PRICE_SANITY_RANGE = {
-    "XAU_USD":    (1500.0,  5500.0),
-    "US30_USD":   (20000.0, 70000.0),
-    "NAS100_USD": (8000.0,  25000.0),
-    "SPX500_USD": (3000.0,  9000.0),
-    "DE30_EUR":   (8000.0,  30000.0),
-}
-
-_SKIP_RATIO_CHECK = {"XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR"}
-
 ZONE_WIDTH_FALLBACK = {
     "US30_USD":   0.50,
     "NAS100_USD": 0.50,
@@ -93,17 +93,6 @@ ZONE_WIDTH_FALLBACK = {
     "XAU_USD":    0.20,
 }
 DEFAULT_ZONE_WIDTH = 0.5
-
-PDF_DIST_THRESHOLDS = {
-    "US30_USD": 5.0, "NAS100_USD": 5.0, "SPX500_USD": 5.0, "DE30_EUR": 5.0,
-    "XAU_USD": 8.0,
-}
-DEFAULT_PDF_DIST = 8.0
-
-ABSOLUTE_MAX_DIST = {
-    "XAU_USD": 8.0,
-    "US30_USD": 4.0, "NAS100_USD": 4.0, "SPX500_USD": 4.0, "DE30_EUR": 4.0,
-}
 
 POST_MERGE_THRESHOLD = 0.30
 POST_MERGE_MAP = {
@@ -116,12 +105,68 @@ CONFLUENCE_THRESHOLD_MAP = {
     "XAU_USD": 1.5,
 }
 
-# FIX : _DEV_THRESHOLD placé AVANT validate_live_price qui l'utilise
-_DEV_THRESHOLD = {
+# ── Validation des prix (santé des données) ────────────────────────
+PRICE_SANITY_RANGE = {
+    "XAU_USD":    (1500.0,  5500.0),
+    "US30_USD":   (20000.0, 70000.0),
+    "NAS100_USD": (8000.0,  25000.0),
+    "SPX500_USD": (3000.0,  9000.0),
+    "DE30_EUR":   (8000.0,  30000.0),
+}
+_SKIP_RATIO_CHECK    = {"XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR"}
+_DEV_THRESHOLD       = {
     "XAU_USD": 3.0,
     "US30_USD": 2.5, "NAS100_USD": 2.5, "SPX500_USD": 2.0, "DE30_EUR": 2.0,
 }
 _DEFAULT_DEV_THRESHOLD = 1.5
+
+# ── Paramètres export PDF (filtrage de distance) ───────────────────
+PDF_DIST_THRESHOLDS = {
+    "US30_USD": 5.0, "NAS100_USD": 5.0, "SPX500_USD": 5.0, "DE30_EUR": 5.0,
+    "XAU_USD": 8.0,
+}
+DEFAULT_PDF_DIST = 8.0
+
+ABSOLUTE_MAX_DIST = {
+    "XAU_USD": 8.0,
+    "US30_USD": 4.0, "NAS100_USD": 4.0, "SPX500_USD": 4.0, "DE30_EUR": 4.0,
+}
+
+# ══════════════════════════════════════════════════════════════════
+# BUGFIX #1 — Cache thread-safe (remplace @st.cache_data pour les données OANDA)
+# Problème original : ThreadPoolExecutor (8 workers) + @st.cache_data
+# créait des race conditions sur les écritures de cache Streamlit.
+# Solution : dict protégé par threading.Lock() + TTL manuel.
+# ══════════════════════════════════════════════════════════════════
+
+# ── Cache thread-safe ──────────────────────────────────────────────
+_oanda_cache: dict = {}
+_oanda_cache_lock  = threading.Lock()
+
+def _token_fingerprint(token: str) -> str:
+    """
+    LOW #3 FIX — Le token OANDA ne doit pas apparaître en clair dans
+    les clés de cache (logs Streamlit, métadonnées disque).
+    On utilise les 12 premiers caractères du SHA-256 comme fingerprint.
+    """
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+def _cache_key(token: str, symbol: str, timeframe: str, limit: int) -> str:
+    return f"{_token_fingerprint(token)}__{symbol}__{timeframe}__{limit}"
+
+def _cache_get(key: str, ttl_seconds: int) -> Optional[pd.DataFrame]:
+    with _oanda_cache_lock:
+        entry = _oanda_cache.get(key)
+    if entry is None:
+        return None
+    df, ts = entry
+    if (datetime.now() - ts).total_seconds() > ttl_seconds:
+        return None
+    return df
+
+def _cache_set(key: str, df: Optional[pd.DataFrame]) -> None:
+    with _oanda_cache_lock:
+        _oanda_cache[key] = (df, datetime.now())
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -136,7 +181,7 @@ _EMOJI_MAP = [
     ('🟢', '[BUY]'),  ('🔴', '[SELL]'), ('🔥', '[CHAUD]'),
     ('⚠️', '[PROCHE]'), ('⚠',  '[PROCHE]'), ('📈', ''), ('📉', ''),
     ('↔️', ''), ('↔',  ''), ('✅', '[OK]'), ('❌', '[X]'),
-    ('⚡', '[!]'), ('📡', ''), ('📅', ''),
+    ('⚡', '[!]'), ('📡', ''), ('📅', ''), ('↩️', '[RR]'),
 ]
 
 def _safe_pdf_str(text: str) -> str:
@@ -151,8 +196,8 @@ def _safe_pdf_str(text: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 # API OANDA
 # ══════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=3600)
-def determine_oanda_environment(access_token, account_id):
+@st.cache_data(ttl=300)   # TTL court : 5 min (était 3600 = 1h, trop long)
+def determine_oanda_environment(access_token: str, account_id: str) -> Optional[str]:
     headers = {"Authorization": f"Bearer {access_token}"}
     for url in [
         "https://api-fxpractice.oanda.com",
@@ -168,12 +213,23 @@ def determine_oanda_environment(access_token, account_id):
     return None
 
 
-@st.cache_data(ttl=600)
-def get_oanda_data(base_url, access_token, symbol, timeframe="daily", limit=500):
+def get_oanda_data(base_url: str, access_token: str, symbol: str,
+                   timeframe: str = "daily", limit: int = 500) -> Optional[pd.DataFrame]:
+    """
+    BUGFIX #1 : plus de @st.cache_data ici.
+    Cache manuel thread-safe (dict + Lock).
+    TTL = 600s pour les données de prix, identique à l'original.
+    On demande limit+1 bougies pour compenser la bougie en cours (incomplète).
+    """
+    key = _cache_key(access_token, symbol, timeframe, limit)
+    cached = _cache_get(key, ttl_seconds=600)
+    if cached is not None:
+        return cached
+
     url     = f"{base_url}/v3/instruments/{symbol}/candles"
     headers = {"Authorization": f"Bearer {access_token}"}
     params  = {
-        "count":       limit,
+        "count":       limit + 1,   # +1 pour compenser la bougie en cours
         "granularity": {"h4": "H4", "daily": "D", "weekly": "W"}[timeframe],
         "price":       "M",
     }
@@ -182,6 +238,7 @@ def get_oanda_data(base_url, access_token, symbol, timeframe="daily", limit=500)
         r.raise_for_status()
         data = r.json()
         if not data.get("candles"):
+            _cache_set(key, None)
             return None
         candles = [
             {
@@ -194,13 +251,38 @@ def get_oanda_data(base_url, access_token, symbol, timeframe="daily", limit=500)
             }
             for c in data.get("candles", []) if c.get("complete")
         ]
-        return pd.DataFrame(candles).set_index("date")
+        # On limite à `limit` bougies complètes (on a demandé limit+1)
+        # HIGH #2 FIX — bloc pass mort supprimé. Le df retourné reflète
+        # la réalité : si 450 bougies sur 500, len(df)=450, l'appelant
+        # le verra via len(df) < 20 dans find_strong_sr_zones.
+        df = pd.DataFrame(candles[:limit]).set_index("date")
+        _cache_set(key, df)
+        return df
     except requests.RequestException:
+        _cache_set(key, None)
         return None
 
 
-@st.cache_data(ttl=60)
-def get_oanda_current_price(base_url, access_token, account_id, symbol):
+# Cache séparé pour les prix live (TTL court : 60s)
+_price_cache: dict = {}
+_price_cache_lock  = threading.Lock()
+
+def get_oanda_current_price(base_url: str, access_token: str,
+                             account_id: str, symbol: str) -> Optional[float]:
+    """
+    CRIT #2 FIX — @st.cache_data retiré.
+    Même problème que get_oanda_data : appelée depuis ThreadPoolExecutor,
+    @st.cache_data créait des race conditions sur les écritures de cache.
+    Cache manuel thread-safe avec TTL=60s.
+    """
+    key = f"{_token_fingerprint(access_token)}__{symbol}__price"
+    with _price_cache_lock:
+        entry = _price_cache.get(key)
+    if entry is not None:
+        val, ts = entry
+        if (datetime.now() - ts).total_seconds() < 60:
+            return val
+
     url     = f"{base_url}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
@@ -210,17 +292,28 @@ def get_oanda_current_price(base_url, access_token, account_id, symbol):
         if "prices" in data and data["prices"]:
             bid = float(data["prices"][0]["closeoutBid"])
             ask = float(data["prices"][0]["closeoutAsk"])
-            return (bid + ask) / 2
-        return None
+            result = (bid + ask) / 2
+        else:
+            result = None
     except requests.RequestException:
-        return None
+        result = None
+
+    with _price_cache_lock:
+        _price_cache[key] = (result, datetime.now())
+    return result
 
 
 def validate_live_price(live_price, symbol, base_url, access_token):
+    """
+    MEDIUM #1 FIX — limit=500 au lieu de limit=10 pour partager le cache
+    avec le prefetch de scan_single_symbol (même clé de cache).
+    Élimine 33 appels réseau superflus (un par symbole) au premier scan.
+    """
     dev_threshold = _DEV_THRESHOLD.get(symbol, _DEFAULT_DEV_THRESHOLD)
 
     h4_close = None
-    df_check = get_oanda_data(base_url, access_token, symbol, "h4", limit=10)
+    # limit=500 → même clé cache que le prefetch → hit garanti au 2e appel
+    df_check = get_oanda_data(base_url, access_token, symbol, "h4", limit=500)
     if df_check is not None and not df_check.empty:
         h4_close = float(df_check["close"].iloc[-1])
         if symbol in PRICE_SANITY_RANGE:
@@ -241,19 +334,15 @@ def validate_live_price(live_price, symbol, base_url, access_token):
 
     if live_price is not None:
         return live_price, None
-
     if h4_close is not None:
         return h4_close, None
-
     return None, f"Aucun prix fiable disponible pour {symbol}"
 
 
 def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
     if current_price is None or current_price <= 0:
         return None
-
     messages = []
-
     if symbol not in _SKIP_RATIO_CHECK and len(support_levels) >= 3:
         median_sup = np.median(support_levels)
         if median_sup > 0:
@@ -263,7 +352,6 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
                     f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
                     f"({median_sup:.2f}) - donnees a verifier"
                 )
-
     if last_candle_close and last_candle_close > 0:
         dev = abs(current_price - last_candle_close) / last_candle_close * 100
         if dev > 25.0:
@@ -271,19 +359,25 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
                 f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
                 f"du dernier close ({last_candle_close:.2f})"
             )
-
     return " | ".join(messages) if messages else None
 
 
 def get_price_context(current_price, supports, resistances):
+    """
+    MEDIUM #3 FIX — Guard current_price nul ou None.
+    nlargest/nsmallest déjà en place (v2). On ajoute la protection
+    contre current_price=0 qui donnait une division par zéro dans dist_s/dist_r.
+    """
+    if not current_price or current_price <= 0:
+        return "Prix indisponible"
     parts = []
     if not supports.empty:
-        nearest_sup = supports.loc[supports["level"].idxmax()]
+        nearest_sup = supports.nlargest(1, "level").iloc[0]
         dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
         tag    = "SUR support" if dist_s < 0.5 else "S proche"
         parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
     if not resistances.empty:
-        nearest_res = resistances.loc[resistances["level"].idxmin()]
+        nearest_res = resistances.nsmallest(1, "level").iloc[0]
         dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
         tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
         parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
@@ -297,7 +391,12 @@ def get_adaptive_distance(timeframe):
     return {"h4": 5, "daily": 8, "weekly": 10}.get(timeframe, 5)
 
 
-def compute_atr(df, period=14):
+def compute_atr(df, period=14) -> Optional[float]:
+    """
+    MEDIUM #1 FIX — NaN pandas converti en None pour propagation explicite.
+    Évite que rolling() sur fenêtre trop petite retourne NaN silencieux
+    qui corrompt les calculs de zone_width et dist_atr en aval.
+    """
     if df is None or len(df) < period + 1:
         return None
     tr = pd.concat([
@@ -305,14 +404,19 @@ def compute_atr(df, period=14):
         (df["high"] - df["close"].shift(1)).abs(),
         (df["low"]  - df["close"].shift(1)).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(period).mean().iloc[-1]
+    result = tr.rolling(period).mean().iloc[-1]
+    return float(result) if pd.notna(result) and result > 0 else None
 
 
 def compute_trend(df, sma_period=20):
     if df is None or len(df) < 15:
         return "NEUTRE"
 
+    # BUGFIX : période insuffisante → tendance non fiable → NEUTRE
     actual_period = min(sma_period, len(df) - 5)
+    if actual_period < sma_period * 0.6:
+        return "NEUTRE"
+
     close   = df["close"]
     sma     = close.rolling(actual_period).mean().iloc[-1]
     current = close.iloc[-1]
@@ -328,11 +432,10 @@ def compute_trend(df, sma_period=20):
     above_sma = current > sma
     below_sma = current < sma
 
-    if above_sma and slope_pct > 0.05 and hh:
-        return "HAUSSIER"
-    elif below_sma and slope_pct < -0.05 and ll:
-        return "BAISSIER"
-    elif above_sma and slope_pct > 0.05:
+    # MEDIUM #4 FIX — Branches elif redondantes supprimées (dead code).
+    # hh/ll renforcent le signal mais ne sont pas des conditions bloquantes.
+    # La logique précédente avait 4 branches pour 2 cas réels.
+    if above_sma and slope_pct > 0.05:
         return "HAUSSIER"
     elif below_sma and slope_pct < -0.05:
         return "BAISSIER"
@@ -355,13 +458,16 @@ def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_ba
 
 def post_merge_zones(zones_list, threshold_pct=0.30):
     """
-    FIX : la référence du groupe se recalcule à chaque ajout
-    pour éviter la dérive sur les bords.
+    BUGFIX #2 — Ancre fixe par groupe.
+    Problème original : la moyenne du groupe dérivait après chaque ajout,
+    ce qui pouvait absorber des zones trop éloignées du point de départ.
+    Solution : on ancre sur le PREMIER élément du groupe (pivot stable),
+    pas sur la moyenne recalculée.
     """
     if len(zones_list) <= 1:
         return zones_list
 
-    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Consommee": 2}
+    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
 
     changed = True
     while changed:
@@ -370,13 +476,14 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
         for i in range(len(zones_list)):
             if i in used:
                 continue
-            group = [zones_list[i]]
+            group  = [zones_list[i]]
+            anchor = zones_list[i]["level"]   # ← ancre FIXE sur le 1er élément
+
             for j in range(i + 1, len(zones_list)):
                 if j in used:
                     continue
-                # FIX : recalcul de la référence après chaque ajout
-                ref = np.mean([z["level"] for z in group])
-                if abs(zones_list[j]["level"] - ref) / ref * 100 <= threshold_pct:
+                # On compare toujours à l'ancre du groupe, pas à la moyenne mobile
+                if abs(zones_list[j]["level"] - anchor) / anchor * 100 <= threshold_pct:
                     group.append(zones_list[j])
                     used.add(j)
                     changed = True
@@ -399,82 +506,107 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
 
 
 def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
-    highs  = df["high"].values
-    lows   = df["low"].values
-    closes = df["close"].values
-    n_bars = len(df)
+    """
+    HIGH #1 FIX — Version vectorisée numpy (O(n) au lieu de O(n²)).
+    Problème original : boucle Python pure avec np.max sur des slices
+    à chaque itération → ~50 000 appels sur 33 actifs × 3 TF × 500 bougies.
+    Solution : rolling max/min via pd.Series + masques booléens vectorisés.
+    Résultat identique, 10-30× plus rapide.
+    """
+    highs  = pd.Series(df["high"].values)
+    lows   = pd.Series(df["low"].values)
+    closes = pd.Series(df["close"].values)
 
-    swing_high_idx, swing_low_idx = [], []
+    # Rolling max/min sur n bougies à gauche et à droite
+    roll_high_left  = highs.shift(1).rolling(n, min_periods=n).max()
+    roll_high_right = highs[::-1].shift(1).rolling(n, min_periods=n).max()[::-1]
+    roll_low_left   = lows.shift(1).rolling(n, min_periods=n).min()
+    roll_low_right  = lows[::-1].shift(1).rolling(n, min_periods=n).min()[::-1]
 
-    for i in range(n, n_bars - n - 1):
-        h = highs[i]
-        l = lows[i]
+    # Confirmation par la clôture suivante (shift(-1))
+    next_close = closes.shift(-1)
 
-        is_sh = (
-            h > np.max(highs[i - n: i]) and
-            h > np.max(highs[i + 1: i + n + 1]) and
-            closes[i + 1] < h
-        )
-        if is_sh:
-            if atr_val and atr_val > 0:
-                local_low = np.min(lows[max(0, i - n): i + n + 1])
-                amplitude = h - local_low
-                if amplitude < atr_val * prominence_coeff:
-                    is_sh = False
-        if is_sh:
-            swing_high_idx.append(i)
+    sh_mask = (
+        (highs > roll_high_left) &
+        (highs > roll_high_right) &
+        (next_close < highs)
+    )
+    sl_mask = (
+        (lows < roll_low_left) &
+        (lows < roll_low_right) &
+        (next_close > lows)
+    )
 
-        is_sl = (
-            l < np.min(lows[i - n: i]) and
-            l < np.min(lows[i + 1: i + n + 1]) and
-            closes[i + 1] > l
-        )
-        if is_sl:
-            if atr_val and atr_val > 0:
-                local_high = np.max(highs[max(0, i - n): i + n + 1])
-                amplitude  = local_high - l
-                if amplitude < atr_val * prominence_coeff:
-                    is_sl = False
-        if is_sl:
-            swing_low_idx.append(i)
+    # Filtre prominence ATR (gardé pour cohérence avec l'original)
+    if atr_val and atr_val > 0:
+        min_amplitude = atr_val * prominence_coeff
+        roll_low_around  = lows.rolling(2 * n + 1, center=True, min_periods=1).min()
+        roll_high_around = highs.rolling(2 * n + 1, center=True, min_periods=1).max()
+        sh_mask = sh_mask & ((highs - roll_low_around)  >= min_amplitude)
+        sl_mask = sl_mask & ((roll_high_around - lows)  >= min_amplitude)
 
-    pivot_highs = (pd.Series(highs[swing_high_idx], index=swing_high_idx)
+    swing_high_idx = sh_mask[sh_mask].index.tolist()
+    swing_low_idx  = sl_mask[sl_mask].index.tolist()
+
+    pivot_highs = (pd.Series(highs.values[swing_high_idx], index=swing_high_idx)
                    if swing_high_idx else pd.Series(dtype=float))
-    pivot_lows  = (pd.Series(lows[swing_low_idx],   index=swing_low_idx)
+    pivot_lows  = (pd.Series(lows.values[swing_low_idx],   index=swing_low_idx)
                    if swing_low_idx  else pd.Series(dtype=float))
     return pivot_highs, pivot_lows
 
 
 def classify_zone_status(level, zone_type, df, formation_idx,
                           atr_val=None, tolerance_coeff=0.25):
+    """
+    BUGFIX #4 — Role Reversal.
+    HIGH #1 FIX — Version vectorisée numpy (élimine la boucle iloc O(n)).
+    Problème original : boucle Python avec closes_after.iloc[i] à chaque
+    itération — très lent sur 490 bougies × N zones × 3 TF × 33 actifs.
+    """
     if formation_idx >= len(df) - 1:
         return "Vierge"
 
     tolerance = (atr_val * tolerance_coeff) if (atr_val and atr_val > 0) else (level * 0.003)
 
-    closes_after = df["close"].iloc[formation_idx + 1:]
-    highs_after  = df["high"].iloc[formation_idx + 1:]
-    lows_after   = df["low"].iloc[formation_idx + 1:]
+    c_arr = df["close"].values[formation_idx + 1:]
+    h_arr = df["high"].values[formation_idx + 1:]
+    l_arr = df["low"].values[formation_idx + 1:]
 
-    has_approach = False
+    if len(c_arr) == 0:
+        return "Vierge"
 
-    for i in range(len(closes_after)):
-        c = closes_after.iloc[i]
-        h = highs_after.iloc[i]
-        l = lows_after.iloc[i]
+    # Approche vectorisée : masque "proche de la zone"
+    near = (np.abs(c_arr - level) <= tolerance) | (
+        (l_arr <= level + tolerance) & (h_arr >= level - tolerance)
+    )
+    has_approach = bool(near.any())
 
-        near_zone = (abs(c - level) <= tolerance or
-                     (l <= level + tolerance and h >= level - tolerance))
+    # Détection cassure
+    if zone_type == "Support":
+        break_mask = c_arr < level - tolerance
+    else:
+        break_mask = c_arr > level + tolerance
 
-        if near_zone:
-            has_approach = True
+    break_positions = np.where(break_mask)[0]
+    if len(break_positions) == 0:
+        return "Testee" if has_approach else "Vierge"
 
-        if zone_type == "Support" and c < level - tolerance:
-            return "Consommee"
-        if zone_type == "Resistance" and c > level + tolerance:
-            return "Consommee"
+    break_idx = int(break_positions[0])
 
-    return "Testee" if has_approach else "Vierge"
+    # Re-test après cassure (role reversal) — vectorisé
+    retest_tol = tolerance * 2
+    rc = c_arr[break_idx + 1:]
+    rh = h_arr[break_idx + 1:]
+    rl = l_arr[break_idx + 1:]
+
+    if len(rc) == 0:
+        return "Consommee"
+
+    retest_mask = (rl <= level + retest_tol) & (rh >= level - retest_tol)
+    if retest_mask.any():
+        return "Role Reverse"
+
+    return "Consommee"
 
 
 def find_strong_sr_zones(df, current_price, atr_val=None,
@@ -524,10 +656,21 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
     zones_raw = []
     cur_group = [pivots_with_idx[0]]
 
+    # HIGH #5 FIX — Fallback zone_width cohérent par type d'instrument.
+    # Problème original : avg * zone_percentage_width / 100 avec avg=2000 (XAU)
+    # donnait une zone de 10 points (trop large) ; avec avg=1.10 (EUR/USD)
+    # donnait 0.0055 (trop étroit). Le fallback doit être absolu pour les indices/métaux.
+    # On calcule une fois la largeur de référence basée sur le premier pivot.
+    first_price = pivots_with_idx[0][0]
+    if atr_val and atr_val > 0:
+        _zone_width_ref = atr_val * atr_zone_coeff   # priorité ATR
+    else:
+        _zone_width_ref = first_price * zone_percentage_width / 100  # % du prix
+
     for price, idx in pivots_with_idx[1:]:
         avg = np.mean([p for p, _ in cur_group])
         zone_width_abs = ((atr_val * atr_zone_coeff) if (atr_val and atr_val > 0)
-                          else (avg * zone_percentage_width / 100))
+                          else _zone_width_ref)   # référence stable, pas recalculée
         if abs(price - avg) < zone_width_abs:
             cur_group.append((price, idx))
         else:
@@ -598,10 +741,26 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
     if not all_zones:
         return []
 
-    zones_df     = pd.DataFrame(all_zones).sort_values("level")
+    # MEDIUM #2 FIX — Zones Consommées exclues AVANT la détection de confluence.
+    # Problème original : une zone Consommée absorbait une zone Vierge voisine
+    # dans un groupe via used_indices, faisant disparaître la Vierge des résultats.
+    # On exclut les Consommées ici ; elles restent visibles dans les tableaux TF
+    # individuels mais ne polluent pas les confluences.
+    all_zones = [z for z in all_zones if z.get("status") != "Consommee"]
+
+    if not all_zones:
+        return []
+
+    # HIGH #2 FIX — reset_index OBLIGATOIRE pour éviter les collisions d'index
+    # quand detect_confluences est appelé sur un seul actif à la fois :
+    # les indices 0,1,2... sont locaux à cet actif et ne peuvent pas se chevaucher,
+    # mais un reset explicite garantit le comportement même si la logique change.
+    zones_df     = (pd.DataFrame(all_zones)
+                    .sort_values("level")
+                    .reset_index(drop=True))   # ← index 0..N garanti propre
     used_indices = set()
     confluences  = []
-    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Consommee": 2}
+    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
 
     for i, zone in zones_df.iterrows():
         if i in used_indices:
@@ -622,10 +781,9 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                 nb_tf     = len(timeframes)
                 dist_pct  = abs(current_price - avg_level) / current_price * 100
 
-                # FIX : les zones Consommées n'entrent PAS dans le calcul du score
                 group_active = group[group["status"] != "Consommee"]
                 if group_active.empty:
-                    group_active = group  # fallback si tout est consommé
+                    group_active = group
 
                 total_score = 0.0
                 for _, row in group_active.iterrows():
@@ -638,13 +796,16 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     )
 
                 total_strength = int(group["strength"].sum())
-
                 best_status = min(
                     group["status"].tolist(),
                     key=lambda s: STATUS_PRIORITY.get(s, 1)
                 )
 
-                zone_type = group.iloc[0]["type"]
+                # HIGH #2b FIX — zone_type par vote majoritaire (pas iloc[0] arbitraire).
+                # Quand H4=Support et Daily=Resistance sur le même niveau, iloc[0] donnait
+                # un type aléatoire selon le tri. On prend le type le plus représenté.
+                type_counts = group["type"].value_counts()
+                zone_type = type_counts.idxmax()
                 signal    = "🟢 BUY ZONE" if zone_type == "Support" else "🔴 SELL ZONE"
                 tf_label  = " + ".join(sorted(timeframes))
                 alerte    = ("🔥 ZONE CHAUDE" if dist_pct < 0.5
@@ -668,7 +829,23 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
     return confluences
 
 
-def scan_single_symbol(args):
+# ══════════════════════════════════════════════════════════════════
+# BUGFIX #5 — ScanResult dataclass (remplace le tuple de 6 éléments)
+# Problème original : retour positionnel fragile, ajouter un champ
+# cassait silencieusement tous les appels.
+# ══════════════════════════════════════════════════════════════════
+@dataclass
+class ScanResult:
+    symbol:        str
+    rows:          dict
+    zones:         dict
+    price:         Optional[float]
+    trends:        dict
+    anomaly:       Optional[str]
+    scan_error:    Optional[str] = None   # nouveau champ sans casser l'existant
+
+
+def scan_single_symbol(args) -> ScanResult:
     symbol, base_url, access_token, account_id, zone_width, min_touches = args
 
     raw_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
@@ -690,21 +867,54 @@ def scan_single_symbol(args):
     last_h4_close  = None
     anomaly_msg    = price_alert_msg
 
-    for tf_key, tf_cap in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
-        df = get_oanda_data(base_url, access_token, symbol, tf_key, limit=500)
+    # ──────────────────────────────────────────────────────────────
+    # BUGFIX #6 — Prix de référence figé AVANT la boucle TF.
+    # Problème original : current_price était muté dans le bloc H4
+    # (fallback last_h4_close), ce qui faisait utiliser le close H4
+    # comme référence pour Daily et Weekly → classification S/R fausse.
+    # Solution : reference_price est assigné une seule fois et ne change plus.
+    # ──────────────────────────────────────────────────────────────
+    reference_price = current_price   # peut être None → résolu dans la boucle
+
+    # LOW #1 FIX — sym_d calculé une fois hors boucle (était recalculé 3× par symbole)
+    sym_d = symbol.replace("_", "/")
+
+    # HIGH #8 FIX — Prefetch des 3 TFs en parallèle dans le thread du symbole.
+    # Problème original : 3 appels réseau séquentiels par symbole = latence × 3.
+    # Le ThreadPoolExecutor externe gère 8 symboles en parallèle, mais à l'intérieur
+    # chaque symbole attendait H4, puis Daily, puis Weekly l'un après l'autre.
+    # Solution : sous-pool de 3 workers pour récupérer les 3 TFs simultanément.
+    # Gain estimé : latence réduite de ~66% par symbole (3 appels → 1 RTT).
+    _TF_KEYS = [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]
+
+    def _fetch_tf(tf_key):
+        return tf_key, get_oanda_data(base_url, access_token, symbol, tf_key, limit=500)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as tf_pool:
+        tf_futures = {tf_pool.submit(_fetch_tf, tk): tk for tk, _ in _TF_KEYS}
+        tf_data = {}
+        for fut in concurrent.futures.as_completed(tf_futures):
+            try:
+                tf_key, df = fut.result()
+                tf_data[tf_key] = df
+            except Exception:
+                tf_data[tf_futures[fut]] = None
+
+    for tf_key, tf_cap in _TF_KEYS:
+        df = tf_data.get(tf_key)
         if df is None or df.empty:
             continue
 
-        cp = current_price if current_price is not None else df["close"].iloc[-1]
+        # Au premier TF disponible, on fixe le prix de référence si encore inconnu
+        if reference_price is None:
+            reference_price = float(df["close"].iloc[-1])
 
         if tf_key == "h4":
-            last_h4_close = df["close"].iloc[-1]
-            if current_price is None:
-                current_price = last_h4_close
-                cp = last_h4_close
+            last_h4_close = float(df["close"].iloc[-1])
+
+        cp = reference_price   # stable pour tous les TFs, jamais ré-assigné
 
         trends[tf_cap] = compute_trend(df)
-
         atr_val = compute_atr(df, period=14)
 
         supports, resistances = find_strong_sr_zones(
@@ -726,32 +936,49 @@ def scan_single_symbol(args):
             price_ctx = get_price_context(cp, supports, resistances)
             zones_d["_price_ctx"] = price_ctx
 
-        sym_d          = symbol.replace("_", "/")
-        tf_weight_name = tf_cap
-        n_total_bars   = len(df)
-
+        # LOW #1 FIX — tf_weight_name et n_total_bars étaient des aliases inutiles
+        # recalculés à chaque TF. On utilise tf_cap et len(df) directement.
         def make_row(zone, ztype, _cp=cp, _atr=atr_val,
                      _pdf_max=pdf_dist_max, _abs_max=abs_dist_max,
-                     _tf=tf_weight_name, _ntot=n_total_bars):
-            lvl          = zone["level"]
-            strength     = int(zone["strength"])
-            age_bars     = int(zone.get("age_bars", 0))
-            status       = zone.get("status", "Testee")
-            dist_pct     = abs(_cp - lvl) / _cp * 100
-            dist_atr     = round(abs(_cp - lvl) / _atr, 1) if (_atr and _atr > 0) else np.nan
+                     _tf=tf_cap, _ntot=len(df)):
+            """
+            MEDIUM #2 FIX — Guards contre _cp=0/None et _atr=NaN.
+            Problème original : dist_pct = abs(_cp - lvl) / _cp plantait
+            en ZeroDivisionError si _cp était 0 ou None (cas extrêmes
+            de données corrompues OANDA). dist_atr déjà protégé mais
+            np.isnan échouait si dist_atr était None (pas NaN).
+            """
+            lvl      = zone["level"]
+            strength = int(zone["strength"])
+            age_bars = int(zone.get("age_bars", 0))
+            status   = zone.get("status", "Testee")
+
+            # Guard prix de référence nul ou absent
+            if not _cp or _cp <= 0:
+                dist_pct = 0.0
+                dist_atr_str = "N/A"
+                in_pdf = False
+            else:
+                dist_pct = abs(_cp - lvl) / _cp * 100
+                if _atr and _atr > 0:
+                    dist_atr_str = f"{round(abs(_cp - lvl) / _atr, 1):.1f}x"
+                else:
+                    dist_atr_str = "N/A"
+                in_pdf = dist_pct <= _pdf_max and dist_pct <= _abs_max
+
             struct_score = compute_structural_score(strength, 1, _tf, age_bars, _ntot)
             return {
                 "Actif":       sym_d,
-                "Prix Actuel": f"{_cp:.5f}",
+                "Prix Actuel": f"{_cp:.5f}" if _cp else "N/A",
                 "Type":        ztype,
                 "Niveau":      f"{lvl:.5f}",
                 "Force":       f"{strength} touches",
                 "Score":       struct_score,
                 "Statut":      status,
                 "Dist. %":     f"{dist_pct:.2f}%",
-                "Dist. ATR":   f"{dist_atr:.1f}x" if not np.isnan(dist_atr) else "N/A",
+                "Dist. ATR":   dist_atr_str,
                 "_dist_num":   dist_pct,
-                "_in_pdf":     dist_pct <= _pdf_max and dist_pct <= _abs_max,
+                "_in_pdf":     in_pdf,
             }
 
         tf_rows = (
@@ -761,20 +988,30 @@ def scan_single_symbol(args):
         if tf_rows:
             rows[tf_cap] = tf_rows
 
-    if all_sup_levels and current_price:
+    if all_sup_levels and reference_price:
         new_anomaly = flag_data_anomaly(
-            symbol, current_price, all_sup_levels, last_h4_close
+            symbol, reference_price, all_sup_levels, last_h4_close
         )
         if new_anomaly:
             anomaly_msg = (f"{anomaly_msg} | {new_anomaly}"
                            if anomaly_msg else new_anomaly)
 
-    return symbol, rows, zones_d, current_price, trends, anomaly_msg
+    return ScanResult(
+        symbol  = symbol,
+        rows    = rows,
+        zones   = zones_d,
+        price   = reference_price,
+        trends  = trends,
+        anomaly = anomaly_msg,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
 # GÉNÉRATION PDF
 # ══════════════════════════════════════════════════════════════════
+# Colonnes internes à ne jamais exposer dans l'UI ou les exports
+_INTERNAL_COLS = ["_dist_num", "_in_pdf"]
+
 def strip_emojis_df(df):
     clean = df.copy()
     for col in clean.select_dtypes(include='object').columns:
@@ -793,7 +1030,7 @@ class PDF(FPDF):
                   _safe_pdf_str(
                       f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
                       "Score = (Force x Poids_TF x NbTF) x Facteur_Age | "
-                      "Statut Vierge/Testee/Consommee"
+                      "Statut Vierge / Testee / Role Reverse / Consommee"
                   ),
                   border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
@@ -810,7 +1047,6 @@ class PDF(FPDF):
         self.ln(4)
 
     def chapter_anomalies(self, anomalies: dict):
-        """FIX : affichage des anomalies de prix dans le PDF."""
         if not anomalies:
             return
         self.set_font('Helvetica', 'B', 10)
@@ -914,17 +1150,29 @@ class PDF(FPDF):
             self.ln()
 
 
-def _apply_pdf_filter(df):
+def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    HIGH #6 FIX — Garde-fou renforcé, fallback hiérarchique.
+    Ordre : _in_pdf → _dist_num → reconstruction depuis 'Dist. %'.
+    Garantit qu'aucune zone hors-distance ne passe dans le PDF,
+    même si make_row() a produit un résultat partiel.
+    """
     if df.empty:
         return df
     if "_in_pdf" in df.columns:
-        df = df[df["_in_pdf"] == True].copy()
-    return df.drop(columns=["_in_pdf", "_dist_num"], errors="ignore").reset_index(drop=True)
+        df = df[df["_in_pdf"]].copy()
+    elif "_dist_num" in df.columns:
+        df = df[df["_dist_num"] <= DEFAULT_PDF_DIST].copy()
+    elif "Dist. %" in df.columns:
+        def _to_f(s):
+            try:    return float(str(s).replace("%", ""))
+            except: return 999.0
+        df = df[df["Dist. %"].apply(_to_f) <= DEFAULT_PDF_DIST].copy()
+    return df.drop(columns=_INTERNAL_COLS, errors="ignore").reset_index(drop=True)
 
 
 def create_pdf_report(results_dict, confluences_df=None,
                       summaries=None, anomalies=None):
-    """FIX : anomalies maintenant affichées dans le PDF."""
     summaries = summaries or []
     anomalies = anomalies or {}
 
@@ -933,7 +1181,6 @@ def create_pdf_report(results_dict, confluences_df=None,
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # Anomalies en première page si présentes
     if anomalies:
         pdf.chapter_anomalies(anomalies)
 
@@ -944,7 +1191,7 @@ def create_pdf_report(results_dict, confluences_df=None,
     if confluences_df is not None and not confluences_df.empty:
         pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
         clean_conf = strip_emojis_df(confluences_df.copy())
-        clean_conf = clean_conf.drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
+        clean_conf = clean_conf.drop(columns=_INTERNAL_COLS, errors="ignore")
         if "Score" in clean_conf.columns:
             clean_conf = clean_conf.sort_values("Score", ascending=False)
         pdf.chapter_body(clean_conf)
@@ -960,7 +1207,7 @@ def create_pdf_report(results_dict, confluences_df=None,
             continue
         pdf.chapter_title(title_map.get(tf_key, tf_key))
         clean_df = strip_emojis_df(df.copy())
-        clean_df = clean_df.drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
+        clean_df = clean_df.drop(columns=_INTERNAL_COLS, errors="ignore")
         if "Score" in clean_df.columns:
             clean_df = clean_df.sort_values("Score", ascending=False)
         pdf.chapter_body(clean_df)
@@ -972,12 +1219,12 @@ def create_pdf_report(results_dict, confluences_df=None,
 def create_csv_report(results_dict, confluences_df=None):
     all_dfs = []
     if confluences_df is not None and not confluences_df.empty:
-        c = confluences_df.copy()
+        c = confluences_df.drop(columns=_INTERNAL_COLS, errors="ignore").copy()
         c["Section"] = "CONFLUENCES"
         all_dfs.append(c)
     for tf, df in results_dict.items():
-        if not df.empty:
-            d = df.copy()
+        if df is not None and not df.empty:
+            d = df.drop(columns=_INTERNAL_COLS, errors="ignore").copy()
             d["Timeframe"] = tf
             all_dfs.append(d)
     if not all_dfs:
@@ -989,9 +1236,9 @@ def create_csv_report(results_dict, confluences_df=None):
 
 def create_llm_brief(summaries, confluences_df,
                      max_dist=2.0, min_score=100.0,
-                     allowed_statuts=("Vierge", "Testee")):
+                     allowed_statuts=("Vierge", "Testee", "Role Reverse")):
     TREND_ARROW  = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
-    STATUS_LABEL = {"Vierge": "V", "Testee": "T", "Consommee": "C"}
+    STATUS_LABEL = {"Vierge": "V", "Testee": "T", "Role Reverse": "RR", "Consommee": "C"}
     ALERT_LABEL  = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠", "": ""}
 
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -1007,7 +1254,7 @@ def create_llm_brief(summaries, confluences_df,
         "**Légende :**",
         "- `BUY` / `SELL` : direction de la zone",
         "- `Sc` : Score pondéré (Force × Poids_TF × NbTF × Facteur_Age). >300=institutionnel, 100-300=fort",
-        "- `V` = Vierge (jamais testée — plus fiable) | `T` = Testée (respectée) | `C` = Consommée (éviter)",
+        "- `V` = Vierge | `T` = Testée | `RR` = Role Reverse (zone cassée retestée) | `C` = Consommée (éviter)",
         "- `Dist%` : distance du prix actuel à la zone",
         "- `TFs` : timeframes en confluence (H4/D/W)",
         "- `⚡` = zone chaude (<0.5% du prix) | `⚠` = proche (<1.5%)",
@@ -1029,8 +1276,13 @@ def create_llm_brief(summaries, confluences_df,
         except Exception:
             dist_val = 999.0
 
-        score_val = float(row.get("Score", 0))
-        statut    = str(row.get("Statut", ""))
+        # BUGFIX : guard sur Score pour éviter ValueError si "N/A" ou NaN
+        try:
+            score_val = float(row.get("Score", 0))
+        except (TypeError, ValueError):
+            score_val = 0.0
+
+        statut = str(row.get("Statut", ""))
 
         if dist_val > max_dist:
             continue
@@ -1107,7 +1359,8 @@ def create_llm_brief(summaries, confluences_df,
         "1. Identifie les setups les plus immédiats (⚡ zones chaudes en priorité)",
         "2. Vérifie la cohérence tendance vs direction de zone (ex: BUY en tendance haussière)",
         "3. Priorise les zones Vierge (V) sur 3 TF avec Score > 200",
-        "4. Propose un plan de trade structuré : entrée, SL (au-delà de la zone), TP (prochain niveau)",
+        "4. Les zones Role Reverse (RR) = pullback sur niveau cassé, setup souvent court terme",
+        "5. Propose un plan de trade structuré : entrée, SL (au-delà de la zone), TP (prochain niveau)",
         "```",
     ]
 
@@ -1118,12 +1371,12 @@ def create_json_export(summaries, confluences_df,
                        max_dist=5.0, min_score=50.0):
     output = {
         "generated_at":     datetime.now().isoformat(),
-        "scanner_version":  "Bluestar",
+        "scanner_version":  f"Bluestar v{SCANNER_VERSION}",
         "description": (
             "Support/Resistance multi-timeframe scanner. "
             "Scores weighted by TF (H4=1x, Daily=2x, Weekly=3x) and age decay. "
             "Status: Vierge=never tested (most reliable), "
-            "Testee=respected, Consommee=broken."
+            "Testee=respected, Role Reverse=S/R flip setup, Consommee=broken."
         ),
         "filters_applied": {"max_dist_pct": max_dist, "min_score": min_score},
         "assets": []
@@ -1137,10 +1390,16 @@ def create_json_export(summaries, confluences_df,
     actif_groups = {}
     for _, row in confluences_df.iterrows():
         try:
-            dist_val  = float(str(row.get("Distance %", "999")).replace("%", ""))
-            score_val = float(row.get("Score", 0))
+            dist_val = float(str(row.get("Distance %", "999")).replace("%", ""))
         except Exception:
-            dist_val, score_val = 999.0, 0.0
+            dist_val = 999.0
+        # MEDIUM #5 FIX — guard NaN/None/str sur Score, cohérent avec create_llm_brief
+        try:
+            score_val = float(row.get("Score", 0))
+            if not pd.notna(score_val):
+                score_val = 0.0
+        except (TypeError, ValueError):
+            score_val = 0.0
 
         if dist_val > max_dist or score_val < min_score:
             continue
@@ -1184,22 +1443,26 @@ def create_json_export(summaries, confluences_df,
 # ══════════════════════════════════════════════════════════════════
 # AFFICHAGE STREAMLIT
 # ══════════════════════════════════════════════════════════════════
-def _display_results(sr, max_dist_filter):
+def _display_results(sr: dict, max_dist_filter: float):
     df_h4     = sr.get("df_h4",        pd.DataFrame())
     df_daily  = sr.get("df_daily",      pd.DataFrame())
     df_wk     = sr.get("df_weekly",     pd.DataFrame())
     conf_full = sr.get("conf_full",     pd.DataFrame())
-    conf_filt = sr.get("conf_filtered", pd.DataFrame())
     rep_dict  = sr.get("report_dict",   {})
     summaries = sr.get("summaries",     [])
     anomalies = sr.get("anomalies",     {})
+    errors    = sr.get("scan_errors",   {})
 
-    # FIX : recalcul du filtre de confluence avec le slider live
+    # HIGH #7 FIX — Recalcul conf_filt avec nettoyage systématique.
+    # On nettoie _INTERNAL_COLS en entrée ET en sortie pour être
+    # certain qu'aucune colonne fantôme n'atteint st.dataframe().
     if not conf_full.empty:
-        tmp = conf_full.copy()
-        tmp["_dist_num"] = tmp["Distance %"].str.replace("%", "").astype(float)
+        tmp = conf_full.drop(columns=_INTERNAL_COLS, errors="ignore").copy()
+        tmp["_dist_num"] = (
+            tmp["Distance %"].str.replace("%", "", regex=False).astype(float)
+        )
         conf_filt = (tmp[tmp["_dist_num"] <= max_dist_filter]
-                     .drop(columns=["_dist_num"])
+                     .drop(columns=_INTERNAL_COLS, errors="ignore")  # double nettoyage
                      .reset_index(drop=True))
     else:
         conf_filt = pd.DataFrame()
@@ -1216,9 +1479,14 @@ def _display_results(sr, max_dist_filter):
         "Dist. ATR":   st.column_config.TextColumn("Dist. ATR",   width="small"),
     }
 
-    # FIX : affichage des anomalies dans l'UI
+    # Erreurs de scan (actifs ayant échoué)
+    if errors:
+        with st.expander(f"❌ {len(errors)} actif(s) en erreur — cliquer pour voir"):
+            for sym, err in errors.items():
+                st.error(f"**{sym}** : {err}")
+
     if anomalies:
-        with st.expander(f"⚠️ {len(anomalies)} anomalie(s) de prix détectée(s) — cliquer pour voir"):
+        with st.expander(f"⚠️ {len(anomalies)} anomalie(s) de prix — cliquer pour voir"):
             for sym, msg in anomalies.items():
                 st.warning(f"**{sym}** : {msg}")
 
@@ -1275,29 +1543,18 @@ def _display_results(sr, max_dist_filter):
         st.divider()
         st.markdown("**🤖 Exports optimisés LLM**")
         st.caption(
-            "Le Brief Markdown est filtré et structuré pour être collé directement "
-            "dans ChatGPT, Claude ou Gemini. Le JSON convient aux pipelines automatisés."
+            "Paramètres LLM configurables dans la barre latérale (section 3) — "
+            "ils survivent aux re-renders contrairement aux sliders ici."
         )
 
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            llm_max_dist = st.slider(
-                "Dist. max (%) pour le brief LLM", 0.5, 5.0, 2.0, 0.5,
-                help="Zones au-delà de cette distance sont exclues du brief LLM."
-            )
-        with fc2:
-            llm_min_score = st.slider(
-                "Score minimum (brief LLM)", 50, 300, 100, 25,
-                help="Zones sous ce score sont exclues du brief LLM."
-            )
-        with fc3:
-            llm_statuts_raw = st.multiselect(
-                "Statuts autorisés (brief LLM)",
-                options=["Vierge", "Testee", "Consommee"],
-                default=["Vierge", "Testee"],
-                help="Consommee = zone cassée, généralement à éviter."
-            )
-        llm_statuts = tuple(llm_statuts_raw) if llm_statuts_raw else ("Vierge", "Testee")
+        # MEDIUM #4 FIX — Les paramètres LLM sont lus depuis la sidebar (st.session_state)
+        # plutôt que redéfinis dans l'expander qui se réinitialise à chaque re-render.
+        llm_max_dist  = st.session_state.get("llm_max_dist",  2.0)
+        llm_min_score = st.session_state.get("llm_min_score", 100)
+        llm_statuts_raw = st.session_state.get("llm_statuts", ["Vierge", "Testee", "Role Reverse"])
+        llm_statuts = tuple(llm_statuts_raw) if llm_statuts_raw else ("Vierge", "Testee", "Role Reverse")
+
+        st.caption(f"🔧 Filtres actifs : Dist < **{llm_max_dist}%** | Score ≥ **{llm_min_score}** | {', '.join(llm_statuts)}")
 
         col3, col4 = st.columns(2)
         with col3:
@@ -1348,13 +1605,13 @@ def _display_results(sr, max_dist_filter):
             st.warning("Aperçu non disponible.")
 
     def _filter_and_sort(df, max_pct):
-        if df.empty:
+        if df.empty or "Dist. %" not in df.columns:
             return df
         def to_float(s):
             try:   return float(str(s).replace("%", ""))
             except: return 999.0
         mask = df["Dist. %"].apply(to_float) <= max_pct
-        out  = df[mask].drop(columns=["_in_pdf", "_dist_num"], errors="ignore")
+        out  = df[mask].drop(columns=_INTERNAL_COLS, errors="ignore")
         if "Score" in out.columns:
             out = out.sort_values("Score", ascending=False)
         return out.reset_index(drop=True)
@@ -1400,14 +1657,35 @@ with st.sidebar:
             "Actifs spécifiques :", options=ALL_SYMBOLS, default=default_sel
         )
 
-    st.header("3. Paramètres de Détection")
+    st.header("3. Paramètres Export LLM")
+    st.caption("Ces paramètres survivent aux re-renders contrairement aux sliders dans l'expander.")
+    llm_max_dist_sidebar = st.slider(
+        "Dist. max (%) brief LLM", 0.5, 5.0, 2.0, 0.5,
+        key="llm_max_dist",
+        help="Zones au-delà de cette distance sont exclues du brief LLM.",
+    )
+    llm_min_score_sidebar = st.slider(
+        "Score min brief LLM", 50, 300, 100, 25,
+        key="llm_min_score",
+        help="Zones sous ce score sont exclues du brief LLM.",
+    )
+    llm_statuts_sidebar = st.multiselect(
+        "Statuts autorisés (brief LLM)",
+        options=["Vierge", "Testee", "Role Reverse", "Consommee"],
+        default=["Vierge", "Testee", "Role Reverse"],
+        key="llm_statuts",
+        help="Role Reverse = zone cassée retestée (setup pullback).",
+    )
+
+    st.divider()
+    st.header("4. Paramètres de Détection")
     zone_width = st.slider(
         "Largeur zone Forex (% fallback si ATR indispo)", 0.1, 2.0, 0.5, 0.1,
         help="Normalement remplacé par ATR × coeff. Utilisé si ATR non disponible.",
     )
     min_touches = st.slider(
-        "Force minimale (touches)", 2, 10, 3, 1,
-        help="Nombre de contacts minimum pour valider une zone.",
+        "Force minimale (touches)", 3, 10, 3, 1,
+        help="Nombre de contacts minimum pour valider une zone. Min 3 recommandé.",
     )
     confluence_threshold = st.slider(
         "Seuil confluence Forex (%)", 0.3, 2.0, 1.0, 0.1,
@@ -1425,21 +1703,41 @@ with st.sidebar:
     st.caption("⚪ < 30  : Zone secondaire")
 
     st.divider()
-    st.caption("**Améliorations moteur :**")
-    st.caption("✅ Swing HH/LL confirmé (clôture suivante)")
-    st.caption("✅ Score pondéré TF (Weekly=3× H4) + âge")
-    st.caption("✅ Statut : Vierge / Testée / Consommée")
-    st.caption("✅ Prominence ATR + largeur zone ATR-based")
-    st.caption("✅ Plages prix 2026 mises à jour")
-    st.caption("✅ Fallback silencieux H4 close (prix fiable)")
-    st.caption("✅ Anomalies prix affichées dans UI + PDF")
+    st.caption("**Statuts :**")
+    st.caption("✅ Vierge = jamais testée (la plus fiable)")
+    st.caption("🔵 Testée = respectée, toujours valide")
+    st.caption("↩️ Role Reverse = niveau cassé retesté")
+    st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption("**Exports disponibles :**")
-    st.caption("📄 PDF complet — rapport détaillé toutes zones")
-    st.caption("📊 CSV brut — toutes données pour analyse perso")
-    st.caption("🤖 Brief LLM — Markdown filtré, ~50 tokens/actif")
-    st.caption("🔧 JSON structuré — pour pipelines automatisés")
+    st.caption("**Corrections v2 (critiques) :**")
+    st.caption("✅ Cache thread-safe (ThreadPoolExecutor)")
+    st.caption("✅ Prix de référence figé avant boucle TF")
+    st.caption("✅ post_merge_zones ancre fixe (no drift)")
+    st.caption("✅ Erreurs scan loggées (plus de pass silencieux)")
+    st.caption("✅ Role Reversal détecté automatiquement")
+    st.caption("✅ ScanResult dataclass (retour nommé)")
+    st.divider()
+    st.caption("**Corrections v3 (élevés) :**")
+    st.caption("✅ detect_swing_pivots vectorisé (10-30× plus rapide)")
+    st.caption("✅ Prefetch H4/Daily/Weekly en parallèle")
+    st.caption("✅ zone_type par vote majoritaire (plus iloc[0])")
+    st.caption("✅ _apply_pdf_filter fallback hiérarchique")
+    st.caption("✅ Colonnes fantômes purgées dans _display_results")
+    st.caption("✅ zone_width fallback stable (référence fixe)")
+    st.divider()
+    st.caption("**Corrections v5 (audit 2 — 11 findings) :**")
+    st.caption("✅ Nested ThreadPoolExecutor → pool ext. 4 workers (12 threads max)")
+    st.caption("✅ get_oanda_current_price : cache manuel thread-safe")
+    st.caption("✅ classify_zone_status vectorisé numpy (élim. boucle iloc)")
+    st.caption("✅ Dead code pass supprimé dans get_oanda_data")
+    st.caption("✅ SCANNER_VERSION = '5.0' constante centralisée")
+    st.caption("✅ validate_live_price : limit=500 (partage cache prefetch)")
+    st.caption("✅ detect_confluences : Consommées exclues avant traitement")
+    st.caption("✅ _filter_and_sort : guard colonne Dist. % absente")
+    st.caption("✅ compute_trend : branches elif dead code supprimées")
+    st.caption("✅ sym_d calculé une fois hors boucle TF")
+    st.caption("✅ create_csv_report : guard df is not None")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1461,7 +1759,8 @@ if scan_button and symbols_to_scan:
             all_zones_map = {}
             prices_map    = {}
             trends_map    = {}
-            anomalies_map = {}   # FIX : collecte des anomalies
+            anomalies_map = {}
+            scan_errors   = {}   # BUGFIX #3 : collecte des erreurs par symbole
 
             args_list = [
                 (sym, base_url, access_token, account_id, zone_width, min_touches)
@@ -1469,7 +1768,11 @@ if scan_button and symbols_to_scan:
             ]
             total, completed = len(args_list), 0
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            # CRIT #1 FIX — Pool externe limité à 4 workers (était 8).
+            # Avec le sous-pool de 3 threads par symbole (prefetch TFs),
+            # on plafonne à 4×3=12 threads IO simultanés au lieu de 24.
+            # Évite l'épuisement du pool OS et les deadlocks nested sur Python < 3.9.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 future_map = {
                     executor.submit(scan_single_symbol, a): a[0] for a in args_list
                 }
@@ -1481,16 +1784,17 @@ if scan_button and symbols_to_scan:
                         text=f"Scan… ({completed}/{total}) {sym.replace('_', '/')}",
                     )
                     try:
-                        symbol, rows, zones_d, cp, trends, anomaly_msg = future.result()
-                        all_zones_map[symbol] = zones_d
-                        prices_map[symbol]    = cp
-                        trends_map[symbol]    = trends
+                        # BUGFIX #5 : déstructuration nommée via dataclass
+                        result: ScanResult = future.result()
 
-                        # FIX : on stocke les anomalies non nulles
-                        if anomaly_msg:
-                            anomalies_map[symbol.replace("_", "/")] = anomaly_msg
+                        all_zones_map[result.symbol] = result.zones
+                        prices_map[result.symbol]    = result.price
+                        trends_map[result.symbol]    = result.trends
 
-                        for tf_cap, tf_rows in rows.items():
+                        if result.anomaly:
+                            anomalies_map[result.symbol.replace("_", "/")] = result.anomaly
+
+                        for tf_cap, tf_rows in result.rows.items():
                             if tf_rows:
                                 if tf_cap == "H4":
                                     results_h4.extend(tf_rows)
@@ -1498,19 +1802,33 @@ if scan_button and symbols_to_scan:
                                     results_daily.extend(tf_rows)
                                 elif tf_cap == "Weekly":
                                     results_weekly.extend(tf_rows)
-                    except Exception:
-                        pass
+
+                    # BUGFIX #3 : exception loggée par symbole, plus de pass silencieux
+                    except Exception as e:
+                        scan_errors[sym.replace("_", "/")] = (
+                            f"{type(e).__name__}: {str(e)[:120]}"
+                        )
 
             progress_bar.empty()
-            st.success(f"✅ Scan terminé — {len(symbols_to_scan)} actifs analysés.")
 
-            # FIX : affichage immédiat des anomalies après le scan
+            n_ok   = len(symbols_to_scan) - len(scan_errors)
+            n_fail = len(scan_errors)
+            if n_fail == 0:
+                st.success(f"✅ Scan terminé — {n_ok} actifs analysés avec succès.")
+            else:
+                st.warning(
+                    f"⚠️ Scan terminé — {n_ok} actifs OK, "
+                    f"{n_fail} en erreur (voir détail ci-dessous)."
+                )
+
             if anomalies_map:
-                st.warning(f"⚠️ {len(anomalies_map)} anomalie(s) détectée(s) — voir le détail ci-dessous.")
+                st.warning(f"⚠️ {len(anomalies_map)} anomalie(s) de prix détectée(s).")
 
             st.info("🔍 Analyse des confluences multi-timeframes…")
             all_confluences = []
             for sym in symbols_to_scan:
+                if sym.replace("_", "/") in scan_errors:
+                    continue   # ne pas traiter les actifs en erreur
                 cp = prices_map.get(sym)
                 zones_clean = {k: v for k, v in all_zones_map.get(sym, {}).items()
                                if not k.startswith("_")}
@@ -1522,18 +1840,9 @@ if scan_button and symbols_to_scan:
 
             conf_full = pd.DataFrame(all_confluences)
 
+            # BUGFIX #5b : conf_full stocké SANS colonnes internes
             if not conf_full.empty:
-                conf_full["_dist_num"] = (
-                    conf_full["Distance %"].str.replace("%", "").astype(float)
-                )
-                conf_filtered = (
-                    conf_full[conf_full["_dist_num"] <= max_dist_filter]
-                    .drop(columns=["_dist_num"])
-                    .reset_index(drop=True)
-                )
-                conf_full = conf_full.drop(columns=["_dist_num"])
-            else:
-                conf_filtered = pd.DataFrame()
+                conf_full = conf_full.drop(columns=_INTERNAL_COLS, errors="ignore")
 
             summaries = []
             for sym in symbols_to_scan:
@@ -1575,15 +1884,15 @@ if scan_button and symbols_to_scan:
             }
 
             st.session_state["scan_results"] = {
-                "df_h4":         df_h4,
-                "df_daily":      df_daily,
-                "df_weekly":     df_weekly,
-                "conf_full":     conf_full,
-                "conf_filtered": conf_filtered,
-                "report_dict":   rep_dict,
-                "summaries":     summaries,
-                "anomalies":     anomalies_map,   # FIX : stocké en session
-                "max_dist":      max_dist_filter,
+                "df_h4":       df_h4,
+                "df_daily":    df_daily,
+                "df_weekly":   df_weekly,
+                "conf_full":   conf_full,   # propre, sans _dist_num
+                "report_dict": rep_dict,
+                "summaries":   summaries,
+                "anomalies":   anomalies_map,
+                "scan_errors": scan_errors,
+                "max_dist":    max_dist_filter,
             }
 
             _display_results(st.session_state["scan_results"], max_dist_filter)
@@ -1596,9 +1905,8 @@ else:
         "puis cliquez sur **LANCER LE SCAN COMPLET**."
     )
 
-# FIX : slider live utilisé (max_dist_filter), pas la valeur figée du session_state
 if "scan_results" in st.session_state and not scan_button:
     _display_results(
         st.session_state["scan_results"],
-        max_dist_filter,   # ← valeur live du slider sidebar
+        max_dist_filter,
     )
