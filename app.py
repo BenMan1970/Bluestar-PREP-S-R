@@ -821,72 +821,99 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
             timeframes = group["tf"].unique()
 
             if len(timeframes) >= 2:
-                avg_level = group["level"].mean()
-                nb_tf     = len(timeframes)
-                dist_pct  = abs(current_price - avg_level) / current_price * 100
 
-                group_active = group[group["status"] != "Consommee"]
-                if group_active.empty:
-                    group_active = group
+                # ── V11 FIX — Scission des groupes mixtes ──────────────────
+                # Problème : un groupe peut contenir des zones des deux côtés
+                # du prix (ex: EUR/CHF 0.91569 support + 0.92776 résistance).
+                # Ces zones ne forment pas une vraie confluence — elles sont
+                # contradictoires. Le groupe mixte produisait un signal erroné
+                # via avg_level ou égalité dans le vote individuel.
+                # Solution : détecter les groupes mixtes et les scinder en deux
+                # sous-groupes homogènes, chacun générant sa propre confluence.
+                # Si un sous-groupe n'a qu'un seul TF, il ne qualifie pas
+                # comme confluence multi-TF et est ignoré (comportement normal).
+                group_sup = group[group["level"] < current_price]
+                group_res = group[group["level"] >= current_price]
+                is_mixed  = (not group_sup.empty) and (not group_res.empty)
 
-                total_score = 0.0
-                for _, row in group_active.iterrows():
-                    total_score += compute_structural_score(
-                        int(row["strength"]),
-                        nb_tf,
-                        tf_name    = row["tf"],
-                        age_bars   = int(row.get("age_bars", 0)),
-                        total_bars = 500,
-                    )
-
-                total_strength = int(group["strength"].sum())
-                best_status = min(
-                    group["status"].tolist(),
-                    key=lambda s: STATUS_PRIORITY.get(s, 1)
+                subgroups = (
+                    [(group_sup, "Support"), (group_res, "Resistance")]
+                    if is_mixed
+                    else [(group, None)]  # groupe homogène → traitement normal
                 )
 
-                # V10 FIX — Correction définitive du signal BUY/SELL.
-                # Problème résiduel v9 : avg_level (moyenne du groupe) pouvait être
-                # du mauvais côté du prix si le groupe mélange des zones sous et
-                # au-dessus du prix (ex: EUR/CHF 0.91569 + 0.92776 → avg=0.92173 > prix).
-                # Solution : vote sur la POSITION RÉELLE de chaque zone individuelle,
-                # puis PIVOT seulement si dist_pct ≤ 0.50% (zone chaude ⚡).
-                # L'ordre de priorité : PIVOT > vote individuel.
-                is_pivot_zone = dist_pct <= 0.50
-                if is_pivot_zone:
-                    zone_type = "Pivot"
-                    signal    = "↔ PIVOT ZONE"
-                else:
-                    # Vote sur position réelle de chaque zone individuelle vs prix
-                    n_support    = (group["level"] < current_price).sum()
-                    n_resistance = (group["level"] >= current_price).sum()
-                    if n_support > n_resistance:
-                        zone_type = "Support"
-                        signal    = "🟢 BUY ZONE"
-                    elif n_resistance > n_support:
-                        zone_type = "Resistance"
-                        signal    = "🔴 SELL ZONE"
-                    else:
-                        # Égalité → on tranche sur avg_level
-                        zone_type = "Support" if avg_level < current_price else "Resistance"
-                        signal    = "🟢 BUY ZONE" if zone_type == "Support" else "🔴 SELL ZONE"
-                tf_label  = " + ".join(sorted(timeframes))
-                alerte    = ("🔥 ZONE CHAUDE" if dist_pct < 0.5
-                             else ("⚠️ Proche" if dist_pct < 1.5 else ""))
+                for subgroup, forced_type in subgroups:
+                    if subgroup.empty:
+                        continue
 
-                confluences.append({
-                    "Actif":        symbol,
-                    "Signal":       signal,
-                    "Niveau":       f"{avg_level:.5f}",
-                    "Type":         zone_type,
-                    "Timeframes":   tf_label,
-                    "Nb TF":        nb_tf,
-                    "Force Totale": total_strength,
-                    "Score":        round(total_score, 1),
-                    "Statut":       best_status,
-                    "Distance %":   f"{dist_pct:.2f}%",
-                    "Alerte":       alerte,
-                })
+                    sub_tfs = subgroup["tf"].unique()
+                    # Un sous-groupe doit avoir ≥2 TF pour être une confluence
+                    if is_mixed and len(sub_tfs) < 2:
+                        continue
+
+                    sub_avg   = subgroup["level"].mean()
+                    sub_nb_tf = len(sub_tfs)
+                    sub_dist  = abs(current_price - sub_avg) / current_price * 100
+
+                    sub_active = subgroup[subgroup["status"] != "Consommee"]
+                    if sub_active.empty:
+                        sub_active = subgroup
+
+                    sub_score = sum(
+                        compute_structural_score(
+                            int(r["strength"]), sub_nb_tf,
+                            tf_name  = r["tf"],
+                            age_bars = int(r.get("age_bars", 0)),
+                            total_bars = 500,
+                        )
+                        for _, r in sub_active.iterrows()
+                    )
+
+                    sub_strength = int(subgroup["strength"].sum())
+                    sub_status   = min(
+                        subgroup["status"].tolist(),
+                        key=lambda s: STATUS_PRIORITY.get(s, 1)
+                    )
+
+                    # Signal : PIVOT si dist ≤ 0.50%, sinon type forcé ou vote
+                    is_pivot = sub_dist <= 0.50
+                    if is_pivot:
+                        sub_type   = "Pivot"
+                        sub_signal = "↔ PIVOT ZONE"
+                    elif forced_type:
+                        # Groupe scindé → type connu avec certitude
+                        sub_type   = forced_type
+                        sub_signal = "🟢 BUY ZONE" if forced_type == "Support" else "🔴 SELL ZONE"
+                    else:
+                        # Groupe homogène → vote individuel (héritage v10)
+                        n_sup = (subgroup["level"] < current_price).sum()
+                        n_res = (subgroup["level"] >= current_price).sum()
+                        if n_sup > n_res:
+                            sub_type, sub_signal = "Support",    "🟢 BUY ZONE"
+                        elif n_res > n_sup:
+                            sub_type, sub_signal = "Resistance", "🔴 SELL ZONE"
+                        else:
+                            sub_type   = "Support" if sub_avg < current_price else "Resistance"
+                            sub_signal = "🟢 BUY ZONE" if sub_type == "Support" else "🔴 SELL ZONE"
+
+                    sub_tf_label = " + ".join(sorted(sub_tfs))
+                    sub_alerte   = ("🔥 ZONE CHAUDE" if sub_dist < 0.5
+                                    else ("⚠️ Proche" if sub_dist < 1.5 else ""))
+
+                    confluences.append({
+                        "Actif":        symbol,
+                        "Signal":       sub_signal,
+                        "Niveau":       f"{sub_avg:.5f}",
+                        "Type":         sub_type,
+                        "Timeframes":   sub_tf_label,
+                        "Nb TF":        sub_nb_tf,
+                        "Force Totale": sub_strength,
+                        "Score":        round(sub_score, 1),
+                        "Statut":       sub_status,
+                        "Distance %":   f"{sub_dist:.2f}%",
+                        "Alerte":       sub_alerte,
+                    })
+
                 used_indices.update(group.index)
 
     return confluences
@@ -1800,8 +1827,8 @@ with st.sidebar:
     st.caption("✅ Colonnes fantômes purgées dans _display_results")
     st.caption("✅ zone_width fallback stable (référence fixe)")
     st.divider()
-    st.caption("**Corrections v10 (brief 11h09) :**")
-    st.caption("✅ Signal BUY/SELL : vote position réelle (pas avg_level)")
+    st.caption("**Corrections v11 (brief 11h15) :**")
+    st.caption("✅ Groupes mixtes S/R scindés en 2 confluences distinctes")
     st.caption("✅ Nested ThreadPoolExecutor → pool ext. 4 workers (12 threads max)")
     st.caption("✅ get_oanda_current_price : cache manuel thread-safe")
     st.caption("✅ classify_zone_status vectorisé numpy (élim. boucle iloc)")
