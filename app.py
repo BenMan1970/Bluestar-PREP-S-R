@@ -845,17 +845,31 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     key=lambda s: STATUS_PRIORITY.get(s, 1)
                 )
 
-                # V9 FIX C1 — seuil aligné sur PIVOT_BAND_PCT = 0.50%
+                # V10 FIX — Correction définitive du signal BUY/SELL.
+                # Problème résiduel v9 : avg_level (moyenne du groupe) pouvait être
+                # du mauvais côté du prix si le groupe mélange des zones sous et
+                # au-dessus du prix (ex: EUR/CHF 0.91569 + 0.92776 → avg=0.92173 > prix).
+                # Solution : vote sur la POSITION RÉELLE de chaque zone individuelle,
+                # puis PIVOT seulement si dist_pct ≤ 0.50% (zone chaude ⚡).
+                # L'ordre de priorité : PIVOT > vote individuel.
                 is_pivot_zone = dist_pct <= 0.50
                 if is_pivot_zone:
                     zone_type = "Pivot"
                     signal    = "↔ PIVOT ZONE"
-                elif avg_level < current_price:
-                    zone_type = "Support"
-                    signal    = "🟢 BUY ZONE"
                 else:
-                    zone_type = "Resistance"
-                    signal    = "🔴 SELL ZONE"
+                    # Vote sur position réelle de chaque zone individuelle vs prix
+                    n_support    = (group["level"] < current_price).sum()
+                    n_resistance = (group["level"] >= current_price).sum()
+                    if n_support > n_resistance:
+                        zone_type = "Support"
+                        signal    = "🟢 BUY ZONE"
+                    elif n_resistance > n_support:
+                        zone_type = "Resistance"
+                        signal    = "🔴 SELL ZONE"
+                    else:
+                        # Égalité → on tranche sur avg_level
+                        zone_type = "Support" if avg_level < current_price else "Resistance"
+                        signal    = "🟢 BUY ZONE" if zone_type == "Support" else "🔴 SELL ZONE"
                 tf_label  = " + ".join(sorted(timeframes))
                 alerte    = ("🔥 ZONE CHAUDE" if dist_pct < 0.5
                              else ("⚠️ Proche" if dist_pct < 1.5 else ""))
@@ -1786,9 +1800,8 @@ with st.sidebar:
     st.caption("✅ Colonnes fantômes purgées dans _display_results")
     st.caption("✅ zone_width fallback stable (référence fixe)")
     st.divider()
-    st.caption("**Corrections v9 (brief 06h17) :**")
-    st.caption("✅ PIVOT_BAND_PCT 0.30% → 0.50% (aligné zone chaude ⚡)")
-    st.caption("✅ get_price_context guard strict position (NZD/CHF fix)")
+    st.caption("**Corrections v10 (brief 11h09) :**")
+    st.caption("✅ Signal BUY/SELL : vote position réelle (pas avg_level)")
     st.caption("✅ Nested ThreadPoolExecutor → pool ext. 4 workers (12 threads max)")
     st.caption("✅ get_oanda_current_price : cache manuel thread-safe")
     st.caption("✅ classify_zone_status vectorisé numpy (élim. boucle iloc)")
