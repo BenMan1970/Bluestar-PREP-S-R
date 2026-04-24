@@ -179,8 +179,9 @@ _ACCENT_MAP = str.maketrans(
 
 _EMOJI_MAP = [
     ('🟢', '[BUY]'),  ('🔴', '[SELL]'), ('🔥', '[CHAUD]'),
-    ('⚠️', '[PROCHE]'), ('⚠',  '[PROCHE]'), ('📈', ''), ('📉', ''),
-    ('↔️', ''), ('↔',  ''), ('✅', '[OK]'), ('❌', '[X]'),
+    ('↔️', '[PIVOT]'), ('↔',  '[PIVOT]'), ('⚠️', '[PROCHE]'), ('⚠',  '[PROCHE]'),
+    ('📈', ''), ('📉', ''),
+    ('✅', '[OK]'), ('❌', '[X]'),
     ('⚡', '[!]'), ('📡', ''), ('📅', ''), ('↩️', '[RR]'),
 ]
 
@@ -721,8 +722,28 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
     strong = post_merge_zones(strong, threshold_pct=post_merge_threshold)
 
     df_zones    = pd.DataFrame(strong).sort_values("level").reset_index(drop=True)
-    supports    = df_zones[df_zones["level"] <  current_price].copy()
-    resistances = df_zones[df_zones["level"] >= current_price].copy()
+
+    # ANOMALIE #2 FIX — Bande neutre PIVOT autour du prix actuel.
+    # Problème : une zone à 0.17% du prix peut basculer de BUY à SELL entre deux
+    # scans espacés de 8 minutes si le prix franchit légèrement le niveau.
+    # Solution : toute zone dans un rayon de PIVOT_BAND_PCT % du prix est classée
+    # "Pivot" — ni Support ni Résistance. Elle apparaît dans les deux DataFrames
+    # avec un flag "is_pivot" pour que l'UI/export puisse l'afficher différemment.
+    # En confluences, le signal sera "↔ PIVOT ZONE" au lieu de BUY/SELL instable.
+    PIVOT_BAND_PCT = 0.30  # ±0.30% autour du prix = bande neutre
+
+    if current_price and current_price > 0:
+        pivot_mask = (
+            abs(df_zones["level"] - current_price) / current_price * 100
+            <= PIVOT_BAND_PCT
+        )
+    else:
+        pivot_mask = pd.Series([False] * len(df_zones))
+
+    df_zones["is_pivot"] = pivot_mask
+
+    supports    = df_zones[(df_zones["level"] <  current_price) | pivot_mask].copy()
+    resistances = df_zones[(df_zones["level"] >= current_price) | pivot_mask].copy()
     return supports, resistances
 
 
@@ -818,8 +839,17 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                 # Quand H4=Support et Daily=Resistance sur le même niveau, iloc[0] donnait
                 # un type aléatoire selon le tri. On prend le type le plus représenté.
                 type_counts = group["type"].value_counts()
-                zone_type = type_counts.idxmax()
-                signal    = "🟢 BUY ZONE" if zone_type == "Support" else "🔴 SELL ZONE"
+                # zone_type par vote majoritaire (v3 fix)
+                type_counts = group["type"].value_counts()
+                zone_type   = type_counts.idxmax()
+
+                # ANOMALIE #2 FIX — Signal PIVOT ZONE si la zone est dans la bande neutre
+                # (dist < PIVOT_BAND_PCT sur au moins un TF) → pas de BUY/SELL instable.
+                is_pivot_zone = dist_pct <= 0.30
+                if is_pivot_zone:
+                    signal = "↔ PIVOT ZONE"
+                else:
+                    signal = "🟢 BUY ZONE" if zone_type == "Support" else "🔴 SELL ZONE"
                 tf_label  = " + ".join(sorted(timeframes))
                 alerte    = ("🔥 ZONE CHAUDE" if dist_pct < 0.5
                              else ("⚠️ Proche" if dist_pct < 1.5 else ""))
@@ -995,11 +1025,21 @@ def scan_single_symbol(args) -> ScanResult:
             }
 
         tf_rows = (
-            [make_row(z, "Support")    for _, z in supports.iterrows()] +
-            [make_row(z, "Resistance") for _, z in resistances.iterrows()]
+            [make_row(z, "PIVOT" if z.get("is_pivot") else "Support")
+             for _, z in supports.iterrows()] +
+            [make_row(z, "PIVOT" if z.get("is_pivot") else "Resistance")
+             for _, z in resistances.iterrows()]
         )
-        if tf_rows:
-            rows[tf_cap] = tf_rows
+        # Dédupliquer les zones PIVOT qui apparaissent dans les deux DataFrames
+        seen_levels = set()
+        unique_rows = []
+        for r in tf_rows:
+            key = (r["Niveau"], r["Type"])
+            if key not in seen_levels:
+                seen_levels.add(key)
+                unique_rows.append(r)
+        if unique_rows:
+            rows[tf_cap] = unique_rows
 
     if all_sup_levels and reference_price:
         new_anomaly = flag_data_anomaly(
@@ -1510,12 +1550,13 @@ def _display_results(sr: dict, max_dist_filter: float):
 
         disp = conf_filt.sort_values("Score", ascending=False).reset_index(drop=True)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Total zones",       len(disp))
         c2.metric("🔥 Zones chaudes",  len(disp[disp["Alerte"] == "🔥 ZONE CHAUDE"]))
         c3.metric("⚠️ Zones proches",  len(disp[disp["Alerte"] == "⚠️ Proche"]))
         c4.metric("🟢 BUY Zones",      len(disp[disp["Signal"] == "🟢 BUY ZONE"]))
         c5.metric("🔴 SELL Zones",     len(disp[disp["Signal"] == "🔴 SELL ZONE"]))
+        c6.metric("↔ PIVOT Zones",     len(disp[disp["Signal"] == "↔ PIVOT ZONE"]))
 
         conf_cfg = {
             **{k: st.column_config.TextColumn(k, width="small")
@@ -1739,7 +1780,9 @@ with st.sidebar:
     st.caption("✅ Colonnes fantômes purgées dans _display_results")
     st.caption("✅ zone_width fallback stable (référence fixe)")
     st.divider()
-    st.caption("**Corrections v5 (audit 2 — 11 findings) :**")
+    st.caption("**Corrections v7 (anomalies brief) :**")
+    st.caption("✅ get_price_context : filtre 5% actif (AUD/USD fix)")
+    st.caption("✅ Bande neutre PIVOT ±0.30% — plus de flip BUY↔SELL")
     st.caption("✅ Nested ThreadPoolExecutor → pool ext. 4 workers (12 threads max)")
     st.caption("✅ get_oanda_current_price : cache manuel thread-safe")
     st.caption("✅ classify_zone_status vectorisé numpy (élim. boucle iloc)")
