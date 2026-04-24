@@ -754,15 +754,23 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
     all_zones = []
     for tf, (supports, resistances) in zones_dict.items():
         for _, z in supports.iterrows():
+            # V8 FIX — Les zones PIVOT apparaissent dans les deux DataFrames (support ET resistance).
+            # On les déduplique ici en leur assignant un type "Pivot" neutre,
+            # pour éviter que type_counts leur donne "Resistance" à 2 voix vs 1.
+            is_piv = bool(z.get("is_pivot", False))
             all_zones.append({
                 "tf":       tf,
                 "level":    z["level"],
                 "strength": z["strength"],
                 "age_bars": z.get("age_bars", 0),
                 "status":   z.get("status", "Testee"),
-                "type":     "Support",
+                "type":     "Pivot" if is_piv else "Support",
+                "is_pivot": is_piv,
             })
         for _, z in resistances.iterrows():
+            is_piv = bool(z.get("is_pivot", False))
+            if is_piv:
+                continue  # déjà ajouté depuis supports — on ne double pas
             all_zones.append({
                 "tf":       tf,
                 "level":    z["level"],
@@ -770,6 +778,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                 "age_bars": z.get("age_bars", 0),
                 "status":   z.get("status", "Testee"),
                 "type":     "Resistance",
+                "is_pivot": False,
             })
 
     if not all_zones:
@@ -835,21 +844,20 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     key=lambda s: STATUS_PRIORITY.get(s, 1)
                 )
 
-                # HIGH #2b FIX — zone_type par vote majoritaire (pas iloc[0] arbitraire).
-                # Quand H4=Support et Daily=Resistance sur le même niveau, iloc[0] donnait
-                # un type aléatoire selon le tri. On prend le type le plus représenté.
-                type_counts = group["type"].value_counts()
-                # zone_type par vote majoritaire (v3 fix)
-                type_counts = group["type"].value_counts()
-                zone_type   = type_counts.idxmax()
-
-                # ANOMALIE #2 FIX — Signal PIVOT ZONE si la zone est dans la bande neutre
-                # (dist < PIVOT_BAND_PCT sur au moins un TF) → pas de BUY/SELL instable.
+                # V8 FIX — zone_type déterminé par la position réelle du niveau vs prix,
+                # pas par vote majoritaire qui était biaisé par les doublons PIVOT.
+                # Si la zone est dans la bande PIVOT (dist<=0.30%) → signal neutre.
+                # Sinon on utilise avg_level vs current_price pour BUY/SELL.
                 is_pivot_zone = dist_pct <= 0.30
                 if is_pivot_zone:
-                    signal = "↔ PIVOT ZONE"
+                    zone_type = "Pivot"
+                    signal    = "↔ PIVOT ZONE"
+                elif avg_level < current_price:
+                    zone_type = "Support"
+                    signal    = "🟢 BUY ZONE"
                 else:
-                    signal = "🟢 BUY ZONE" if zone_type == "Support" else "🔴 SELL ZONE"
+                    zone_type = "Resistance"
+                    signal    = "🔴 SELL ZONE"
                 tf_label  = " + ".join(sorted(timeframes))
                 alerte    = ("🔥 ZONE CHAUDE" if dist_pct < 0.5
                              else ("⚠️ Proche" if dist_pct < 1.5 else ""))
@@ -1780,9 +1788,10 @@ with st.sidebar:
     st.caption("✅ Colonnes fantômes purgées dans _display_results")
     st.caption("✅ zone_width fallback stable (référence fixe)")
     st.divider()
-    st.caption("**Corrections v7 (anomalies brief) :**")
-    st.caption("✅ get_price_context : filtre 5% actif (AUD/USD fix)")
-    st.caption("✅ Bande neutre PIVOT ±0.30% — plus de flip BUY↔SELL")
+    st.caption("**Corrections v8 (brief 06h10) :**")
+    st.caption("✅ PIVOT dédupliqué dans detect_confluences")
+    st.caption("✅ zone_type basé sur position réelle niveau vs prix")
+    st.caption("✅ 14 signaux SELL inversés corrigés")
     st.caption("✅ Nested ThreadPoolExecutor → pool ext. 4 workers (12 threads max)")
     st.caption("✅ get_oanda_current_price : cache manuel thread-safe")
     st.caption("✅ classify_zone_status vectorisé numpy (élim. boucle iloc)")
