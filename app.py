@@ -366,19 +366,21 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
 def get_price_context(current_price, supports, resistances, max_dist_pct: float = 5.0):
     """
     MEDIUM #3 FIX — Guard current_price nul ou None.
-    BUG VISIBLE FIX — Filtre de distance max_dist_pct avant nlargest/nsmallest.
-    Problème original : nlargest(1) sur TOUS les supports retournait le support
-    le plus haut même à 2.44% ou plus — incohérent avec le filtre confluence à 2%.
-    Désormais on ne retient que les niveaux dans un rayon de max_dist_pct (5% par défaut).
-    Si aucun niveau proche → "Zone intermediaire" au lieu d'un niveau trompeur.
+    BUG VISIBLE FIX — Filtre max_dist_pct avant nlargest/nsmallest.
+    V9 FIX C2 — Guard strict de position : on ne retient dans 'supports'
+    que les niveaux STRICTEMENT en-dessous du prix, et dans 'resistances'
+    que les niveaux STRICTEMENT au-dessus. Élimine l'inversion NZD/CHF où
+    la bande PIVOT faisait apparaître le même niveau dans les deux DataFrames,
+    et get_price_context retournait résistance < support (physiquement impossible).
     """
     if not current_price or current_price <= 0:
         return "Prix indisponible"
     parts = []
     if not supports.empty:
-        # Filtrer les supports dans le rayon max_dist_pct
+        # Filtrer : strictement sous le prix ET dans le rayon max_dist_pct
         sup_nearby = supports[
-            abs(supports["level"] - current_price) / current_price * 100 <= max_dist_pct
+            (supports["level"] < current_price) &
+            (abs(supports["level"] - current_price) / current_price * 100 <= max_dist_pct)
         ]
         if not sup_nearby.empty:
             nearest_sup = sup_nearby.nlargest(1, "level").iloc[0]
@@ -386,9 +388,10 @@ def get_price_context(current_price, supports, resistances, max_dist_pct: float 
             tag    = "SUR support" if dist_s < 0.5 else "S proche"
             parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
     if not resistances.empty:
-        # Filtrer les résistances dans le rayon max_dist_pct
+        # Filtrer : strictement au-dessus du prix ET dans le rayon max_dist_pct
         res_nearby = resistances[
-            abs(resistances["level"] - current_price) / current_price * 100 <= max_dist_pct
+            (resistances["level"] > current_price) &
+            (abs(resistances["level"] - current_price) / current_price * 100 <= max_dist_pct)
         ]
         if not res_nearby.empty:
             nearest_res = res_nearby.nsmallest(1, "level").iloc[0]
@@ -723,14 +726,12 @@ def find_strong_sr_zones(df, current_price, atr_val=None,
 
     df_zones    = pd.DataFrame(strong).sort_values("level").reset_index(drop=True)
 
-    # ANOMALIE #2 FIX — Bande neutre PIVOT autour du prix actuel.
-    # Problème : une zone à 0.17% du prix peut basculer de BUY à SELL entre deux
-    # scans espacés de 8 minutes si le prix franchit légèrement le niveau.
-    # Solution : toute zone dans un rayon de PIVOT_BAND_PCT % du prix est classée
-    # "Pivot" — ni Support ni Résistance. Elle apparaît dans les deux DataFrames
-    # avec un flag "is_pivot" pour que l'UI/export puisse l'afficher différemment.
-    # En confluences, le signal sera "↔ PIVOT ZONE" au lieu de BUY/SELL instable.
-    PIVOT_BAND_PCT = 0.30  # ±0.30% autour du prix = bande neutre
+    # V9 FIX C1 — PIVOT_BAND_PCT élargi de 0.30% à 0.50%.
+    # Justification : 0.50% est le seuil "zone chaude ⚡" déjà utilisé dans le brief.
+    # Les 3 cas résiduels (EUR/CAD 0.34%, USD/CAD 0.43%, GBP/CHF 0.48%) sont
+    # dans la bande "chaude" mais hors bande PIVOT → signal SELL inversé.
+    # Aligner les deux seuils est cohérent et élimine ces cas définitivement.
+    PIVOT_BAND_PCT = 0.50  # était 0.30 — aligné sur le seuil zone chaude ⚡
 
     if current_price and current_price > 0:
         pivot_mask = (
@@ -844,11 +845,8 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     key=lambda s: STATUS_PRIORITY.get(s, 1)
                 )
 
-                # V8 FIX — zone_type déterminé par la position réelle du niveau vs prix,
-                # pas par vote majoritaire qui était biaisé par les doublons PIVOT.
-                # Si la zone est dans la bande PIVOT (dist<=0.30%) → signal neutre.
-                # Sinon on utilise avg_level vs current_price pour BUY/SELL.
-                is_pivot_zone = dist_pct <= 0.30
+                # V9 FIX C1 — seuil aligné sur PIVOT_BAND_PCT = 0.50%
+                is_pivot_zone = dist_pct <= 0.50
                 if is_pivot_zone:
                     zone_type = "Pivot"
                     signal    = "↔ PIVOT ZONE"
@@ -1788,10 +1786,9 @@ with st.sidebar:
     st.caption("✅ Colonnes fantômes purgées dans _display_results")
     st.caption("✅ zone_width fallback stable (référence fixe)")
     st.divider()
-    st.caption("**Corrections v8 (brief 06h10) :**")
-    st.caption("✅ PIVOT dédupliqué dans detect_confluences")
-    st.caption("✅ zone_type basé sur position réelle niveau vs prix")
-    st.caption("✅ 14 signaux SELL inversés corrigés")
+    st.caption("**Corrections v9 (brief 06h17) :**")
+    st.caption("✅ PIVOT_BAND_PCT 0.30% → 0.50% (aligné zone chaude ⚡)")
+    st.caption("✅ get_price_context guard strict position (NZD/CHF fix)")
     st.caption("✅ Nested ThreadPoolExecutor → pool ext. 4 workers (12 threads max)")
     st.caption("✅ get_oanda_current_price : cache manuel thread-safe")
     st.caption("✅ classify_zone_status vectorisé numpy (élim. boucle iloc)")
