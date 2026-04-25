@@ -1,9 +1,3 @@
-# app.py → v5.0 — Optimisation CASCADE ENGINE
-# [1] Colonnes Niveau + Distance% (niveau fractal cassé + écart prix actuel)
-# [2] Monthly exclu du scan — Weekly conservé pour analyse personnelle
-# [3] Noms de paires normalisés sans slash dans PDF/CSV (EURUSD) — Streamlit conserve EUR/USD
-# [4] Filtre Stale : Fresh+Aged uniquement dans PDF/CSV — Stale visible Streamlit uniquement
-
 import streamlit as st
 import pandas as pd
 import numpy as np
