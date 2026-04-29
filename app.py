@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from typing import Optional
+
 import numpy as np
 import pandas as pd
 import requests
@@ -106,7 +107,7 @@ CONFLUENCE_THRESHOLD_MAP = {
 PRICE_SANITY_RANGE = {
     "XAU_USD":    (1500.0,  5500.0),
     "US30_USD":   (20000.0, 70000.0),
-    "NAS100_USD": (8000.0,  25000.0),
+    "NAS100_USD": (8000.0,  35000.0),
     "SPX500_USD": (3000.0,  9000.0),
     "DE30_EUR":   (8000.0,  30000.0),
 }
