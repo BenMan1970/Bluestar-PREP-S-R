@@ -238,7 +238,8 @@ def get_oanda_data(base_url: str, access_token: str, symbol: str,
         _cache_set(key, df)
         return df
     except requests.RequestException:
-        _cache_set(key, None)
+        # FIX v5.2 — ne jamais cacher un échec réseau (timeout, rate-limit).
+        # Le prochain appel réessaiera vraiment au lieu de servir un None périmé 600s.
         return None
 
 
@@ -270,8 +271,10 @@ def get_oanda_current_price(base_url: str, access_token: str,
     except requests.RequestException:
         result = None
 
-    with _price_cache_lock:
-        _price_cache[key] = (result, datetime.now())
+    # FIX v5.2 — ne cacher que les succès, jamais les échecs réseau
+    if result is not None:
+        with _price_cache_lock:
+            _price_cache[key] = (result, datetime.now())
     return result
 
 
@@ -1657,6 +1660,11 @@ with st.sidebar:
     st.caption("↩️ Role Reverse = niveau cassé retesté")
     st.caption("❌ Consommée = cassée sans retour")
 
+    st.divider()
+    st.caption("**Corrections v5.2 (cache poisoning) :**")
+    st.caption("✅ get_oanda_data : échec réseau non caché (timeout/rate-limit)")
+    st.caption("✅ get_oanda_current_price : idem — retry garanti au prochain appel")
+    st.caption("✅ NAS100_USD plafond PRICE_SANITY_RANGE : 25k→35k")
     st.divider()
     st.caption("**Corrections v5.1 (export JSON LLM) :**")
     st.caption("✅ create_json_export allégé : -38% tokens SR")
