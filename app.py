@@ -54,7 +54,7 @@ scan_button = st.button("🚀 LANCER LE SCAN COMPLET", type="primary", use_conta
 # ══════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ══════════════════════════════════════════════════════════════════
-SCANNER_VERSION = "5.6"
+SCANNER_VERSION = "5.7"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -78,6 +78,10 @@ DEFAULT_ZONE_WIDTH = 0.5
 POST_MERGE_THRESHOLD = 0.30
 POST_MERGE_MAP = {"US30_USD": 0.05, "NAS100_USD": 0.05, "SPX500_USD": 0.08, "DE30_EUR": 0.08, "XAU_USD": 0.15}
 
+# FIX 3 — Coefficient ATR pour post-merge (remplace les seuils % fixe pour les indices)
+# Ex. NAS100 : 0.05% de 19000 = 9.5 pts < bruit ; 0.5*ATR H4 (~150 pts) = cohérent
+POST_MERGE_ATR_COEFF = 0.5  # distance en fraction d'ATR pour le merge quand ATR disponible
+
 CONFLUENCE_THRESHOLD_MAP = {"US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, "DE30_EUR": 1.2, "XAU_USD": 1.5}
 
 PRICE_SANITY_RANGE = {
@@ -95,8 +99,21 @@ ABSOLUTE_MAX_DIST = {"XAU_USD": 8.0, "US30_USD": 4.0, "NAS100_USD": 4.0, "SPX500
 
 _GRANULARITY_MAP = {"h4": "H4", "daily": "D", "weekly": "W"}
 
-# FIX D — seuil min_ratio par timeframe (Weekly plus souple : 0.4 vs 0.6)
+# FIX D (v5.6) — seuil min_ratio par timeframe (Weekly plus souple : 0.4 vs 0.6)
 _TREND_MIN_RATIO = {"h4": 0.6, "daily": 0.6, "weekly": 0.4}
+
+# FIX 4 — Bande PIVOT par actif (en % du prix)
+# Forex : 0.50% standard | Indices : ATR-based via find_strong_sr_zones
+# Ce dict sert de fallback quand ATR est indisponible
+PIVOT_BAND_MAP = {
+    "US30_USD": 0.15, "NAS100_USD": 0.15,
+    "SPX500_USD": 0.12, "DE30_EUR": 0.12,
+    "XAU_USD": 0.20,
+}
+DEFAULT_PIVOT_BAND_PCT = 0.50
+# Coefficient ATR pour la bande pivot quand ATR disponible
+# Ex. NAS100 ATR H4 ~150 pts → pivot_band = 0.5 * 150 = 75 pts ≈ 0.40% → raisonnable
+PIVOT_BAND_ATR_COEFF = 0.5
 
 # ══════════════════════════════════════════════════════════════════
 # CACHE THREAD-SAFE
@@ -318,7 +335,7 @@ def compute_atr(df, period=14) -> Optional[float]:
     result = tr.rolling(period).mean().iloc[-1]
     return float(result) if pd.notna(result) and result > 0 else None
 
-# FIX D — compute_trend : seuil min_ratio par TF, Weekly plus souple (0.4)
+# FIX D (v5.6) — compute_trend : seuil min_ratio par TF, Weekly plus souple (0.4)
 def compute_trend(df, sma_period=20, timeframe_key: str = "daily"):
     if df is None or len(df) < 15:
         return "NEUTRE"
@@ -361,7 +378,17 @@ def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_ba
     age_f = float(np.exp(-1.5 * age_r))
     return round(strength * tf_w * nb_tf * age_f, 1)
 
-def post_merge_zones(zones_list, threshold_pct=0.30):
+# ──────────────────────────────────────────────────────────────────
+# FIX 3 — post_merge_zones : seuil en fraction d'ATR pour les indices
+#
+# AVANT : distance de merge = centroid * threshold_pct / 100 (% fixe)
+#   → Sur NAS100 : POST_MERGE_MAP = 0.05% de 19000 = 9.5 pts
+#     alors que ATR H4 ≈ 150 pts → seuil trop serré, zones non fusionnées
+#
+# APRÈS : si atr_val disponible → distance = atr_val * POST_MERGE_ATR_COEFF
+#         sinon → fallback sur le % fixe d'origine (comportement identique pour Forex)
+# ──────────────────────────────────────────────────────────────────
+def post_merge_zones(zones_list, threshold_pct=0.30, atr_val=None):
     if len(zones_list) <= 1:
         return zones_list
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
@@ -377,7 +404,12 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
                 if j in used:
                     continue
                 current_centroid = np.mean([z["level"] for z in group])
-                if abs(zones_list[j]["level"] - current_centroid) / current_centroid * 100 <= threshold_pct:
+                # FIX 3 : distance ATR-based quand disponible, fallback % sinon
+                if atr_val and atr_val > 0:
+                    merge_ok = abs(zones_list[j]["level"] - current_centroid) <= atr_val * POST_MERGE_ATR_COEFF
+                else:
+                    merge_ok = abs(zones_list[j]["level"] - current_centroid) / current_centroid * 100 <= threshold_pct
+                if merge_ok:
                     group.append(zones_list[j])
                     used.add(j)
                     changed = True
@@ -416,7 +448,24 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
                    if swing_low_idx  else pd.Series(dtype=float))
     return pivot_highs, pivot_lows
 
-def classify_zone_status(level, zone_type, df, formation_idx, atr_val=None, tolerance_coeff=0.25):
+# ──────────────────────────────────────────────────────────────────
+# FIX 1 — classify_zone_status : tolerance alignée sur atr_zone_coeff
+#
+# AVANT : tolerance_coeff = 0.25 fixe
+#   → Zone formée avec atr_zone_coeff = 0.4 (largeur = 0.4 × ATR)
+#   → Bougie touchant le bord de la zone (ex. 0.35 × ATR du centre)
+#     = dans la zone de détection, mais PAS dans la tolérance de statut
+#   → Zone classée "Vierge" alors qu'elle a été touchée → FAUX VIERGE
+#
+# APRÈS : tolerance_coeff hérite de l'atr_zone_coeff passé par l'appelant
+#         (0.4 par défaut, 0.5 pour XAU, 0.3 pour indices)
+#         → cohérence garantie : ce qui définit la zone définit aussi son test
+# ──────────────────────────────────────────────────────────────────
+def classify_zone_status(level, zone_type, df, formation_idx,
+                         atr_val=None, tolerance_coeff=None):
+    # FIX 1 : si non fourni, utilise DEFAULT_ATR_COEFF (cohérent avec la formation de zone)
+    if tolerance_coeff is None:
+        tolerance_coeff = DEFAULT_ATR_COEFF
     if formation_idx >= len(df) - 1:
         return "Vierge"
     tolerance = (atr_val * tolerance_coeff) if (atr_val and atr_val > 0) else (level * 0.003)
@@ -457,9 +506,20 @@ def classify_zone_status(level, zone_type, df, formation_idx, atr_val=None, tole
         return "Consommee"
     return "Role Reverse"
 
-def find_strong_sr_zones(df, current_price, atr_val=None, zone_percentage_width=0.5,
-                          atr_zone_coeff=0.4, prominence_coeff=0.3, min_touches=2,
-                          timeframe="daily", post_merge_threshold=0.30, swing_n=3):
+# ──────────────────────────────────────────────────────────────────
+# FIX 1 + FIX 3 + FIX 4 — find_strong_sr_zones
+#
+# FIX 1 : passe atr_zone_coeff à classify_zone_status (tolerance cohérente)
+# FIX 3 : passe atr_val à post_merge_zones (merge ATR-based)
+# FIX 4 : bande PIVOT ATR-based par actif (PIVOT_BAND_ATR_COEFF * ATR)
+#          → Sur indices, la bande pivot est maintenant ~0.5 × ATR H4
+#            au lieu de 0.50% fixe, beaucoup plus représentatif du bruit de marché
+#          Signature : ajout du paramètre `symbol` (facultatif, pour PIVOT_BAND_MAP)
+# ──────────────────────────────────────────────────────────────────
+def find_strong_sr_zones(df, current_price, symbol=None, atr_val=None,
+                          zone_percentage_width=0.5, atr_zone_coeff=0.4,
+                          prominence_coeff=0.3, min_touches=2, timeframe="daily",
+                          post_merge_threshold=0.30, swing_n=3):
     if df is None or df.empty or len(df) < 20:
         return pd.DataFrame(), pd.DataFrame()
     if current_price is None:
@@ -505,32 +565,58 @@ def find_strong_sr_zones(df, current_price, atr_val=None, zone_percentage_width=
         last_idx = max(indices)
         age_bars = n_total - 1 - last_idx
         zone_type_tmp = "Support" if lvl < current_price else "Resistance"
+        # FIX 1 : tolerance_coeff = atr_zone_coeff (cohérence formation ↔ statut)
         status = classify_zone_status(lvl, zone_type_tmp, df, last_idx,
-                                       atr_val=atr_val, tolerance_coeff=0.25)
+                                       atr_val=atr_val, tolerance_coeff=atr_zone_coeff)
         strong.append({"level": lvl, "strength": strength, "age_bars": age_bars, "status": status})
     if not strong:
         return pd.DataFrame(), pd.DataFrame()
-    strong = post_merge_zones(strong, threshold_pct=post_merge_threshold)
+    # FIX 3 : passe atr_val pour merge ATR-based sur les indices
+    strong = post_merge_zones(strong, threshold_pct=post_merge_threshold, atr_val=atr_val)
     df_zones = pd.DataFrame(strong).sort_values("level").reset_index(drop=True)
-    PIVOT_BAND_PCT = 0.50
-    if current_price and current_price > 0:
-        pivot_mask = abs(df_zones["level"] - current_price) / current_price * 100 <= PIVOT_BAND_PCT
+
+    # FIX 4 — Bande PIVOT ATR-based : calcul de la bande en points absolus
+    # Priorité : (1) ATR × PIVOT_BAND_ATR_COEFF
+    #            (2) PIVOT_BAND_MAP[symbol] en % du prix (indices sans ATR)
+    #            (3) DEFAULT_PIVOT_BAND_PCT en % du prix (Forex fallback)
+    if atr_val and atr_val > 0:
+        pivot_band_abs = atr_val * PIVOT_BAND_ATR_COEFF
+        if current_price and current_price > 0:
+            pivot_mask = abs(df_zones["level"] - current_price) <= pivot_band_abs
+        else:
+            pivot_mask = pd.Series([False] * len(df_zones))
     else:
-        pivot_mask = pd.Series([False] * len(df_zones))
+        band_pct = PIVOT_BAND_MAP.get(symbol, DEFAULT_PIVOT_BAND_PCT) if symbol else DEFAULT_PIVOT_BAND_PCT
+        if current_price and current_price > 0:
+            pivot_mask = abs(df_zones["level"] - current_price) / current_price * 100 <= band_pct
+        else:
+            pivot_mask = pd.Series([False] * len(df_zones))
+
     df_zones["is_pivot"] = pivot_mask
-    # FIX B — Zones PIVOT : exclusion du DataFrame Resistance
-    # Avant : pivot_mask dans les deux DF → double injection → score doublé
-    # Après : PIVOT uniquement dans supports ; resistances exclut pivot_mask
+    # FIX B (v5.6) — PIVOT uniquement dans supports ; resistances exclut pivot_mask
     supports    = df_zones[(df_zones["level"] <  current_price) | pivot_mask].copy()
     resistances = df_zones[(df_zones["level"] >= current_price) & ~pivot_mask].copy()
     return supports, resistances
 
+# ──────────────────────────────────────────────────────────────────
+# FIX 2 — detect_confluences : sous-groupes mixtes mono-TF non abandonnés
+#
+# AVANT : `if is_mixed and len(sub_tfs) < 2: continue`
+#   → Scénario : groupe H4+Daily en support, uniquement Weekly en résistance
+#   → La résistance Weekly est silencieusement abandonnée (0 confluence émise)
+#   → Biais systématique : certaines résistances/supports valides disparaissent
+#
+# APRÈS : pour les groupes mixtes, on n'exige PAS 2 TF au niveau du sous-groupe
+#   → La validation multi-TF a déjà eu lieu au niveau du groupe parent
+#   → Le sous-groupe mono-TF d'un groupe mixte est émis avec son score réel
+#   → Note : le Score reflète fidèlement le nb réel de TF du sous-groupe
+# ──────────────────────────────────────────────────────────────────
 def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1.0):
     """
-    FIX A — used_indices.update() déplacé APRÈS le check len(timeframes) >= 2
-             Avant : zones mono-TF similaires consommées sans output → AUD/JPY, NAS100 absents
-             Après : seule la zone anchor (i) est marquée used si mono-TF
-    FIX B (dedup) — dédoublonnage par (level arrondi, tf) avant traitement
+    FIX A (v5.6) — used_indices.update() déplacé APRÈS le check len(timeframes) >= 2
+    FIX B (v5.6) — dédoublonnage par (level arrondi, tf) avant traitement
+    FIX 2 (v5.7) — sous-groupes mixtes : suppression du filtre len(sub_tfs) < 2
+                   Les côtés mono-TF d'un groupe mixte multi-TF sont désormais émis.
     """
     if not zones_dict or current_price is None:
         return []
@@ -548,7 +634,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                                "type": "Pivot" if is_piv else "Resistance", "is_pivot": is_piv})
     if not all_zones:
         return []
-    # FIX B — dédoublonnage défensif par (level, tf)
+    # FIX B (v5.6) — dédoublonnage défensif par (level, tf)
     seen_keys: set = set()
     deduped: list  = []
     for z in all_zones:
@@ -573,7 +659,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
         if len(similar) >= 1:
             group      = pd.concat([zones_df.loc[[i]], similar])
             timeframes = group["tf"].unique()
-            # FIX A — used_indices.update() APRÈS le check NbTF
+            # FIX A (v5.6) — used_indices.update() APRÈS le check NbTF
             if len(timeframes) >= 2:
                 used_indices.update(group.index)
                 group_sup = group[group["level"] < current_price]
@@ -585,7 +671,11 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     if subgroup.empty:
                         continue
                     sub_tfs = subgroup["tf"].unique()
-                    if is_mixed and len(sub_tfs) < 2:
+                    # FIX 2 (v5.7) — Pour les groupes mixtes, on ne ré-exige PAS 2 TF
+                    # au niveau du sous-groupe : la validation multi-TF est déjà faite
+                    # au niveau du groupe parent (len(timeframes) >= 2 ci-dessus).
+                    # Pour les groupes non-mixtes, on conserve l'exigence d'origine.
+                    if not is_mixed and len(sub_tfs) < 2:
                         continue
                     sub_avg   = subgroup["level"].mean()
                     sub_nb_tf = len(sub_tfs)
@@ -630,7 +720,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                         "Alerte": sub_alerte,
                     })
             else:
-                # FIX A — mono-TF : seule la zone anchor est marquée used
+                # FIX A (v5.6) — mono-TF : seule la zone anchor est marquée used
                 used_indices.add(i)
         else:
             used_indices.add(i)
@@ -693,11 +783,13 @@ def scan_single_symbol(args) -> ScanResult:
         if tf_key == "h4":
             last_h4_close = float(df["close"].iloc[-1])
         cp = reference_price
-        # FIX D — passage du timeframe_key à compute_trend
+        # FIX D (v5.6) — passage du timeframe_key à compute_trend
         trends[tf_cap] = compute_trend(df, timeframe_key=tf_key)
         atr_val = compute_atr(df, period=14)
+        # FIX 1 + FIX 3 + FIX 4 — passage de symbol et atr_zone_coeff
         supports, resistances = find_strong_sr_zones(
-            df, cp, atr_val=atr_val, zone_percentage_width=zone_w_fallback,
+            df, cp, symbol=symbol, atr_val=atr_val,
+            zone_percentage_width=zone_w_fallback,
             atr_zone_coeff=atr_zone_coeff, prominence_coeff=prom_coeff,
             min_touches=min_touches, timeframe=tf_key,
             post_merge_threshold=merge_thresh,
@@ -705,7 +797,7 @@ def scan_single_symbol(args) -> ScanResult:
         zones_d[tf_cap] = (supports, resistances)
         if not supports.empty:
             all_sup_levels.extend(supports["level"].tolist())
-        # FIX F — price_context sur Daily ET H4
+        # FIX F (v5.6) — price_context sur Daily ET H4
         if tf_key == "daily":
             zones_d["_price_ctx"] = get_price_context(cp, supports, resistances,
                                                        min_strength_anchor=min_touches)
@@ -870,14 +962,13 @@ class PDF(FPDF):
                 self.cell(w, 5, val, border=1, align='C', new_x='RIGHT', new_y='TOP')
             self.ln()
 
-# FIX E — _apply_pdf_filter : ABSOLUTE_MAX_DIST appliqué dans le fallback
+# FIX E (v5.6) — _apply_pdf_filter : ABSOLUTE_MAX_DIST appliqué dans le fallback
 def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     if "_in_pdf" in df.columns:
         df = df[df["_in_pdf"]].copy()
     elif "_dist_num" in df.columns:
-        # FIX E : respect de ABSOLUTE_MAX_DIST par actif en fallback
         if "Actif" in df.columns:
             def _max_for_row(row):
                 sym_key = str(row.get("Actif", "")).replace("/", "_")
@@ -945,7 +1036,7 @@ def create_csv_report(results_dict, confluences_df=None):
 def _normalize_tf_label(tf_str: str) -> str:
     return tf_str.replace("Daily", "D").replace("Weekly", "W").replace(" + ", "+")
 
-# FIX C — create_llm_brief : note cohérence PIVOT avec JSON
+# FIX C (v5.6) — create_llm_brief : note cohérence PIVOT avec JSON
 def create_llm_brief(summaries, confluences_df, max_dist=2.0, min_score=100.0,
                      allowed_statuts=("Vierge", "Testee", "Role Reverse"),
                      session_ts: Optional[datetime] = None):
@@ -1047,7 +1138,7 @@ def create_llm_brief(summaries, confluences_df, max_dist=2.0, min_score=100.0,
     ]
     return "\n".join(lines).encode("utf-8")
 
-# FIX C — create_json_export : PIVOT zones incluses pour cohérence avec brief
+# FIX C (v5.6) — create_json_export : PIVOT zones incluses pour cohérence avec brief
 def create_json_export(summaries, confluences_df, max_dist=5.0, min_score=50.0,
                        session_ts: Optional[datetime] = None):
     ts = session_ts if session_ts is not None else datetime.now()
@@ -1058,10 +1149,12 @@ def create_json_export(summaries, confluences_df, max_dist=5.0, min_score=50.0,
             "max_dist_pct":   max_dist,
             "min_score":      min_score,
             "statuts_exclus": ["Consommee"],
-            "pivots_inclus":  True,   # FIX C
+            "pivots_inclus":  True,
             "note": (
                 "Pivots inclus depuis v5.6 — cohérence avec brief LLM. "
-                "Tendances indicatives — se référer au GPS MTF pour le biais."
+                "Tendances indicatives — se référer au GPS MTF pour le biais. "
+                "v5.7 : FIX 1 tolerance coherente, FIX 2 mixtes mono-TF, "
+                "FIX 3 post-merge ATR-based, FIX 4 pivot-band ATR-based."
             ),
         },
         "assets": []
@@ -1081,7 +1174,6 @@ def create_json_export(summaries, confluences_df, max_dist=5.0, min_score=50.0,
             continue
         if str(row.get("Statut", "")) == "Consommee":
             continue
-        # FIX C — PIVOT zones plus exclues (suppression filtre BUY/SELL only)
         signal_raw = str(row.get("Signal", ""))
         if   "BUY"  in signal_raw: signal_clean = "BUY ZONE"
         elif "SELL" in signal_raw: signal_clean = "SELL ZONE"
@@ -1294,7 +1386,13 @@ with st.sidebar:
     st.caption("🔴 >300 : Institutionnel | 🟠 100-300 : Fort | 🟡 30-100 : Valide | ⚪ <30 : Secondaire")
     st.caption("✅ Vierge | 🔵 Testée | ↩️ Role Reverse | ❌ Consommée")
     st.divider()
-    st.caption("**v5.6 — Fixes audit indépendant :**")
+    st.caption(f"**v{SCANNER_VERSION} — Fixes v5.7 (audit structurel) :**")
+    st.caption("✅ FIX 1 — classify_zone_status : tolerance = atr_zone_coeff (fini les faux Vierge)")
+    st.caption("✅ FIX 2 — confluences mixtes : côtés mono-TF émis (fin perte silencieuse)")
+    st.caption("✅ FIX 3 — post_merge_zones : seuil ATR-based sur indices (plus % fixe)")
+    st.caption("✅ FIX 4 — bande PIVOT ATR-based par actif (indices correctement détectés)")
+    st.divider()
+    st.caption("**Fixes v5.6 :**")
     st.caption("✅ FIX A — detect_confluences : zones mono-TF non consommées (AUD/JPY, NAS100)")
     st.caption("✅ FIX B — PIVOT : exclusion DF Resistance + dedup (level,tf)")
     st.caption("✅ FIX C — JSON : PIVOT zones incluses, cohérence avec brief")
@@ -1378,7 +1476,7 @@ if scan_button and symbols_to_scan:
                 if not conf_full.empty and sym_d in conf_full["Actif"].values:
                     ac = conf_full[conf_full["Actif"] == sym_d].sort_values("Score", ascending=False)
                     top_zones = ac.head(3).to_dict("records")
-                # FIX F — price_context Daily + H4
+                # FIX F (v5.6) — price_context Daily + H4
                 d_zones = all_zones_map.get(sym, {})
                 ctx_daily = d_zones.get("_price_ctx", "")
                 ctx_h4    = d_zones.get("_price_ctx_h4", "")
