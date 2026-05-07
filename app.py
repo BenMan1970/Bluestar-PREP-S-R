@@ -611,13 +611,20 @@ def find_strong_sr_zones(df, current_price, symbol=None, atr_val=None,
 #   → Le sous-groupe mono-TF d'un groupe mixte est émis avec son score réel
 #   → Note : le Score reflète fidèlement le nb réel de TF du sous-groupe
 # ──────────────────────────────────────────────────────────────────
-def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1.0):
+def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1.0,
+                       atr_map=None):
     """
     FIX A (v5.6) — used_indices.update() déplacé APRÈS le check len(timeframes) >= 2
     FIX B (v5.6) — dédoublonnage par (level arrondi, tf) avant traitement
     FIX 2 (v5.7) — sous-groupes mixtes : suppression du filtre len(sub_tfs) < 2
                    Les côtés mono-TF d'un groupe mixte multi-TF sont désormais émis.
+    FIX 5 (v5.7) — is_pivot ATR-based (cohérent avec FIX 4 de find_strong_sr_zones)
+                   Priorité H4 ATR > Daily ATR > Weekly ATR > fallback 0.50% fixe.
     """
+    # FIX 5 — ATR de référence : H4 en priorité (plus précis), puis repli sur les TF supérieurs
+    _ref_atr = None
+    if atr_map:
+        _ref_atr = atr_map.get("h4") or atr_map.get("daily") or atr_map.get("weekly")
     if not zones_dict or current_price is None:
         return []
     all_zones = []
@@ -692,7 +699,13 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     sub_strength = int(subgroup["strength"].sum())
                     sub_status   = min(subgroup["status"].tolist(),
                                        key=lambda s: STATUS_PRIORITY.get(s, 1))
-                    is_pivot = sub_dist <= 0.50
+                    # FIX 5 — pivot band ATR-based, cohérent avec FIX 4
+                    # Avant : is_pivot = sub_dist <= 0.50 (% fixe → trop large sur Forex, trop étroit sur indices)
+                    # Après : utilise PIVOT_BAND_ATR_COEFF × ATR H4 si disponible, sinon 0.50% fallback
+                    if _ref_atr and _ref_atr > 0 and current_price > 0:
+                        is_pivot = abs(sub_avg - current_price) <= _ref_atr * PIVOT_BAND_ATR_COEFF
+                    else:
+                        is_pivot = sub_dist <= 0.50
                     if is_pivot:
                         sub_type, sub_signal = "Pivot", "↔ PIVOT ZONE"
                     elif forced_type:
@@ -795,6 +808,8 @@ def scan_single_symbol(args) -> ScanResult:
             post_merge_threshold=merge_thresh,
         )
         zones_d[tf_cap] = (supports, resistances)
+        # FIX 5 — stockage ATR par TF pour detect_confluences (pivot band cohérent)
+        zones_d[f"_atr_{tf_key}"] = atr_val
         if not supports.empty:
             all_sup_levels.extend(supports["level"].tolist())
         # FIX F (v5.6) — price_context sur Daily ET H4
@@ -1390,7 +1405,8 @@ with st.sidebar:
     st.caption("✅ FIX 1 — classify_zone_status : tolerance = atr_zone_coeff (fini les faux Vierge)")
     st.caption("✅ FIX 2 — confluences mixtes : côtés mono-TF émis (fin perte silencieuse)")
     st.caption("✅ FIX 3 — post_merge_zones : seuil ATR-based sur indices (plus % fixe)")
-    st.caption("✅ FIX 4 — bande PIVOT ATR-based par actif (indices correctement détectés)")
+    st.caption("✅ FIX 4 — bande PIVOT ATR-based par actif dans find_strong_sr_zones")
+    st.caption("✅ FIX 5 — is_pivot ATR-based dans detect_confluences (cohérence FIX 4)")
     st.divider()
     st.caption("**Fixes v5.6 :**")
     st.caption("✅ FIX A — detect_confluences : zones mono-TF non consommées (AUD/JPY, NAS100)")
@@ -1457,11 +1473,15 @@ if scan_button and symbols_to_scan:
                 if sym.replace("_", "/") in scan_errors:
                     continue
                 cp          = prices_map.get(sym)
-                zones_clean = {k: v for k, v in all_zones_map.get(sym, {}).items()
-                               if not k.startswith("_")}
+                sym_raw     = all_zones_map.get(sym, {})
+                zones_clean = {k: v for k, v in sym_raw.items() if not k.startswith("_")}
+                # FIX 5 — extraction de l'atr_map (h4/daily/weekly) pour pivot band cohérent
+                atr_map     = {k.replace("_atr_", ""): v for k, v in sym_raw.items()
+                               if k.startswith("_atr_") and v is not None}
                 sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, confluence_threshold)
                 all_confluences.extend(detect_confluences(sym.replace("_", "/"),
-                                                           zones_clean, cp, sym_threshold))
+                                                           zones_clean, cp, sym_threshold,
+                                                           atr_map=atr_map))
 
             conf_full = pd.DataFrame(all_confluences)
             if not conf_full.empty:
