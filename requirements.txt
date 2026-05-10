@@ -4,3 +4,4 @@ requests
 scipy
 numpy
 fpdf2
+matplotlib
