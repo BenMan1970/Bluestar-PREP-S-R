@@ -5,3 +5,4 @@ scipy
 numpy
 fpdf2
 matplotlib
+oandapyV20
