@@ -1,8 +1,8 @@
 streamlit
 pandas
-requests
-scipy
 numpy
-fpdf2
 matplotlib
 oandapyV20
+reportlab
+scipy
+fpdf2
