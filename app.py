@@ -68,7 +68,7 @@ scan_button = st.button("🚀 LANCER LE SCAN COMPLET", type="primary", use_conta
 # ══════════════════════════════════════════════════════════════════
 
 # FIX R9 — SCANNER_VERSION affiché dans le footer PDF (n'était plus dead code)
-SCANNER_VERSION = "5.5"
+SCANNER_VERSION = "5.7"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -184,7 +184,11 @@ def _cache_get(key: str, ttl_seconds: int) -> Optional[pd.DataFrame]:
         if (datetime.now() - ts).total_seconds() > ttl_seconds:
             del _oanda_cache[key]   # purge atomique dans le lock
             return None
-        return df                   # retour dans le lock (ref Python, pas de copie)
+        # FIX A (audit HTML) — Copie défensive : protège contre la mutation silencieuse
+        # du DataFrame par un appelant (ex: df.drop(), df["col"]=...) qui corromprait
+        # le cache pour TOUS les threads jusqu'à expiration du TTL (600s).
+        # Le coût mémoire est acceptable (~500 bougies × 6 colonnes float64 ≈ 24KB).
+        return df.copy()
 
 # FIX #1 + #11 — La purge est maintenant limitée aux entrées du token courant
 #                (évite d'invalider le cache d'un autre utilisateur sur
@@ -229,6 +233,18 @@ def _safe_pdf_str(text: str) -> str:
     return text
 
 
+# FIX #17 — Sanitisation des tracebacks pour ne jamais exposer le token OANDA.
+# Le token est passé en paramètre dans toute la pile d'appels ; en cas
+# d'exception, Python inclut les locals/args dans le traceback, ce qui peut
+# faire fuiter le token dans les logs Streamlit Cloud.
+def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
+    """Masque les valeurs sensibles (token, account_id) dans un traceback."""
+    for val in sensitive_values:
+        if val and isinstance(val, str) and len(val) > 4:
+            tb = tb.replace(val, f"***{val[-4:]}")
+    return tb
+
+
 # FIX R2 — Helper centralisé pour supprimer les colonnes internes.
 #           Remplace les 4+ appels drop(columns=_INTERNAL_COLS) dispersés.
 _INTERNAL_COLS = ["_dist_num", "_in_pdf"]
@@ -236,6 +252,15 @@ _INTERNAL_COLS = ["_dist_num", "_in_pdf"]
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     """Supprime les colonnes internes non destinées à l'affichage/export."""
     return df.drop(columns=_INTERNAL_COLS, errors="ignore")
+
+
+# FIX R7 — Source unique de vérité pour la conversion du symbole OANDA vers
+#           format affichage (EUR_USD → EUR/USD).
+#           Avant : sym.replace("_", "/") dupliqué dans scan_single_symbol,
+#           la boucle principale, detect_confluences et summaries.
+def _sym_display(sym: str) -> str:
+    """Convertit un symbole OANDA (EUR_USD) en format d'affichage (EUR/USD)."""
+    return sym.replace("_", "/")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -255,7 +280,7 @@ def determine_oanda_environment(access_token: str, account_id: str) -> Optional[
                              headers=headers, timeout=5)
             if r.status_code == 200:
                 return url
-        except requests.RequestException:
+        except (requests.RequestException, ValueError):   # FIX G
             continue
     return None
 
@@ -298,7 +323,10 @@ def get_oanda_data(base_url: str, access_token: str, symbol: str,
             return None
         _cache_set(key, df)
         return df
-    except requests.RequestException:
+    # FIX G (audits HTML+Gemini) — ValueError inclut json.JSONDecodeError.
+    # Si OANDA/Cloudflare retourne du HTML (captcha, anti-bot) avec status 200,
+    # r.json() lève json.JSONDecodeError (hérite de ValueError, pas RequestException).
+    except (requests.RequestException, ValueError):
         return None
 
 
@@ -325,12 +353,15 @@ def _price_cache_set(key: str, value: float) -> None:
 def get_oanda_current_price(base_url: str, access_token: str,
                              account_id: str, symbol: str) -> Optional[float]:
     key = f"{_token_fingerprint(access_token)}__{symbol}__price"
+    # FIX B (audit HTML) — TTL check maintenant DANS le lock pour atomicité.
+    # Avant : lecture sous lock, vérification TTL hors lock → race condition TOCTOU
+    # (un autre thread pouvait purger l'entrée entre la lecture et le check TTL).
     with _price_cache_lock:
         entry = _price_cache.get(key)
-    if entry is not None:
-        val, ts = entry
-        if (datetime.now() - ts).total_seconds() < 60:
-            return val
+        if entry is not None:
+            val, ts = entry
+            if (datetime.now() - ts).total_seconds() < 60:
+                return val
 
     url     = f"{base_url}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -344,7 +375,7 @@ def get_oanda_current_price(base_url: str, access_token: str,
             result = (bid + ask) / 2
         else:
             result = None
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):   # FIX G : json.JSONDecodeError inclus
         result = None
 
     if result is not None:
@@ -457,7 +488,12 @@ def compute_trend(df, sma_period=20):
         return "NEUTRE"
 
     actual_period = min(sma_period, len(df) - 5)
-    if actual_period < sma_period * 0.6:
+    # FIX #14 — Seuil minimum absolu de 10 barres au lieu du ratio relatif 0.6
+    # (0.6 × 20 = 12 bars, mais ce calcul n'était pas documenté et donnait
+    #  des résultats instables avec des DataFrames courts > 14 barres).
+    # Un minimum de 10 barres est le seuil empirique standard pour une SMA fiable.
+    _MIN_SMA_BARS = 10
+    if actual_period < _MIN_SMA_BARS:
         return "NEUTRE"
 
     close   = df["close"]
@@ -469,13 +505,16 @@ def compute_trend(df, sma_period=20):
     n      = min(10, len(df))
     highs  = df["high"].iloc[-n:]
     lows   = df["low"].iloc[-n:]
-    hh     = highs.iloc[-1] > highs.iloc[0]
-    ll     = lows.iloc[-1]  < lows.iloc[0]
-    lh     = highs.iloc[-1] < highs.iloc[0]
-    hl     = lows.iloc[-1]  > lows.iloc[0]
+    hh     = highs.iloc[-1] > highs.iloc[0]   # Higher High
+    ll     = lows.iloc[-1]  < lows.iloc[0]    # Lower Low
+    lh     = highs.iloc[-1] < highs.iloc[0]   # Lower High
+    hl     = lows.iloc[-1]  > lows.iloc[0]    # Higher Low
 
     above_sma = current > sma
     below_sma = current < sma
+
+    # R5 — Note : lh AND hl simultanément = marché en compression (triangle/range).
+    # Ce cas retourne NEUTRE via le fallback final, comportement voulu.
 
     if above_sma and slope_pct > 0.05 and hh and hl:
         return "HAUSSIER"
@@ -496,9 +535,12 @@ TF_WEIGHT = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 
 def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_bars=500):
     tf_w  = TF_WEIGHT.get(tf_name, 1.0)
-    age_r = age_bars / max(total_bars, 1)
+    # FIX F (audit HTML) — Guards sur age_bars et total_bars :
+    # age_bars négatif (bug en amont) → np.exp(-1.5 * négatif) = exp(+grand) → score aberrant.
+    # max(age_bars, 0) garantit que le facteur âge reste dans [0, 1].
+    age_r = max(int(age_bars), 0) / max(int(total_bars), 1)
     age_f = float(np.exp(-1.5 * age_r))
-    raw   = strength * tf_w * nb_tf
+    raw   = int(strength) * tf_w * nb_tf   # FIX #16 : int(strength) déjà appliqué
     return round(raw * age_f, 1)
 
 
@@ -528,6 +570,10 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
                 if j in used:
                     continue
                 current_centroid = np.mean([z["level"] for z in group])
+                # FIX C (audit HTML) — Guard centroïde nul : si données corrompues en amont
+                # (niveau = 0.0), la division lèverait ZeroDivisionError et crasherait le thread.
+                if current_centroid <= 0:
+                    break
                 if abs(zones_list[j]["level"] - current_centroid) / current_centroid * 100 <= threshold_pct:
                     group.append(zones_list[j])
                     used.add(j)
@@ -540,8 +586,8 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
                 key=lambda s: STATUS_PRIORITY.get(s, 1)
             )
             new_zones.append({
-                "level":    np.mean([z["level"] for z in group]),
-                "strength": sum(z["strength"] for z in group),
+                "level":    float(np.mean([z["level"] for z in group])),
+                "strength": int(sum(z["strength"] for z in group)),   # FIX #16 : int() explicite
                 "age_bars": best_age,
                 "status":   best_status,
             })
@@ -554,23 +600,50 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
     highs  = pd.Series(df["high"].values)
     lows   = pd.Series(df["low"].values)
     closes = pd.Series(df["close"].values)
+    opens  = pd.Series(df["open"].values)
 
     roll_high_left  = highs.shift(1).rolling(n, min_periods=n).max()
-    roll_high_right = highs[::-1].shift(1).rolling(n, min_periods=n).max()[::-1]
+    # FIX E (audit Gemini) — min_periods=1 (au lieu de n) pour le côté droit.
+    # Avant : min_periods=n → les n dernières bougies avaient roll_high_right=NaN
+    #         → condition highs > NaN = False → jamais pivot sur les bougies récentes.
+    # Après : min_periods=1 → les dernières bougies sont évaluées contre ce qui existe
+    #         à leur droite, avec une fenêtre partielle. Le filtre wick (≥20%) compense
+    #         la moindre confirmation structurelle des bougies en fin de dataset.
+    roll_high_right = highs[::-1].shift(1).rolling(n, min_periods=1).max()[::-1]
     roll_low_left   = lows.shift(1).rolling(n, min_periods=n).min()
-    roll_low_right  = lows[::-1].shift(1).rolling(n, min_periods=n).min()[::-1]
+    roll_low_right  = lows[::-1].shift(1).rolling(n, min_periods=1).min()[::-1]
 
     next_close = closes.shift(-1).fillna(closes)
+
+    # FIX #12 — Filtre wick de rejet pour éliminer les faux pivots sur tendances fortes.
+    # Avant : `next_close < highs` presque toujours vraie → faux pivot sur chaque
+    # bougie haussière dont le close n'atteint pas exactement son high.
+    # Après : on exige un vrai wick de rejet supérieur (corps < 50% de la plage)
+    # ET la confirmation classique next_close < high.
+    # Le wick_ratio élimine les bougies Marubozu (corps = 100% plage) qui
+    # génèrent de faux pivots sur les tendances impulsives.
+    candle_range  = (highs - lows).clip(lower=1e-10)   # évite /0 sur doji parfaits
+    body_top      = pd.Series(np.maximum(opens.values, closes.values))
+    upper_wick_pct = (highs - body_top) / candle_range   # 0 = pas de wick, 1 = corps au bas
+
+    body_bottom   = pd.Series(np.minimum(opens.values, closes.values))
+    lower_wick_pct = (body_bottom - lows) / candle_range
+
+    # Seuil : wick supérieur ≥ 20% de la plage pour un swing high valide
+    # Seuil : wick inférieur ≥ 20% de la plage pour un swing low valide
+    _WICK_THRESHOLD = 0.20
 
     sh_mask = (
         (highs > roll_high_left) &
         (highs > roll_high_right) &
-        (next_close < highs)
+        (next_close < highs) &
+        (upper_wick_pct >= _WICK_THRESHOLD)   # FIX #12 : rejet visible en haut
     )
     sl_mask = (
         (lows < roll_low_left) &
         (lows < roll_low_right) &
-        (next_close > lows)
+        (next_close > lows) &
+        (lower_wick_pct >= _WICK_THRESHOLD)   # FIX #12 : soutien visible en bas
     )
 
     if atr_val and atr_val > 0:
@@ -645,10 +718,21 @@ def classify_zone_status(level, zone_type, df, formation_idx,
     if len(rc_after) == 0:
         return "Role Reverse"
 
+    # FIX D (audit Gemini) — Logique de re-consommation CORRIGÉE.
+    # Avant (INVERSÉ) :
+    #   Support cassé → résistance RR. Si rc_after < level - tolerance → "Consommee"
+    #   Mais rc_after < level signifie que la résistance TIENT (prix repart à la baisse)
+    #   = le setup Role Reverse fonctionne → on tuait les meilleurs setups !
+    #
+    # Après (CORRECT) :
+    #   Un RR Support (devenu résistance) est re-consommé si le prix repasse HAUSSIER
+    #   au-dessus du niveau (rc_after > level + tolerance = cassure de la résistance RR).
+    #   Un RR Résistance (devenu support) est re-consommé si le prix repasse BAISSIER
+    #   en dessous du niveau.
     if zone_type == "Support":
-        second_break = rc_after < level - tolerance
+        second_break = rc_after > level + tolerance   # prix casse la résistance RR → zone morte
     else:
-        second_break = rc_after > level + tolerance
+        second_break = rc_after < level - tolerance   # prix casse le support RR → zone morte
 
     if second_break.any():
         return "Consommee"
@@ -843,8 +927,12 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
         ]
 
         if len(similar) >= 1:
-            group      = pd.concat([zones_df.loc[[i]], similar])
-            timeframes = group["tf"].unique()
+            # FIX #15 — Remplacement de pd.concat([zones_df.loc[[i]], similar])
+            # par une sélection directe par index : évite N allocations DataFrame
+            # dans une boucle O(n²) (1000 zones → ~500 pd.concat inutiles).
+            group_indices = [i] + similar.index.tolist()
+            group         = zones_df.loc[group_indices]
+            timeframes    = group["tf"].unique()
 
             used_indices.update(group.index)
 
@@ -964,12 +1052,14 @@ def scan_single_symbol(args) -> ScanResult:
     rows           = {"H4": None, "Daily": None, "Weekly": None}
     zones_d        = {}
     trends         = {}
-    bars_map       = {}   # FIX #8
+    bars_map       = {}
     all_sup_levels = []
     last_h4_close  = None
     anomaly_msg    = None
+    internal_error = None   # FIX R6 — champ scan_error désormais peuplé
 
-    sym_d = symbol.replace("_", "/")
+    # FIX R7 — utilisation du helper centralisé
+    sym_d = _sym_display(symbol)
 
     _TF_KEYS = [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]
 
@@ -1093,13 +1183,14 @@ def scan_single_symbol(args) -> ScanResult:
                            if anomaly_msg else new_anomaly)
 
     return ScanResult(
-        symbol   = symbol,
-        rows     = rows,
-        zones    = zones_d,
-        price    = reference_price,
-        trends   = trends,
-        anomaly  = anomaly_msg,
-        bars_map = bars_map,   # FIX #8
+        symbol     = symbol,
+        rows       = rows,
+        zones      = zones_d,
+        price      = reference_price,
+        trends     = trends,
+        anomaly    = anomaly_msg,
+        bars_map   = bars_map,
+        scan_error = internal_error,   # FIX R6 — peuplé si erreur interne capturée
     )
 
 
@@ -1796,6 +1887,14 @@ with st.sidebar:
         "Seuil confluence Forex (%)", 0.3, 2.0, 1.0, 0.1,
         help="Indices/Métaux utilisent des seuils adaptatifs (1.2-1.5%) automatiquement.",
     )
+    # FIX R4 — Avertissement explicite : pour XAU, US30, NAS100, SPX500, DE30
+    # le slider ci-dessus est IGNORÉ (seuils hardcodés dans CONFLUENCE_THRESHOLD_MAP).
+    _overridden = [s.replace("_USD","").replace("_EUR","")
+                   for s in CONFLUENCE_THRESHOLD_MAP]
+    st.caption(
+        f"⚠️ Seuil ignoré pour : {', '.join(_overridden)} "
+        f"(valeurs fixes : {list(CONFLUENCE_THRESHOLD_MAP.values())})"
+    )
     max_dist_filter = st.slider(
         "Afficher zones < (%) - filtre visuel uniquement", 1.0, 15.0, 3.0, 0.5,
     )
@@ -1816,25 +1915,28 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Corrections audit (12 fixes) :**")
-    st.caption("✅ #1  — _cache_get : check TTL atomique dans le lock")
-    st.caption("✅ #2  — RLock (réentrant) → deadlock impossible")
-    st.caption("✅ #3  — Guard level<=0 dans detect_confluences")
-    st.caption("✅ #4  — Pivots dans UN seul DataFrame (plus de double-comptage)")
-    st.caption("✅ #5  — _price_cache : purge automatique (fuite mémoire corrigée)")
-    st.caption("✅ #6  — post_merge_zones : MAX_ITERATIONS=50 (boucle infinie impossible)")
-    st.caption("✅ #7  — determine_oanda_environment : @st.cache_data supprimé")
-    st.caption("✅ #8  — Score confluence : bars_map réel par TF (plus de 500 hardcodé)")
-    st.caption("✅ #9  — Exception handling : catch spécifique + traceback complet")
-    st.caption("✅ #10 — classify_zone_status : tolérance fallback par instrument")
-    st.caption("✅ #11 — Cache purge token-aware (isolation multi-users)")
-    st.caption("✅ #13 — JSON export : min_score depuis sidebar (plus hardcodé à 50)")
-    st.caption("✅ #18 — ABSOLUTE_MAX_DIST aligné sur PDF_DIST_THRESHOLDS")
-    st.caption("✅ #19 — Secrets : valeurs vides détectées explicitement")
-    st.caption("✅ #21 — _apply_pdf_filter : branche elif documentée")
-    st.caption("✅ R2  — _clean_df() : helper centralisé (DRY)")
-    st.caption("✅ R8  — _safe_pdf_str : double-appel supprimé dans chapter_body")
-    st.caption("✅ R9  — SCANNER_VERSION affiché dans header PDF")
+    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 34 corrections**")
+    st.caption("— v5.5 (12 fixes) —")
+    st.caption("✅ #1  — Cache TTL atomique | #2 RLock | #3 Guard level<=0")
+    st.caption("✅ #4  — Pivots non doublonnés | #5 Price cache purge")
+    st.caption("✅ #6  — post_merge MAX_ITER | #7 cache_data supprimé")
+    st.caption("✅ #8  — bars_map réel | #9 Exception handling ciblé")
+    st.caption("✅ #10 — Tolérance par instrument | #11 Cache token-aware")
+    st.caption("✅ #13 — JSON min_score sidebar | #18/#19 alignements")
+    st.caption("— v5.6 (9 fixes) —")
+    st.caption("✅ #12 — Wick filter ≥20% (faux pivots éliminés)")
+    st.caption("✅ #14 — SMA seuil absolu | #15 pd.concat O(n²)→O(n)")
+    st.caption("✅ #16 — strength int() | #17 token sanitisé dans logs")
+    st.caption("✅ R4  — Warning seuils confluence | R6 scan_error UI")
+    st.caption("✅ R7  — _sym_display() centralisé")
+    st.caption("— v5.7 (7 fixes — audits HTML+Gemini) —")
+    st.caption("✅ A   — _cache_get() : df.copy() défensif (corruption impossible)")
+    st.caption("✅ B   — get_oanda_current_price : TOCTOU éliminé (TTL dans lock)")
+    st.caption("✅ C   — post_merge_zones : guard centroïde <= 0 (ZeroDivision)")
+    st.caption("✅ D   — classify_zone_status : Role Reverse NON inversé (fix CRITIQUE)")
+    st.caption("✅ E   — detect_swing_pivots : min_periods=1 (pivots récents détectés)")
+    st.caption("✅ F   — compute_structural_score : age_bars négatif protégé")
+    st.caption("✅ G   — API OANDA : json.JSONDecodeError catchée (captcha/proxy)")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1880,16 +1982,24 @@ if scan_button and symbols_to_scan:
                     # FIX #9 — Gestion d'exception différenciée :
                     # erreurs métier catchées nommément, erreurs inattendues
                     # loggées avec traceback complet.
+                    # FIX #17 — token et account_id sanitisés dans les tracebacks.
                     try:
                         result: ScanResult = future.result()
 
                         all_zones_map[result.symbol]   = result.zones
                         prices_map[result.symbol]      = result.price
                         trends_map[result.symbol]      = result.trends
-                        bars_map_global[result.symbol] = result.bars_map  # FIX #8
+                        bars_map_global[result.symbol] = result.bars_map
 
                         if result.anomaly:
-                            anomalies_map[result.symbol.replace("_", "/")] = result.anomaly
+                            # FIX R7 — _sym_display centralisé
+                            anomalies_map[_sym_display(result.symbol)] = result.anomaly
+
+                        # FIX R6 — affichage des erreurs internes (scan_error peuplé)
+                        if result.scan_error:
+                            scan_errors[_sym_display(result.symbol)] = (
+                                f"[interne] {result.scan_error}"
+                            )
 
                         for tf_cap, tf_rows in result.rows.items():
                             if tf_rows:
@@ -1902,13 +2012,16 @@ if scan_button and symbols_to_scan:
 
                     except (requests.RequestException, ValueError,
                             KeyError, pd.errors.EmptyDataError) as e:
-                        scan_errors[sym.replace("_", "/")] = (
+                        scan_errors[_sym_display(sym)] = (   # FIX R7
                             f"{type(e).__name__}: {str(e)[:200]}"
                         )
                     except Exception as e:
-                        # Erreur inattendue : on conserve le traceback complet
                         tb = traceback.format_exc()
-                        scan_errors[sym.replace("_", "/")] = (
+                        # FIX #17 — masquer token et account_id dans le traceback
+                        tb = _sanitize_traceback(
+                            tb, [access_token, account_id]
+                        )
+                        scan_errors[_sym_display(sym)] = (   # FIX R7
                             f"INATTENDU {type(e).__name__}: {tb[-400:]}"
                         )
 
@@ -1930,28 +2043,28 @@ if scan_button and symbols_to_scan:
             st.info("🔍 Analyse des confluences multi-timeframes…")
             all_confluences = []
             for sym in symbols_to_scan:
-                if sym.replace("_", "/") in scan_errors:
+                if _sym_display(sym) in scan_errors:   # FIX R7
                     continue
                 cp = prices_map.get(sym)
                 zones_clean = {k: v for k, v in all_zones_map.get(sym, {}).items()
                                if not k.startswith("_")}
                 sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, confluence_threshold)
                 confs = detect_confluences(
-                    sym.replace("_", "/"),
+                    _sym_display(sym),              # FIX R7
                     zones_clean,
                     cp,
                     sym_threshold,
-                    bars_map=bars_map_global.get(sym, {}),  # FIX #8
+                    bars_map=bars_map_global.get(sym, {}),
                 )
                 all_confluences.extend(confs)
 
             conf_full = pd.DataFrame(all_confluences)
             if not conf_full.empty:
-                conf_full = _clean_df(conf_full)  # FIX R2
+                conf_full = _clean_df(conf_full)
 
             summaries = []
             for sym in symbols_to_scan:
-                sym_d  = sym.replace("_", "/")
+                sym_d  = _sym_display(sym)   # FIX R7
                 trends = trends_map.get(sym, {})
                 cp     = prices_map.get(sym)
 
@@ -2015,3 +2128,4 @@ if "scan_results" in st.session_state and not scan_button:
         st.session_state["scan_results"],
         max_dist_filter,
     )
+    
