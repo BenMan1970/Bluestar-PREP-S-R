@@ -2128,4 +2128,3 @@ if "scan_results" in st.session_state and not scan_button:
         st.session_state["scan_results"],
         max_dist_filter,
     )
-    
