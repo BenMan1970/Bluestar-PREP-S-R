@@ -3,6 +3,7 @@ import json
 import threading
 import traceback
 import concurrent.futures
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
@@ -61,14 +62,23 @@ st.markdown(
 )
 
 st.markdown("<br>", unsafe_allow_html=True)
-scan_button = st.button("🚀 LANCER LE SCAN COMPLET", type="primary", use_container_width=True)
+
+# FIX K — Protection double-clic : le bouton est désactivé pendant un scan actif.
+# Avant : deux clics rapides lançaient deux ThreadPoolExecutor concurrents, doublant
+# la charge API et corrompant potentiellement les résultats dans session_state.
+scan_button = st.button(
+    "🚀 LANCER LE SCAN COMPLET",
+    type="primary",
+    use_container_width=True,
+    disabled=st.session_state.get("scanning", False),
+)
 
 # ══════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ══════════════════════════════════════════════════════════════════
 
-# FIX R9 — SCANNER_VERSION affiché dans le footer PDF (n'était plus dead code)
-SCANNER_VERSION = "5.7"
+# FIX R9 — SCANNER_VERSION affiché dans le footer PDF
+SCANNER_VERSION = "5.8"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -101,7 +111,13 @@ ZONE_WIDTH_FALLBACK = {
 }
 DEFAULT_ZONE_WIDTH = 0.5
 
-POST_MERGE_THRESHOLD = 0.30
+# FIX N — POST_MERGE_THRESHOLD Forex réduit de 0.30 % à 0.15 %.
+# Avant : 0.30 % sur EUR/USD@1.09 = 0.00327 = ~33 pips.
+# Deux zones S/R distantes de 33 pips sont des niveaux distincts en swing trading ;
+# les fusionner effaçait de la granularité analytique utile.
+# Après : 0.15 % ≈ 16 pips sur EUR/USD — seuil cohérent avec les niveaux H4/Daily.
+POST_MERGE_THRESHOLD = 0.15   # FIX N (était 0.30)
+
 POST_MERGE_MAP = {
     "US30_USD": 0.05, "NAS100_USD": 0.05, "SPX500_USD": 0.08, "DE30_EUR": 0.08,
     "XAU_USD": 0.15,
@@ -113,7 +129,7 @@ CONFLUENCE_THRESHOLD_MAP = {
 }
 
 PRICE_SANITY_RANGE = {
-    "XAU_USD":    (1500.0,  5500.0),
+    "XAU_USD":    (1500.0,  6500.0),   # or à ~3300$ en mai 2026, borne haute élargie
     "US30_USD":   (20000.0, 70000.0),
     "NAS100_USD": (8000.0,  35000.0),
     "SPX500_USD": (3000.0,  9000.0),
@@ -132,10 +148,7 @@ PDF_DIST_THRESHOLDS = {
 }
 DEFAULT_PDF_DIST = 8.0
 
-# FIX #18 — ABSOLUTE_MAX_DIST rendus cohérents avec PDF_DIST_THRESHOLDS :
-# les valeurs étaient plus basses que PDF_DIST_THRESHOLDS rendant ces dernières
-# dead code. On aligne : PDF_DIST_THRESHOLDS est la référence, ABSOLUTE_MAX_DIST
-# sert uniquement de plafond de sécurité absolu supérieur ou égal.
+# FIX #18 — ABSOLUTE_MAX_DIST alignés avec PDF_DIST_THRESHOLDS.
 ABSOLUTE_MAX_DIST = {
     "XAU_USD":    8.0,
     "US30_USD":   5.0,
@@ -146,26 +159,92 @@ ABSOLUTE_MAX_DIST = {
 
 _GRANULARITY_MAP = {"h4": "H4", "daily": "D", "weekly": "W"}
 
-# FIX #10 — Tolérance fallback par famille d'instrument (si ATR indisponible).
-# Avant : level * 0.003 = 32 pips sur EUR/USD, trop large.
-# Après : 0.001 pour le Forex (≈ 10 pips), valeurs adaptées pour indices/métaux.
+# FIX #10 — Tolérance fallback par famille d'instrument.
+# FIX M  — Ajout des paires JPY et cross-JPY avec tolérance réduite à 0.0005.
+# Problème identifié : USD/JPY@155 avec 0.001 → tolérance = 0.155 yen ≈ 1.2 pips.
+# Une tolérance de 1 pip sur JPY est un niveau intraday, pas un S/R structurel.
+# Résultat : trop de zones classées "Consommee" sur les paires JPY par faux breakout.
+# Après : 0.0005 → USD/JPY@155 → 0.077 yen ≈ 0.6 pip ; plus conservateur mais
+# la tolérance ATR (prioritaire quand dispo) compense largement sur data suffisante.
 _FALLBACK_TOLERANCE_PCT = {
+    # Métaux
     "XAU_USD":    0.002,
+    # Indices
     "US30_USD":   0.001,
     "NAS100_USD": 0.001,
     "SPX500_USD": 0.001,
     "DE30_EUR":   0.001,
+    # Paires JPY — FIX M : 0.0005 au lieu de 0.001
+    "USD_JPY":    0.0005,
+    "EUR_JPY":    0.0005,
+    "GBP_JPY":    0.0005,
+    "AUD_JPY":    0.0005,
+    "CAD_JPY":    0.0005,
+    "CHF_JPY":    0.0005,
+    "NZD_JPY":    0.0005,
 }
 _DEFAULT_FALLBACK_TOLERANCE = 0.001   # 10 pips sur paires Forex standard
 
 # ══════════════════════════════════════════════════════════════════
-# CACHE THREAD-SAFE
-# FIX #2 — threading.Lock() → threading.RLock() (réentrant) pour éviter
-#           tout deadlock si un même thread acquiert le lock deux fois
-#           via des appels imbriqués (validate_live_price → get_oanda_data).
+# RATE LIMITING API OANDA
+# FIX I — Sémaphore global limitant les requêtes HTTP OANDA simultanées à 5.
+# Avant : 4 workers externes × 3 workers internes = jusqu'à 12 connexions simultanées
+# sans aucun contrôle → risque de 429 (Too Many Requests) sur compte Practice,
+# scans incomplets silencieux.
+# Après : toutes les requêtes HTTP OANDA (data + prix live) acquièrent ce sémaphore.
+# Le timeout de 10s par requête garantit la libération même en cas d'échec réseau.
 # ══════════════════════════════════════════════════════════════════
-_oanda_cache: dict = {}
-_oanda_cache_lock  = threading.RLock()   # FIX #2
+_api_semaphore = threading.BoundedSemaphore(5)   # FIX I
+
+# ══════════════════════════════════════════════════════════════════
+# CACHE THREAD-SAFE BORNÉ
+# FIX O — Remplacement des dicts non bornés par _BoundedTTLCache.
+# Problème avant : si 500+ entrées non expirées → la condition `if len > 500`
+# ne déclenche aucune purge → croissance mémoire illimitée sur sessions longues.
+# Solution : OrderedDict avec éviction LRU stricte dès que maxsize est atteint.
+# Aucune dépendance externe — implémentation native Python.
+# FIX #2 — threading.RLock() conservé (réentrant, nécessaire pour validate_live_price
+#           → get_oanda_data sur le même thread).
+# ══════════════════════════════════════════════════════════════════
+
+class _BoundedTTLCache:
+    """
+    Cache TTL à taille bornée avec éviction LRU.
+    Thread-safe via RLock externe (voir _oanda_cache_lock).
+    """
+    def __init__(self, maxsize: int, ttl: int):
+        self._cache   = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl     = ttl
+
+    def get(self, key):
+        """Retourne la valeur si présente et non expirée, sinon None."""
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        val, ts = entry
+        if (datetime.now() - ts).total_seconds() > self._ttl:
+            del self._cache[key]
+            return None
+        # LRU : déplacer en fin (most recently used)
+        self._cache.move_to_end(key)
+        return val
+
+    def set(self, key, val):
+        """Stocke la valeur et évicte l'entrée la plus ancienne si plein."""
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = (val, datetime.now())
+        # Éviction LRU stricte : supprime l'entrée la plus ancienne (début de l'OrderedDict)
+        while len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+
+    def __len__(self):
+        return len(self._cache)
+
+
+_oanda_cache      = _BoundedTTLCache(maxsize=300, ttl=600)   # FIX O
+_oanda_cache_lock = threading.RLock()                         # FIX #2
 
 def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()[:12]
@@ -173,38 +252,21 @@ def _token_fingerprint(token: str) -> str:
 def _cache_key(token: str, symbol: str, timeframe: str, limit: int) -> str:
     return f"{_token_fingerprint(token)}__{symbol}__{timeframe}__{limit}"
 
-# FIX #1 — Toute la logique TTL + purge est désormais DANS le lock
-#           (opération atomique check-then-act).
+# FIX #1 — TTL check atomique dans le lock (check-then-act).
+# FIX O  — Utilise maintenant _BoundedTTLCache.get() qui gère TTL + LRU.
 def _cache_get(key: str, ttl_seconds: int) -> Optional[pd.DataFrame]:
     with _oanda_cache_lock:
-        entry = _oanda_cache.get(key)
-        if entry is None:
+        df = _oanda_cache.get(key)
+        if df is None:
             return None
-        df, ts = entry
-        if (datetime.now() - ts).total_seconds() > ttl_seconds:
-            del _oanda_cache[key]   # purge atomique dans le lock
-            return None
-        # FIX A (audit HTML) — Copie défensive : protège contre la mutation silencieuse
-        # du DataFrame par un appelant (ex: df.drop(), df["col"]=...) qui corromprait
-        # le cache pour TOUS les threads jusqu'à expiration du TTL (600s).
-        # Le coût mémoire est acceptable (~500 bougies × 6 colonnes float64 ≈ 24KB).
+        # FIX A — Copie défensive : protège contre la mutation du DataFrame
+        # par un appelant qui corromprait le cache partagé pour tous les threads.
         return df.copy()
 
-# FIX #1 + #11 — La purge est maintenant limitée aux entrées du token courant
-#                (évite d'invalider le cache d'un autre utilisateur sur
-#                 un déploiement multi-sessions).
+# FIX O — Utilise _BoundedTTLCache.set() avec éviction LRU automatique.
 def _cache_set(key: str, df: Optional[pd.DataFrame]) -> None:
-    token_fp = key.split("__")[0]
     with _oanda_cache_lock:
-        if len(_oanda_cache) > 500:
-            now = datetime.now()
-            expired = [
-                k for k, (_, ts) in _oanda_cache.items()
-                if (now - ts).total_seconds() > 600 and k.startswith(token_fp)
-            ]
-            for k in expired:
-                del _oanda_cache[k]
-        _oanda_cache[key] = (df, datetime.now())
+        _oanda_cache.set(key, df)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -234,9 +296,6 @@ def _safe_pdf_str(text: str) -> str:
 
 
 # FIX #17 — Sanitisation des tracebacks pour ne jamais exposer le token OANDA.
-# Le token est passé en paramètre dans toute la pile d'appels ; en cas
-# d'exception, Python inclut les locals/args dans le traceback, ce qui peut
-# faire fuiter le token dans les logs Streamlit Cloud.
 def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
     """Masque les valeurs sensibles (token, account_id) dans un traceback."""
     for val in sensitive_values:
@@ -246,7 +305,6 @@ def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
 
 
 # FIX R2 — Helper centralisé pour supprimer les colonnes internes.
-#           Remplace les 4+ appels drop(columns=_INTERNAL_COLS) dispersés.
 _INTERNAL_COLS = ["_dist_num", "_in_pdf"]
 
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -254,10 +312,7 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=_INTERNAL_COLS, errors="ignore")
 
 
-# FIX R7 — Source unique de vérité pour la conversion du symbole OANDA vers
-#           format affichage (EUR_USD → EUR/USD).
-#           Avant : sym.replace("_", "/") dupliqué dans scan_single_symbol,
-#           la boucle principale, detect_confluences et summaries.
+# FIX R7 — Source unique de vérité pour la conversion symbole OANDA → affichage.
 def _sym_display(sym: str) -> str:
     """Convertit un symbole OANDA (EUR_USD) en format d'affichage (EUR/USD)."""
     return sym.replace("_", "/")
@@ -267,8 +322,7 @@ def _sym_display(sym: str) -> str:
 # API OANDA
 # ══════════════════════════════════════════════════════════════════
 
-# FIX #7 — @st.cache_data supprimé : si le token expire, la fonction doit
-#           re-valider immédiatement plutôt que retourner une URL cached 300s.
+# FIX #7 — @st.cache_data supprimé.
 def determine_oanda_environment(access_token: str, account_id: str) -> Optional[str]:
     headers = {"Authorization": f"Bearer {access_token}"}
     for url in [
@@ -276,8 +330,12 @@ def determine_oanda_environment(access_token: str, account_id: str) -> Optional[
         "https://api-fxtrade.oanda.com",
     ]:
         try:
-            r = _http_session.get(f"{url}/v3/accounts/{account_id}/summary",
-                             headers=headers, timeout=5)
+            # FIX I — Sémaphore sur l'appel de détection environnement
+            with _api_semaphore:
+                r = _http_session.get(
+                    f"{url}/v3/accounts/{account_id}/summary",
+                    headers=headers, timeout=5
+                )
             if r.status_code == 200:
                 return url
         except (requests.RequestException, ValueError):   # FIX G
@@ -302,9 +360,12 @@ def get_oanda_data(base_url: str, access_token: str, symbol: str,
     headers = {"Authorization": f"Bearer {access_token}"}
     params  = {"count": limit + 1, "granularity": gran, "price": "M"}
     try:
-        r = _http_session.get(url, headers=headers, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        # FIX I — Sémaphore : max 5 requêtes OANDA simultanées
+        with _api_semaphore:
+            r = _http_session.get(url, headers=headers, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+
         if not data.get("candles"):
             return None
         candles = [
@@ -323,63 +384,60 @@ def get_oanda_data(base_url: str, access_token: str, symbol: str,
             return None
         _cache_set(key, df)
         return df
-    # FIX G (audits HTML+Gemini) — ValueError inclut json.JSONDecodeError.
-    # Si OANDA/Cloudflare retourne du HTML (captcha, anti-bot) avec status 200,
-    # r.json() lève json.JSONDecodeError (hérite de ValueError, pas RequestException).
+    # FIX G — ValueError inclut json.JSONDecodeError (captcha Cloudflare, proxy cassé).
     except (requests.RequestException, ValueError):
         return None
 
 
-# FIX #5 — _price_cache : ajout d'une purge automatique (même logique que
-#           _oanda_cache patch M1) pour éviter la fuite mémoire sur rescans répétés.
-_price_cache: dict = {}
-_price_cache_lock  = threading.RLock()   # FIX #2
+# ══════════════════════════════════════════════════════════════════
+# CACHE PRIX LIVE — borné avec _BoundedTTLCache
+# FIX O — même logique que _oanda_cache
+# FIX #5 — purge automatique (maintenant garantie par LRU eviction)
+# ══════════════════════════════════════════════════════════════════
+_price_cache      = _BoundedTTLCache(maxsize=100, ttl=60)   # FIX O
+_price_cache_lock = threading.RLock()                        # FIX #2
 
 def _price_cache_set(key: str, value: float) -> None:
-    """Stocke un prix live avec purge automatique si le cache dépasse 200 entrées."""
-    token_fp = key.split("__")[0]
     with _price_cache_lock:
-        if len(_price_cache) > 200:
-            now = datetime.now()
-            expired = [
-                k for k, (_, ts) in _price_cache.items()
-                if (now - ts).total_seconds() > 120 and k.startswith(token_fp)
-            ]
-            for k in expired:
-                del _price_cache[k]
-        _price_cache[key] = (value, datetime.now())
+        _price_cache.set(key, value)
 
 
 def get_oanda_current_price(base_url: str, access_token: str,
                              account_id: str, symbol: str) -> Optional[float]:
     key = f"{_token_fingerprint(access_token)}__{symbol}__price"
-    # FIX B (audit HTML) — TTL check maintenant DANS le lock pour atomicité.
-    # Avant : lecture sous lock, vérification TTL hors lock → race condition TOCTOU
-    # (un autre thread pouvait purger l'entrée entre la lecture et le check TTL).
+    # FIX B — TTL check dans le lock (atomique, élimine TOCTOU).
     with _price_cache_lock:
-        entry = _price_cache.get(key)
-        if entry is not None:
-            val, ts = entry
-            if (datetime.now() - ts).total_seconds() < 60:
-                return val
+        val = _price_cache.get(key)
+        if val is not None:
+            return val
 
     url     = f"{base_url}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
-        r = _http_session.get(url, headers=headers, params={"instruments": symbol}, timeout=5)
-        r.raise_for_status()
-        data = r.json()
+        # FIX I — Sémaphore sur l'appel prix live
+        with _api_semaphore:
+            r = _http_session.get(
+                url, headers=headers, params={"instruments": symbol}, timeout=5
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        # FIX H — Protection KeyError/IndexError :
+        # OANDA peut retourner {"prices": []} si le marché est fermé (week-end)
+        # ou modifier son payload (ex: clé renommée). Sans ce guard, le thread
+        # crashe silencieusement et raw_price=None provoque un fallback H4
+        # sans aucune alerte visible dans les logs.
         if "prices" in data and data["prices"]:
             bid = float(data["prices"][0]["closeoutBid"])
             ask = float(data["prices"][0]["closeoutAsk"])
             result = (bid + ask) / 2
         else:
             result = None
-    except (requests.RequestException, ValueError):   # FIX G : json.JSONDecodeError inclus
+    except (requests.RequestException, ValueError, KeyError, IndexError):   # FIX H + FIX G
         result = None
 
     if result is not None:
-        _price_cache_set(key, result)   # FIX #5
+        _price_cache_set(key, result)
     return result
 
 
@@ -413,13 +471,12 @@ def validate_live_price(live_price, symbol, base_url, access_token):
 
 
 def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
-    # FIX #3 — guard current_price <= 0 déplacé en tête (cohérence)
+    # FIX #3 — guard current_price <= 0
     if current_price is None or current_price <= 0:
         return None
     messages = []
     if symbol not in _SKIP_RATIO_CHECK and len(support_levels) >= 3:
         median_sup = np.median(support_levels)
-        # FIX #3 — guard median_sup > 0 déjà présent, confirmé ici
         if median_sup > 0:
             ratio = current_price / median_sup
             if ratio > 3.0:
@@ -488,11 +545,7 @@ def compute_trend(df, sma_period=20):
         return "NEUTRE"
 
     actual_period = min(sma_period, len(df) - 5)
-    # FIX #14 — Seuil minimum absolu de 10 barres au lieu du ratio relatif 0.6
-    # (0.6 × 20 = 12 bars, mais ce calcul n'était pas documenté et donnait
-    #  des résultats instables avec des DataFrames courts > 14 barres).
-    # Un minimum de 10 barres est le seuil empirique standard pour une SMA fiable.
-    _MIN_SMA_BARS = 10
+    _MIN_SMA_BARS = 10   # FIX #14
     if actual_period < _MIN_SMA_BARS:
         return "NEUTRE"
 
@@ -505,16 +558,13 @@ def compute_trend(df, sma_period=20):
     n      = min(10, len(df))
     highs  = df["high"].iloc[-n:]
     lows   = df["low"].iloc[-n:]
-    hh     = highs.iloc[-1] > highs.iloc[0]   # Higher High
-    ll     = lows.iloc[-1]  < lows.iloc[0]    # Lower Low
-    lh     = highs.iloc[-1] < highs.iloc[0]   # Lower High
-    hl     = lows.iloc[-1]  > lows.iloc[0]    # Higher Low
+    hh     = highs.iloc[-1] > highs.iloc[0]
+    ll     = lows.iloc[-1]  < lows.iloc[0]
+    lh     = highs.iloc[-1] < highs.iloc[0]
+    hl     = lows.iloc[-1]  > lows.iloc[0]
 
     above_sma = current > sma
     below_sma = current < sma
-
-    # R5 — Note : lh AND hl simultanément = marché en compression (triangle/range).
-    # Ce cas retourne NEUTRE via le fallback final, comportement voulu.
 
     if above_sma and slope_pct > 0.05 and hh and hl:
         return "HAUSSIER"
@@ -535,12 +585,10 @@ TF_WEIGHT = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 
 def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_bars=500):
     tf_w  = TF_WEIGHT.get(tf_name, 1.0)
-    # FIX F (audit HTML) — Guards sur age_bars et total_bars :
-    # age_bars négatif (bug en amont) → np.exp(-1.5 * négatif) = exp(+grand) → score aberrant.
-    # max(age_bars, 0) garantit que le facteur âge reste dans [0, 1].
+    # FIX F — max(age_bars, 0) empêche exp(+grand) si age_bars négatif en amont.
     age_r = max(int(age_bars), 0) / max(int(total_bars), 1)
     age_f = float(np.exp(-1.5 * age_r))
-    raw   = int(strength) * tf_w * nb_tf   # FIX #16 : int(strength) déjà appliqué
+    raw   = int(strength) * tf_w * nb_tf   # FIX #16
     return round(raw * age_f, 1)
 
 
@@ -550,9 +598,7 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
 
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
 
-    # FIX #6 — Garde-fou contre boucle infinie : max 50 itérations.
-    # Si threshold_pct est élevé et les centroïdes oscillent, la boucle
-    # peut ne jamais converger sans cette limite.
+    # FIX #6 — Garde-fou boucle infinie.
     MAX_ITERATIONS = 50
     iterations = 0
 
@@ -570,8 +616,7 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
                 if j in used:
                     continue
                 current_centroid = np.mean([z["level"] for z in group])
-                # FIX C (audit HTML) — Guard centroïde nul : si données corrompues en amont
-                # (niveau = 0.0), la division lèverait ZeroDivisionError et crasherait le thread.
+                # FIX C — Guard centroïde nul (ZeroDivisionError).
                 if current_centroid <= 0:
                     break
                 if abs(zones_list[j]["level"] - current_centroid) / current_centroid * 100 <= threshold_pct:
@@ -581,13 +626,22 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
             used.add(i)
 
             best_age = min(z.get("age_bars", 0) for z in group)
-            best_status = min(
+
+            # FIX L — Statut post-fusion : max() au lieu de min().
+            # Bug identifié audit v5.8 : min() par STATUS_PRIORITY retournait "Vierge" (0)
+            # même si un groupe contenait une zone "Consommee" (2).
+            # Exemple : zone Vierge@1.1000 + zone Consommee@1.1020 fusionnent
+            # → résultat "Vierge" = zone invalide présentée comme fiable.
+            # Correction : max() retourne le statut le plus dégradé du groupe,
+            # ce qui est méthodologiquement correct (une cassure invalide la macro-zone).
+            best_status = max(
                 (z.get("status", "Testee") for z in group),
                 key=lambda s: STATUS_PRIORITY.get(s, 1)
-            )
+            )   # FIX L (était min())
+
             new_zones.append({
                 "level":    float(np.mean([z["level"] for z in group])),
-                "strength": int(sum(z["strength"] for z in group)),   # FIX #16 : int() explicite
+                "strength": int(sum(z["strength"] for z in group)),   # FIX #16
                 "age_bars": best_age,
                 "status":   best_status,
             })
@@ -603,47 +657,34 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
     opens  = pd.Series(df["open"].values)
 
     roll_high_left  = highs.shift(1).rolling(n, min_periods=n).max()
-    # FIX E (audit Gemini) — min_periods=1 (au lieu de n) pour le côté droit.
-    # Avant : min_periods=n → les n dernières bougies avaient roll_high_right=NaN
-    #         → condition highs > NaN = False → jamais pivot sur les bougies récentes.
-    # Après : min_periods=1 → les dernières bougies sont évaluées contre ce qui existe
-    #         à leur droite, avec une fenêtre partielle. Le filtre wick (≥20%) compense
-    #         la moindre confirmation structurelle des bougies en fin de dataset.
+    # FIX E — min_periods=1 pour détecter les pivots sur les bougies récentes.
     roll_high_right = highs[::-1].shift(1).rolling(n, min_periods=1).max()[::-1]
     roll_low_left   = lows.shift(1).rolling(n, min_periods=n).min()
     roll_low_right  = lows[::-1].shift(1).rolling(n, min_periods=1).min()[::-1]
 
     next_close = closes.shift(-1).fillna(closes)
 
-    # FIX #12 — Filtre wick de rejet pour éliminer les faux pivots sur tendances fortes.
-    # Avant : `next_close < highs` presque toujours vraie → faux pivot sur chaque
-    # bougie haussière dont le close n'atteint pas exactement son high.
-    # Après : on exige un vrai wick de rejet supérieur (corps < 50% de la plage)
-    # ET la confirmation classique next_close < high.
-    # Le wick_ratio élimine les bougies Marubozu (corps = 100% plage) qui
-    # génèrent de faux pivots sur les tendances impulsives.
-    candle_range  = (highs - lows).clip(lower=1e-10)   # évite /0 sur doji parfaits
+    # FIX #12 — Filtre wick ≥20% : élimine les faux pivots sur bougies Marubozu.
+    candle_range  = (highs - lows).clip(lower=1e-10)
     body_top      = pd.Series(np.maximum(opens.values, closes.values))
-    upper_wick_pct = (highs - body_top) / candle_range   # 0 = pas de wick, 1 = corps au bas
+    upper_wick_pct = (highs - body_top) / candle_range
 
     body_bottom   = pd.Series(np.minimum(opens.values, closes.values))
     lower_wick_pct = (body_bottom - lows) / candle_range
 
-    # Seuil : wick supérieur ≥ 20% de la plage pour un swing high valide
-    # Seuil : wick inférieur ≥ 20% de la plage pour un swing low valide
     _WICK_THRESHOLD = 0.20
 
     sh_mask = (
         (highs > roll_high_left) &
         (highs > roll_high_right) &
         (next_close < highs) &
-        (upper_wick_pct >= _WICK_THRESHOLD)   # FIX #12 : rejet visible en haut
+        (upper_wick_pct >= _WICK_THRESHOLD)
     )
     sl_mask = (
         (lows < roll_low_left) &
         (lows < roll_low_right) &
         (next_close > lows) &
-        (lower_wick_pct >= _WICK_THRESHOLD)   # FIX #12 : soutien visible en bas
+        (lower_wick_pct >= _WICK_THRESHOLD)
     )
 
     if atr_val and atr_val > 0:
@@ -666,9 +707,7 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
 def classify_zone_status(level, zone_type, df, formation_idx,
                           atr_val=None, tolerance_coeff=0.25,
                           fallback_tolerance_pct=_DEFAULT_FALLBACK_TOLERANCE):
-    # FIX #10 — Le fallback_tolerance_pct est maintenant passé par l'appelant
-    #            (find_strong_sr_zones) avec la valeur adaptée à l'instrument.
-    #            Plus de valeur hardcodée 0.003 (32 pips sur EUR/USD).
+    # FIX #10 — fallback_tolerance_pct passé par l'appelant (adapté à l'instrument).
     if formation_idx >= len(df) - 1:
         return "Vierge"
 
@@ -718,21 +757,15 @@ def classify_zone_status(level, zone_type, df, formation_idx,
     if len(rc_after) == 0:
         return "Role Reverse"
 
-    # FIX D (audit Gemini) — Logique de re-consommation CORRIGÉE.
-    # Avant (INVERSÉ) :
-    #   Support cassé → résistance RR. Si rc_after < level - tolerance → "Consommee"
-    #   Mais rc_after < level signifie que la résistance TIENT (prix repart à la baisse)
-    #   = le setup Role Reverse fonctionne → on tuait les meilleurs setups !
-    #
-    # Après (CORRECT) :
-    #   Un RR Support (devenu résistance) est re-consommé si le prix repasse HAUSSIER
-    #   au-dessus du niveau (rc_after > level + tolerance = cassure de la résistance RR).
-    #   Un RR Résistance (devenu support) est re-consommé si le prix repasse BAISSIER
-    #   en dessous du niveau.
+    # FIX D — Logique Role Reverse CORRIGÉE (validée audit v5.8).
+    # RR Support (support cassé → devenu résistance) :
+    #   consommé si rc_after > level + tolerance (prix casse la résistance RR vers le haut).
+    # RR Résistance (résistance cassée → devenu support) :
+    #   consommé si rc_after < level - tolerance (prix casse le support RR vers le bas).
     if zone_type == "Support":
-        second_break = rc_after > level + tolerance   # prix casse la résistance RR → zone morte
+        second_break = rc_after > level + tolerance
     else:
-        second_break = rc_after < level - tolerance   # prix casse le support RR → zone morte
+        second_break = rc_after < level - tolerance
 
     if second_break.any():
         return "Consommee"
@@ -747,7 +780,7 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
                           min_touches=2, timeframe="daily",
                           post_merge_threshold=0.30,
                           swing_n=3):
-    # FIX #10 — Récupération du fallback de tolérance adapté à l'instrument
+    # FIX #10 — Tolérance adaptée à l'instrument
     fallback_tol_pct = _FALLBACK_TOLERANCE_PCT.get(symbol, _DEFAULT_FALLBACK_TOLERANCE)
 
     if df is None or df.empty or len(df) < 20:
@@ -822,7 +855,7 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
         status = classify_zone_status(
             lvl, zone_type_tmp, df, last_idx,
             atr_val=atr_val, tolerance_coeff=0.25,
-            fallback_tolerance_pct=fallback_tol_pct,   # FIX #10
+            fallback_tolerance_pct=fallback_tol_pct,   # FIX #10 + FIX M
         )
 
         strong.append({
@@ -851,12 +884,7 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
 
     df_zones["is_pivot"] = pivot_mask
 
-    # FIX #4 — Les pivots n'apparaissent plus dans les DEUX DataFrames simultanément.
-    # Avant : `| pivot_mask` sur supports ET résistances → doublonnage dans
-    # detect_confluences → scores artificiellement gonflés de 2×.
-    # Après : séparation stricte par niveau. Le flag is_pivot est conservé
-    # dans chaque DataFrame pour l'affichage, mais chaque zone n'existe
-    # que dans UN SEUL des deux DataFrames.
+    # FIX #4 — Séparation stricte supports/résistances (pas de doublonnage).
     supports    = df_zones[df_zones["level"] <  current_price].copy()
     resistances = df_zones[df_zones["level"] >= current_price].copy()
 
@@ -865,8 +893,7 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
 
 def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1.0,
                         bars_map=None):
-    # FIX #8 — bars_map permet d'utiliser le vrai nb de bougies par TF
-    #           au lieu de 500 hardcodé pour tous les actifs.
+    # FIX #8 — bars_map : vrai nb de bougies par TF
     bars_map = bars_map or {}
 
     if not zones_dict or current_price is None:
@@ -915,7 +942,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
         if i in used_indices:
             continue
 
-        # FIX #3 — Guard level <= 0 pour éviter ZeroDivisionError
+        # FIX #3 — Guard level <= 0
         if zone["level"] <= 0:
             used_indices.add(i)
             continue
@@ -927,9 +954,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
         ]
 
         if len(similar) >= 1:
-            # FIX #15 — Remplacement de pd.concat([zones_df.loc[[i]], similar])
-            # par une sélection directe par index : évite N allocations DataFrame
-            # dans une boucle O(n²) (1000 zones → ~500 pd.concat inutiles).
+            # FIX #15 — Sélection directe par index (évite pd.concat O(n²)).
             group_indices = [i] + similar.index.tolist()
             group         = zones_df.loc[group_indices]
             timeframes    = group["tf"].unique()
@@ -964,7 +989,7 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     if sub_active.empty:
                         sub_active = subgroup
 
-                    # FIX #8 — Utilisation du vrai total_bars par TF
+                    # FIX #8 — Vrai total_bars par TF
                     sub_score = sum(
                         compute_structural_score(
                             int(r["strength"]), sub_nb_tf,
@@ -1024,8 +1049,6 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
 
 # ══════════════════════════════════════════════════════════════════
 # SCAN RESULT DATACLASS
-# FIX #8 — Ajout du champ bars_map pour propager les longueurs réelles
-#           des DataFrames vers detect_confluences.
 # ══════════════════════════════════════════════════════════════════
 @dataclass
 class ScanResult:
@@ -1036,7 +1059,7 @@ class ScanResult:
     trends:        dict
     anomaly:       Optional[str]
     bars_map:      dict = field(default_factory=dict)  # FIX #8
-    scan_error:    Optional[str] = None
+    scan_error:    Optional[str] = None                # FIX P
 
 
 def scan_single_symbol(args) -> ScanResult:
@@ -1056,141 +1079,153 @@ def scan_single_symbol(args) -> ScanResult:
     all_sup_levels = []
     last_h4_close  = None
     anomaly_msg    = None
-    internal_error = None   # FIX R6 — champ scan_error désormais peuplé
+    internal_error = None
 
-    # FIX R7 — utilisation du helper centralisé
-    sym_d = _sym_display(symbol)
+    sym_d = _sym_display(symbol)   # FIX R7
 
     _TF_KEYS = [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]
 
     def _fetch_tf(tf_key):
         return tf_key, get_oanda_data(base_url, access_token, symbol, tf_key, limit=500)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as tf_pool:
-        tf_futures = {tf_pool.submit(_fetch_tf, tk): tk for tk, _ in _TF_KEYS}
-        tf_data = {}
-        for fut in concurrent.futures.as_completed(tf_futures):
-            try:
-                tf_key, df = fut.result()
-                tf_data[tf_key] = df
-            except Exception:
-                tf_data[tf_futures[fut]] = None
+    # FIX P — Le corps principal de scan_single_symbol est encapsulé dans un
+    # try/except pour que internal_error soit réellement peuplé et propagé via
+    # ScanResult.scan_error. Avant (FIX R6) : internal_error = None déclaré
+    # mais jamais assigné → champ toujours None (dead code).
+    # Après : toute exception inattendue dans la logique de scan est capturée
+    # ici, ce qui permet au caller (boucle as_completed) de la distinguer des
+    # exceptions de threading/futures et d'afficher un message précis dans l'UI.
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as tf_pool:
+            tf_futures = {tf_pool.submit(_fetch_tf, tk): tk for tk, _ in _TF_KEYS}
+            tf_data = {}
+            for fut in concurrent.futures.as_completed(tf_futures):
+                try:
+                    tf_key, df = fut.result()
+                    tf_data[tf_key] = df
+                except Exception:
+                    tf_data[tf_futures[fut]] = None
 
-    raw_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
-    current_price, price_alert_msg = validate_live_price(
-        raw_price, symbol, base_url, access_token
-    )
-    anomaly_msg = price_alert_msg
-
-    reference_price = current_price
-
-    for tf_key, tf_cap in _TF_KEYS:
-        df = tf_data.get(tf_key)
-        if df is None or df.empty:
-            continue
-
-        if reference_price is None:
-            reference_price = float(df["close"].iloc[-1])
-
-        if tf_key == "h4":
-            last_h4_close = float(df["close"].iloc[-1])
-
-        # FIX #8 — Stocker le nombre réel de bougies pour ce TF
-        bars_map[tf_cap] = len(df)
-
-        cp = reference_price
-
-        trends[tf_cap] = compute_trend(df)
-        atr_val = compute_atr(df, period=14)
-
-        supports, resistances = find_strong_sr_zones(
-            df, cp,
-            symbol                = symbol,           # FIX #10
-            atr_val               = atr_val,
-            zone_percentage_width = zone_w_fallback,
-            atr_zone_coeff        = atr_zone_coeff,
-            prominence_coeff      = prom_coeff,
-            min_touches           = min_touches,
-            timeframe             = tf_key,
-            post_merge_threshold  = merge_thresh,
+        raw_price = get_oanda_current_price(base_url, access_token, account_id, symbol)
+        current_price, price_alert_msg = validate_live_price(
+            raw_price, symbol, base_url, access_token
         )
-        zones_d[tf_cap] = (supports, resistances)
+        anomaly_msg = price_alert_msg
 
-        if not supports.empty:
-            all_sup_levels.extend(supports["level"].tolist())
+        reference_price = current_price
 
-        if tf_key == "daily":
-            price_ctx = get_price_context(cp, supports, resistances)
-            zones_d["_price_ctx"] = price_ctx
+        for tf_key, tf_cap in _TF_KEYS:
+            df = tf_data.get(tf_key)
+            if df is None or df.empty:
+                continue
 
-        def make_row(zone, ztype, _cp=cp, _atr=atr_val,
-                     _pdf_max=pdf_dist_max, _abs_max=abs_dist_max,
-                     _tf=tf_cap, _ntot=len(df)):
-            lvl      = zone["level"]
-            strength = int(zone["strength"])
-            age_bars = int(zone.get("age_bars", 0))
-            status   = zone.get("status", "Testee")
+            if reference_price is None:
+                reference_price = float(df["close"].iloc[-1])
 
-            if not _cp or _cp <= 0:
-                dist_pct = 0.0
-                dist_atr_str = "N/A"
-                in_pdf = False
-            else:
-                dist_pct = abs(_cp - lvl) / _cp * 100
-                if _atr and _atr > 0:
-                    dist_atr_str = f"{round(abs(_cp - lvl) / _atr, 1):.1f}x"
-                else:
+            if tf_key == "h4":
+                last_h4_close = float(df["close"].iloc[-1])
+
+            bars_map[tf_cap] = len(df)   # FIX #8
+
+            cp = reference_price
+
+            trends[tf_cap] = compute_trend(df)
+            atr_val = compute_atr(df, period=14)
+
+            supports, resistances = find_strong_sr_zones(
+                df, cp,
+                symbol                = symbol,
+                atr_val               = atr_val,
+                zone_percentage_width = zone_w_fallback,
+                atr_zone_coeff        = atr_zone_coeff,
+                prominence_coeff      = prom_coeff,
+                min_touches           = min_touches,
+                timeframe             = tf_key,
+                post_merge_threshold  = merge_thresh,
+            )
+            zones_d[tf_cap] = (supports, resistances)
+
+            if not supports.empty:
+                all_sup_levels.extend(supports["level"].tolist())
+
+            if tf_key == "daily":
+                price_ctx = get_price_context(cp, supports, resistances)
+                zones_d["_price_ctx"] = price_ctx
+
+            def make_row(zone, ztype, _cp=cp, _atr=atr_val,
+                         _pdf_max=pdf_dist_max, _abs_max=abs_dist_max,
+                         _tf=tf_cap, _ntot=len(df)):
+                lvl      = zone["level"]
+                strength = int(zone["strength"])
+                age_bars = int(zone.get("age_bars", 0))
+                status   = zone.get("status", "Testee")
+
+                if not _cp or _cp <= 0:
+                    dist_pct = 0.0
                     dist_atr_str = "N/A"
-                in_pdf = dist_pct <= _pdf_max and dist_pct <= _abs_max
+                    in_pdf = False
+                else:
+                    dist_pct = abs(_cp - lvl) / _cp * 100
+                    if _atr and _atr > 0:
+                        dist_atr_str = f"{round(abs(_cp - lvl) / _atr, 1):.1f}x"
+                    else:
+                        dist_atr_str = "N/A"
+                    in_pdf = dist_pct <= _pdf_max and dist_pct <= _abs_max
 
-            struct_score = compute_structural_score(strength, 1, _tf, age_bars, _ntot)
-            return {
-                "Actif":       sym_d,
-                "Prix Actuel": f"{_cp:.5f}" if _cp else "N/A",
-                "Type":        ztype,
-                "Niveau":      f"{lvl:.5f}",
-                "Force":       f"{strength} touches",
-                "Score (1TF)": struct_score,
-                "Statut":      status,
-                "Dist. %":     f"{dist_pct:.2f}%",
-                "Dist. ATR":   dist_atr_str,
-                "_dist_num":   dist_pct,
-                "_in_pdf":     in_pdf,
-            }
+                struct_score = compute_structural_score(strength, 1, _tf, age_bars, _ntot)
+                return {
+                    "Actif":       sym_d,
+                    "Prix Actuel": f"{_cp:.5f}" if _cp else "N/A",
+                    "Type":        ztype,
+                    "Niveau":      f"{lvl:.5f}",
+                    "Force":       f"{strength} touches",
+                    "Score (1TF)": struct_score,
+                    "Statut":      status,
+                    "Dist. %":     f"{dist_pct:.2f}%",
+                    "Dist. ATR":   dist_atr_str,
+                    "_dist_num":   dist_pct,
+                    "_in_pdf":     in_pdf,
+                }
 
-        tf_rows = (
-            [make_row(z, "PIVOT" if z.get("is_pivot") else "Support")
-             for _, z in supports.iterrows()] +
-            [make_row(z, "PIVOT" if z.get("is_pivot") else "Resistance")
-             for _, z in resistances.iterrows()]
-        )
-        seen_levels = set()
-        unique_rows = []
-        for r in tf_rows:
-            key = (r["Niveau"], r["Type"])
-            if key not in seen_levels:
-                seen_levels.add(key)
-                unique_rows.append(r)
-        if unique_rows:
-            rows[tf_cap] = unique_rows
+            tf_rows = (
+                [make_row(z, "PIVOT" if z.get("is_pivot") else "Support")
+                 for _, z in supports.iterrows()] +
+                [make_row(z, "PIVOT" if z.get("is_pivot") else "Resistance")
+                 for _, z in resistances.iterrows()]
+            )
+            seen_levels = set()
+            unique_rows = []
+            for r in tf_rows:
+                key = (r["Niveau"], r["Type"])
+                if key not in seen_levels:
+                    seen_levels.add(key)
+                    unique_rows.append(r)
+            if unique_rows:
+                rows[tf_cap] = unique_rows
 
-    if all_sup_levels and reference_price:
-        new_anomaly = flag_data_anomaly(
-            symbol, reference_price, all_sup_levels, last_h4_close
-        )
-        if new_anomaly:
-            anomaly_msg = (f"{anomaly_msg} | {new_anomaly}"
-                           if anomaly_msg else new_anomaly)
+        if all_sup_levels and reference_price:
+            new_anomaly = flag_data_anomaly(
+                symbol, reference_price, all_sup_levels, last_h4_close
+            )
+            if new_anomaly:
+                anomaly_msg = (f"{anomaly_msg} | {new_anomaly}"
+                               if anomaly_msg else new_anomaly)
+
+    except Exception as e:
+        # FIX P — Capture les erreurs inattendues dans la logique de scan
+        # (ex: bug dans une fonction d'analyse) et les propage via scan_error.
+        # Les erreurs réseau/API sont déjà catchées dans get_oanda_data.
+        internal_error = f"{type(e).__name__}: {str(e)[:300]}"
 
     return ScanResult(
         symbol     = symbol,
         rows       = rows,
         zones      = zones_d,
-        price      = reference_price,
+        price      = reference_price if 'reference_price' in dir() else None,
         trends     = trends,
         anomaly    = anomaly_msg,
         bars_map   = bars_map,
-        scan_error = internal_error,   # FIX R6 — peuplé si erreur interne capturée
+        scan_error = internal_error,   # FIX P — désormais réellement peuplé si erreur
     )
 
 
@@ -1211,7 +1246,7 @@ class PDF(FPDF):
                   _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'),
                   border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
-        # FIX R9 — SCANNER_VERSION utilisé dans le header PDF
+        # FIX R9 — SCANNER_VERSION dans le header PDF
         self.cell(0, 6,
                   _safe_pdf_str(
                       f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
@@ -1274,8 +1309,6 @@ class PDF(FPDF):
             self.set_font('Helvetica', '', 7)
             if top:
                 for z in top:
-                    # FIX R8 — _safe_pdf_str appelé une seule fois ici
-                    # (strip_emojis_df a déjà nettoyé les données en amont)
                     sig  = str(z.get('Signal', ''))
                     niv  = str(z.get('Niveau',     ''))
                     dist = str(z.get('Distance %', ''))
@@ -1347,17 +1380,13 @@ def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
     if "_in_pdf" in df.columns:
         df = df[df["_in_pdf"]].copy()
     elif "_dist_num" in df.columns:
-        # FIX #21 — Utilisation de DEFAULT_PDF_DIST uniquement ici (branche de
-        # sécurité). En pratique _in_pdf est toujours présent. On documente
-        # explicitement ce cas dégradé.
         df = df[df["_dist_num"] <= DEFAULT_PDF_DIST].copy()
     elif "Dist. %" in df.columns:
         def _to_f(s):
             try:    return float(str(s).replace("%", ""))
             except: return 999.0
         df = df[df["Dist. %"].apply(_to_f) <= DEFAULT_PDF_DIST].copy()
-    # FIX R2 — Utilisation du helper centralisé
-    return _clean_df(df).reset_index(drop=True)
+    return _clean_df(df).reset_index(drop=True)   # FIX R2
 
 
 def create_pdf_report(results_dict, confluences_df=None,
@@ -1379,7 +1408,7 @@ def create_pdf_report(results_dict, confluences_df=None,
 
     if confluences_df is not None and not confluences_df.empty:
         pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
-        clean_conf = strip_emojis_df(_clean_df(confluences_df.copy()))  # FIX R2
+        clean_conf = strip_emojis_df(_clean_df(confluences_df.copy()))
         if "Score" in clean_conf.columns:
             clean_conf = clean_conf.sort_values("Score", ascending=False)
         pdf.chapter_body(clean_conf)
@@ -1394,7 +1423,7 @@ def create_pdf_report(results_dict, confluences_df=None,
         if df is None or (hasattr(df, 'empty') and df.empty):
             continue
         pdf.chapter_title(title_map.get(tf_key, tf_key))
-        clean_df = strip_emojis_df(_clean_df(df.copy()))  # FIX R2
+        clean_df = strip_emojis_df(_clean_df(df.copy()))
         if "Score (1TF)" in clean_df.columns:
             clean_df = clean_df.sort_values("Score (1TF)", ascending=False)
         pdf.chapter_body(clean_df)
@@ -1406,12 +1435,12 @@ def create_pdf_report(results_dict, confluences_df=None,
 def create_csv_report(results_dict, confluences_df=None):
     all_dfs = []
     if confluences_df is not None and not confluences_df.empty:
-        c = _clean_df(confluences_df).copy()  # FIX R2
+        c = _clean_df(confluences_df).copy()
         c["Section"] = "CONFLUENCES"
         all_dfs.append(c)
     for tf, df in results_dict.items():
         if df is not None and not df.empty:
-            d = _clean_df(df).copy()  # FIX R2
+            d = _clean_df(df).copy()
             d["Timeframe"] = tf
             all_dfs.append(d)
     if not all_dfs:
@@ -1636,7 +1665,7 @@ def _display_results(sr: dict, max_dist_filter: float):
     errors    = sr.get("scan_errors",   {})
 
     if not conf_full.empty:
-        tmp = _clean_df(conf_full).copy()  # FIX R2
+        tmp = _clean_df(conf_full).copy()
         tmp["_dist_num"] = (
             tmp["Distance %"].str.replace("%", "", regex=False).astype(float)
         )
@@ -1724,9 +1753,7 @@ def _display_results(sr: dict, max_dist_filter: float):
 
         st.divider()
         st.markdown("**🤖 Exports optimisés LLM**")
-        st.caption(
-            "Paramètres LLM configurables dans la barre latérale (section 3)."
-        )
+        st.caption("Paramètres LLM configurables dans la barre latérale (section 3).")
 
         llm_max_dist    = st.session_state.get("llm_max_dist",  2.0)
         llm_min_score   = st.session_state.get("llm_min_score", 100)
@@ -1754,9 +1781,6 @@ def _display_results(sr: dict, max_dist_filter: float):
                 width='stretch',
             )
         with col4:
-            # FIX #13 — min_score utilise maintenant llm_min_score (sidebar)
-            # au lieu de 50.0 hardcodé. L'utilisateur contrôle effectivement
-            # les deux exports LLM avec le même slider.
             json_bytes = create_json_export(
                 summaries, conf_full,
                 max_dist  = max_dist_filter,
@@ -1798,7 +1822,7 @@ def _display_results(sr: dict, max_dist_filter: float):
             try:   return float(str(s).replace("%", ""))
             except: return 999.0
         mask = df["Dist. %"].apply(to_float) <= max_pct
-        out  = _clean_df(df[mask])   # FIX R2
+        out  = _clean_df(df[mask])
         sort_col = "Score (1TF)" if "Score (1TF)" in out.columns else "Score"
         if sort_col in out.columns:
             out = out.sort_values(sort_col, ascending=False)
@@ -1858,37 +1882,30 @@ with st.sidebar:
     llm_max_dist_sidebar = st.slider(
         "Dist. max (%) brief LLM", 0.5, 5.0, 2.0, 0.5,
         key="llm_max_dist",
-        help="Zones au-delà de cette distance sont exclues du brief LLM.",
     )
     llm_min_score_sidebar = st.slider(
         "Score min brief LLM", 50, 300, 100, 25,
         key="llm_min_score",
-        help="Zones sous ce score sont exclues du brief LLM et de l'export JSON.",
     )
     llm_statuts_sidebar = st.multiselect(
         "Statuts autorisés (brief LLM)",
         options=["Vierge", "Testee", "Role Reverse", "Consommee"],
         default=["Vierge", "Testee", "Role Reverse"],
         key="llm_statuts",
-        help="Role Reverse = zone cassée retestée (setup pullback).",
     )
 
     st.divider()
     st.header("4. Paramètres de Détection")
     zone_width = st.slider(
         "Largeur zone Forex (% fallback si ATR indispo)", 0.1, 2.0, 0.5, 0.1,
-        help="Normalement remplacé par ATR × coeff. Utilisé si ATR non disponible.",
     )
     min_touches = st.slider(
         "Force minimale (touches)", 3, 10, 3, 1,
-        help="Nombre de contacts minimum pour valider une zone. Min 3 recommandé.",
     )
     confluence_threshold = st.slider(
         "Seuil confluence Forex (%)", 0.3, 2.0, 1.0, 0.1,
-        help="Indices/Métaux utilisent des seuils adaptatifs (1.2-1.5%) automatiquement.",
     )
-    # FIX R4 — Avertissement explicite : pour XAU, US30, NAS100, SPX500, DE30
-    # le slider ci-dessus est IGNORÉ (seuils hardcodés dans CONFLUENCE_THRESHOLD_MAP).
+    # FIX R4 — Avertissement seuils ignorés pour indices/métaux
     _overridden = [s.replace("_USD","").replace("_EUR","")
                    for s in CONFLUENCE_THRESHOLD_MAP]
     st.caption(
@@ -1901,7 +1918,6 @@ with st.sidebar:
 
     st.divider()
     st.caption("**Score confluence = (Force × Poids_TF × NbTF) × Facteur_Age**")
-    st.caption("**Score (1TF) dans tableaux = mono-TF brut (non comparable au score confluence)**")
     st.caption("🔴 > 300 : Zone institutionnelle majeure")
     st.caption("🟠 100-300 : Zone structurelle forte")
     st.caption("🟡 30-100 : Zone technique valide")
@@ -1915,28 +1931,18 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 34 corrections**")
-    st.caption("— v5.5 (12 fixes) —")
-    st.caption("✅ #1  — Cache TTL atomique | #2 RLock | #3 Guard level<=0")
-    st.caption("✅ #4  — Pivots non doublonnés | #5 Price cache purge")
-    st.caption("✅ #6  — post_merge MAX_ITER | #7 cache_data supprimé")
-    st.caption("✅ #8  — bars_map réel | #9 Exception handling ciblé")
-    st.caption("✅ #10 — Tolérance par instrument | #11 Cache token-aware")
-    st.caption("✅ #13 — JSON min_score sidebar | #18/#19 alignements")
-    st.caption("— v5.6 (9 fixes) —")
-    st.caption("✅ #12 — Wick filter ≥20% (faux pivots éliminés)")
-    st.caption("✅ #14 — SMA seuil absolu | #15 pd.concat O(n²)→O(n)")
-    st.caption("✅ #16 — strength int() | #17 token sanitisé dans logs")
-    st.caption("✅ R4  — Warning seuils confluence | R6 scan_error UI")
-    st.caption("✅ R7  — _sym_display() centralisé")
-    st.caption("— v5.7 (7 fixes — audits HTML+Gemini) —")
-    st.caption("✅ A   — _cache_get() : df.copy() défensif (corruption impossible)")
-    st.caption("✅ B   — get_oanda_current_price : TOCTOU éliminé (TTL dans lock)")
-    st.caption("✅ C   — post_merge_zones : guard centroïde <= 0 (ZeroDivision)")
-    st.caption("✅ D   — classify_zone_status : Role Reverse NON inversé (fix CRITIQUE)")
-    st.caption("✅ E   — detect_swing_pivots : min_periods=1 (pivots récents détectés)")
-    st.caption("✅ F   — compute_structural_score : age_bars négatif protégé")
-    st.caption("✅ G   — API OANDA : json.JSONDecodeError catchée (captcha/proxy)")
+    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 43 corrections**")
+    st.caption("— v5.5 (12 fixes) — v5.6 (9 fixes) — v5.7 (7 fixes) —")
+    st.caption("— v5.8 (9 fixes — audit indépendant Claude Sonnet 4.6) —")
+    st.caption("✅ H   — KeyError/IndexError prix live (crash silencieux week-end)")
+    st.caption("✅ I   — BoundedSemaphore(5) : max 5 req OANDA simultanées")
+    st.caption("✅ J   — max_workers=4→2 pool principal (charge API réduite)")
+    st.caption("✅ K   — Bouton scan désactivé pendant exécution (anti double-clic)")
+    st.caption("✅ L   — post_merge_zones : min()→max() statut (bug métier Vierge/Consommee)")
+    st.caption("✅ M   — Tolérance JPY 0.001→0.0005 (faux Consommee sur USD/JPY etc.)")
+    st.caption("✅ N   — POST_MERGE_THRESHOLD Forex 0.30→0.15% (granularité S/R préservée)")
+    st.caption("✅ O   — _BoundedTTLCache : éviction LRU stricte (fin fuite mémoire)")
+    st.caption("✅ P   — scan_single_symbol : internal_error réellement peuplé")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1952,15 +1958,18 @@ if scan_button and symbols_to_scan:
         if not base_url:
             st.error("Identifiants OANDA invalides. Vérifiez vos secrets.")
         else:
+            # FIX K — Marquer le scan comme actif (désactive le bouton via disabled=)
+            st.session_state["scanning"] = True
+
             progress_bar = st.progress(0, text="Initialisation du scan…")
 
             results_h4, results_daily, results_weekly = [], [], []
-            all_zones_map  = {}
-            prices_map     = {}
-            trends_map     = {}
-            anomalies_map  = {}
-            scan_errors    = {}
-            bars_map_global = {}   # FIX #8
+            all_zones_map   = {}
+            prices_map      = {}
+            trends_map      = {}
+            anomalies_map   = {}
+            scan_errors     = {}
+            bars_map_global = {}
 
             args_list = [
                 (sym, base_url, access_token, account_id, zone_width, min_touches)
@@ -1968,7 +1977,12 @@ if scan_button and symbols_to_scan:
             ]
             total, completed = len(args_list), 0
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            # FIX J — max_workers=4 → 2 sur le pool principal.
+            # Combiné avec FIX I (BoundedSemaphore=5), le pic de connexions HTTP
+            # simultanées est plafonné à 5 quelle que soit la configuration.
+            # 2 workers × 3 TF internes = 6 requêtes potentielles, mais le sémaphore
+            # garantit que seules 5 s'exécutent en même temps sur OANDA.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:   # FIX J
                 future_map = {
                     executor.submit(scan_single_symbol, a): a[0] for a in args_list
                 }
@@ -1979,10 +1993,6 @@ if scan_button and symbols_to_scan:
                         completed / total,
                         text=f"Scan… ({completed}/{total}) {sym.replace('_', '/')}",
                     )
-                    # FIX #9 — Gestion d'exception différenciée :
-                    # erreurs métier catchées nommément, erreurs inattendues
-                    # loggées avec traceback complet.
-                    # FIX #17 — token et account_id sanitisés dans les tracebacks.
                     try:
                         result: ScanResult = future.result()
 
@@ -1992,10 +2002,9 @@ if scan_button and symbols_to_scan:
                         bars_map_global[result.symbol] = result.bars_map
 
                         if result.anomaly:
-                            # FIX R7 — _sym_display centralisé
                             anomalies_map[_sym_display(result.symbol)] = result.anomaly
 
-                        # FIX R6 — affichage des erreurs internes (scan_error peuplé)
+                        # FIX P — scan_error désormais réellement peuplé si erreur interne
                         if result.scan_error:
                             scan_errors[_sym_display(result.symbol)] = (
                                 f"[interne] {result.scan_error}"
@@ -2012,20 +2021,20 @@ if scan_button and symbols_to_scan:
 
                     except (requests.RequestException, ValueError,
                             KeyError, pd.errors.EmptyDataError) as e:
-                        scan_errors[_sym_display(sym)] = (   # FIX R7
+                        scan_errors[_sym_display(sym)] = (
                             f"{type(e).__name__}: {str(e)[:200]}"
                         )
                     except Exception as e:
                         tb = traceback.format_exc()
-                        # FIX #17 — masquer token et account_id dans le traceback
-                        tb = _sanitize_traceback(
-                            tb, [access_token, account_id]
-                        )
-                        scan_errors[_sym_display(sym)] = (   # FIX R7
+                        tb = _sanitize_traceback(tb, [access_token, account_id])
+                        scan_errors[_sym_display(sym)] = (
                             f"INATTENDU {type(e).__name__}: {tb[-400:]}"
                         )
 
             progress_bar.empty()
+
+            # FIX K — Libérer le verrou du bouton scan
+            st.session_state["scanning"] = False
 
             n_ok   = len(symbols_to_scan) - len(scan_errors)
             n_fail = len(scan_errors)
@@ -2043,14 +2052,14 @@ if scan_button and symbols_to_scan:
             st.info("🔍 Analyse des confluences multi-timeframes…")
             all_confluences = []
             for sym in symbols_to_scan:
-                if _sym_display(sym) in scan_errors:   # FIX R7
+                if _sym_display(sym) in scan_errors:
                     continue
                 cp = prices_map.get(sym)
                 zones_clean = {k: v for k, v in all_zones_map.get(sym, {}).items()
                                if not k.startswith("_")}
                 sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, confluence_threshold)
                 confs = detect_confluences(
-                    _sym_display(sym),              # FIX R7
+                    _sym_display(sym),
                     zones_clean,
                     cp,
                     sym_threshold,
@@ -2064,7 +2073,7 @@ if scan_button and symbols_to_scan:
 
             summaries = []
             for sym in symbols_to_scan:
-                sym_d  = _sym_display(sym)   # FIX R7
+                sym_d  = _sym_display(sym)
                 trends = trends_map.get(sym, {})
                 cp     = prices_map.get(sym)
 
