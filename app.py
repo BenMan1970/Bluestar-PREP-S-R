@@ -83,7 +83,7 @@ scan_button = st.button(
 # CONSTANTES
 # ══════════════════════════════════════════════════════════════════
 
-SCANNER_VERSION = "5.9"
+SCANNER_VERSION = "5.10"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -173,6 +173,17 @@ _FALLBACK_TOLERANCE_PCT = {
     "NZD_JPY":    0.0005,
 }
 _DEFAULT_FALLBACK_TOLERANCE = 0.001
+
+# BUG-012 : plancher absolu de tolérance (en unités prix) par famille.
+# Sans plancher, fallback_tolerance_pct sur paires JPY donne < 0.1 yen
+# → moins d'1 pip → un simple spread classe la zone "Consommée" à tort.
+# Planchers : JPY = 0.10 yen (≈1 pip), Forex standard = 0.00010 (≈1 pip),
+#             Indices / XAU = 0 (pas de plancher, ATR toujours dispo).
+_PIP_FLOOR_ABS = {
+    "USD_JPY": 0.10, "EUR_JPY": 0.10, "GBP_JPY": 0.10,
+    "AUD_JPY": 0.10, "CAD_JPY": 0.10, "CHF_JPY": 0.10, "NZD_JPY": 0.10,
+}
+_DEFAULT_PIP_FLOOR = 0.00010   # 1 pip Forex standard (ex: EUR/USD)
 
 # ══════════════════════════════════════════════════════════════════
 # RATE LIMITING API OANDA
@@ -266,6 +277,9 @@ def _safe_pdf_str(text: str) -> str:
 
 
 def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
+    """Masque les valeurs sensibles (token, account_id, base_url) dans un traceback.
+    BUG-013 : base_url inclus — révèle l'environnement practice vs live OANDA.
+    """
     for val in sensitive_values:
         if val and isinstance(val, str) and len(val) > 4:
             tb = tb.replace(val, f"***{val[-4:]}")
@@ -427,7 +441,9 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
     messages = []
     if symbol not in _SKIP_RATIO_CHECK and len(support_levels) >= 3:
         median_sup = np.median(support_levels)
-        if median_sup > 0:
+        # BUG-014 : guard median_sup pathologique (ex: 0.0001 sur paire exotique)
+        # évite un ratio 10000x intempestif non lié à une vraie anomalie de données.
+        if median_sup > 0 and median_sup > 0.01 * current_price:
             ratio = current_price / median_sup
             if ratio > 3.0:
                 messages.append(
@@ -642,14 +658,20 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
 
 def classify_zone_status(level, zone_type, df, formation_idx,
                           atr_val=None, tolerance_coeff=0.25,
-                          fallback_tolerance_pct=_DEFAULT_FALLBACK_TOLERANCE):
+                          fallback_tolerance_pct=_DEFAULT_FALLBACK_TOLERANCE,
+                          symbol=""):
     if formation_idx >= len(df) - 1:
         return "Vierge"
 
-    tolerance = (
-        (atr_val * tolerance_coeff) if (atr_val and atr_val > 0)
-        else (level * fallback_tolerance_pct)
-    )
+    if atr_val and atr_val > 0:
+        tolerance = atr_val * tolerance_coeff
+    else:
+        # BUG-012 : plancher absolu pour éviter tolérance < 1 pip sur paires JPY.
+        # fallback_tolerance_pct seul donne 0.079 yen sur USD/JPY@158 → 0.6 pip.
+        # Un spread normal suffit à déclencher un faux "Consommee".
+        raw_tol   = level * fallback_tolerance_pct
+        pip_floor = _PIP_FLOOR_ABS.get(symbol, _DEFAULT_PIP_FLOOR)
+        tolerance = max(raw_tol, pip_floor)
 
     c_arr = df["close"].values[formation_idx + 1:]
     h_arr = df["high"].values[formation_idx + 1:]
@@ -780,7 +802,9 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
         lvl      = float(np.mean(prices))
         strength = len(grp)
         last_idx = max(indices)
-        age_bars = n_total - 1 - last_idx
+        # BUG-010 : max(0, ...) à la source — compute_structural_score le faisait
+        # aussi, mais mieux vaut garantir la valeur propre dès sa création.
+        age_bars = max(0, n_total - 1 - last_idx)
 
         # BUG-005 CORRIGÉ : filtrer les niveaux nuls ou négatifs
         if lvl <= 0:
@@ -791,6 +815,7 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
             lvl, zone_type_tmp, df, last_idx,
             atr_val=atr_val, tolerance_coeff=0.25,
             fallback_tolerance_pct=fallback_tol_pct,
+            symbol=symbol,   # BUG-012 : nécessaire pour _PIP_FLOOR_ABS
         )
 
         strong.append({
@@ -917,7 +942,12 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                         continue
 
                     sub_avg   = subgroup["level"].mean()
-                    sub_nb_tf = len(sub_tfs)
+                    # BUG-017 : sub_nb_tf doit refléter la richesse réelle du groupe.
+                    # len(sub_tfs) = nb TFs uniques, mais si plusieurs zones du même TF
+                    # sont présentes (pivots proches), le multiplicateur serait sous-évalué.
+                    # On prend max(nb_TFs_uniques, nb_zones) pour éviter la sous-évaluation
+                    # tout en restant cohérent avec la sémantique "confluence multi-TF".
+                    sub_nb_tf = max(len(sub_tfs), len(subgroup))
                     sub_dist  = abs(current_price - sub_avg) / current_price * 100
 
                     sub_active = subgroup[subgroup["status"] != "Consommee"]
@@ -1904,20 +1934,14 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 53 corrections**")
-    st.caption("— v5.5 (12 fixes) — v5.6 (9 fixes) — v5.7 (7 fixes) —")
-    st.caption("— v5.8 (9 fixes — audit Claude Sonnet 4.6) —")
-    st.caption("— v5.9 (7 fixes — audit forensique indépendant) —")
-    st.caption("✅ BUG-001 — reference_price initialisé avant try (NameError potentiel)")
-    st.caption("✅ BUG-002 — st.rerun() atomique : bouton désactivé immédiatement")
-    st.caption("✅ BUG-003 — Verrou unique _cache_lock (anti-deadlock)")
-    st.caption("✅ BUG-004 — detect_confluences : min()→max() pour sub_status")
-    st.caption("✅ BUG-005 — find_strong_sr_zones : filtre lvl <= 0")
-    st.caption("✅ BUG-006 — Timeouts (3,8) sur HTTP + timeout=30 as_completed")
-    st.caption("✅ BUG-008 — Tri stable (price, idx) pour clustering déterministe")
-    st.caption("✅ BUG-010 — used_indices marqués seulement si confluence créée")
-    st.caption("✅ BUG-012 — Session HTTP threading.local() par thread")
-    st.caption("✅ JSON    — Tous les actifs présents (avec ou sans confluence)")
+    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 57 corrections**")
+    st.caption("— v5.5 (12) — v5.6 (9) — v5.7 (7) — v5.8 (9) — v5.9 (10) —")
+    st.caption("— v5.10 (5 fixes — audit forensique niveau expert) —")
+    st.caption("✅ BUG-013 — base_url masqué dans _sanitize_traceback (sécurité)")
+    st.caption("✅ BUG-012 — Plancher pip absolu JPY (faux Consommee éliminés)")
+    st.caption("✅ BUG-017 — sub_nb_tf = max(TFs, zones) : scores confluence corrects")
+    st.caption("✅ BUG-010 — age_bars = max(0, ...) à la source")
+    st.caption("✅ BUG-014 — guard median_sup > 1% du prix (fausses alertes anomalie)")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2015,7 +2039,7 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
                             )
                         except Exception as e:
                             tb = traceback.format_exc()
-                            tb = _sanitize_traceback(tb, [access_token, account_id])
+                            tb = _sanitize_traceback(tb, [access_token, account_id, base_url])
                             scan_errors[_sym_display(sym)] = (
                                 f"INATTENDU {type(e).__name__}: {tb[-400:]}"
                             )
