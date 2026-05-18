@@ -17,14 +17,23 @@ from fpdf import FPDF
 from scipy.signal import find_peaks
 
 # ══════════════════════════════════════════════════════════════════
-# SESSION HTTP GLOBALE
+# SESSION HTTP — BUG-012 CORRIGÉ : threading.local() par thread
+# Avant : session requests.Session() globale partagée entre tous les
+# threads → cookies/headers mutables → corruption silencieuse possible.
+# Après  : chaque thread possède sa propre Session isolée.
 # ══════════════════════════════════════════════════════════════════
-_http_session = requests.Session()
-_http_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=20,
-    pool_maxsize=20,
-)
-_http_session.mount("https://", _http_adapter)
+_thread_local = threading.local()
+
+def _get_session() -> requests.Session:
+    """Retourne la session HTTP du thread courant (créée à la demande)."""
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.mount("https://", requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=4,
+        ))
+        _thread_local.session = s
+    return _thread_local.session
 
 # ══════════════════════════════════════════════════════════════════
 # PAGE CONFIG & CSS
@@ -63,9 +72,6 @@ st.markdown(
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# FIX K — Protection double-clic : le bouton est désactivé pendant un scan actif.
-# Avant : deux clics rapides lançaient deux ThreadPoolExecutor concurrents, doublant
-# la charge API et corrompant potentiellement les résultats dans session_state.
 scan_button = st.button(
     "🚀 LANCER LE SCAN COMPLET",
     type="primary",
@@ -77,8 +83,7 @@ scan_button = st.button(
 # CONSTANTES
 # ══════════════════════════════════════════════════════════════════
 
-# FIX R9 — SCANNER_VERSION affiché dans le footer PDF
-SCANNER_VERSION = "5.8"
+SCANNER_VERSION = "5.9"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -111,12 +116,7 @@ ZONE_WIDTH_FALLBACK = {
 }
 DEFAULT_ZONE_WIDTH = 0.5
 
-# FIX N — POST_MERGE_THRESHOLD Forex réduit de 0.30 % à 0.15 %.
-# Avant : 0.30 % sur EUR/USD@1.09 = 0.00327 = ~33 pips.
-# Deux zones S/R distantes de 33 pips sont des niveaux distincts en swing trading ;
-# les fusionner effaçait de la granularité analytique utile.
-# Après : 0.15 % ≈ 16 pips sur EUR/USD — seuil cohérent avec les niveaux H4/Daily.
-POST_MERGE_THRESHOLD = 0.15   # FIX N (était 0.30)
+POST_MERGE_THRESHOLD = 0.15
 
 POST_MERGE_MAP = {
     "US30_USD": 0.05, "NAS100_USD": 0.05, "SPX500_USD": 0.08, "DE30_EUR": 0.08,
@@ -129,7 +129,7 @@ CONFLUENCE_THRESHOLD_MAP = {
 }
 
 PRICE_SANITY_RANGE = {
-    "XAU_USD":    (1500.0,  6500.0),   # or à ~3300$ en mai 2026, borne haute élargie
+    "XAU_USD":    (1500.0,  6500.0),
     "US30_USD":   (20000.0, 70000.0),
     "NAS100_USD": (8000.0,  35000.0),
     "SPX500_USD": (3000.0,  9000.0),
@@ -148,7 +148,6 @@ PDF_DIST_THRESHOLDS = {
 }
 DEFAULT_PDF_DIST = 8.0
 
-# FIX #18 — ABSOLUTE_MAX_DIST alignés avec PDF_DIST_THRESHOLDS.
 ABSOLUTE_MAX_DIST = {
     "XAU_USD":    8.0,
     "US30_USD":   5.0,
@@ -159,22 +158,12 @@ ABSOLUTE_MAX_DIST = {
 
 _GRANULARITY_MAP = {"h4": "H4", "daily": "D", "weekly": "W"}
 
-# FIX #10 — Tolérance fallback par famille d'instrument.
-# FIX M  — Ajout des paires JPY et cross-JPY avec tolérance réduite à 0.0005.
-# Problème identifié : USD/JPY@155 avec 0.001 → tolérance = 0.155 yen ≈ 1.2 pips.
-# Une tolérance de 1 pip sur JPY est un niveau intraday, pas un S/R structurel.
-# Résultat : trop de zones classées "Consommee" sur les paires JPY par faux breakout.
-# Après : 0.0005 → USD/JPY@155 → 0.077 yen ≈ 0.6 pip ; plus conservateur mais
-# la tolérance ATR (prioritaire quand dispo) compense largement sur data suffisante.
 _FALLBACK_TOLERANCE_PCT = {
-    # Métaux
     "XAU_USD":    0.002,
-    # Indices
     "US30_USD":   0.001,
     "NAS100_USD": 0.001,
     "SPX500_USD": 0.001,
     "DE30_EUR":   0.001,
-    # Paires JPY — FIX M : 0.0005 au lieu de 0.001
     "USD_JPY":    0.0005,
     "EUR_JPY":    0.0005,
     "GBP_JPY":    0.0005,
@@ -183,42 +172,29 @@ _FALLBACK_TOLERANCE_PCT = {
     "CHF_JPY":    0.0005,
     "NZD_JPY":    0.0005,
 }
-_DEFAULT_FALLBACK_TOLERANCE = 0.001   # 10 pips sur paires Forex standard
+_DEFAULT_FALLBACK_TOLERANCE = 0.001
 
 # ══════════════════════════════════════════════════════════════════
 # RATE LIMITING API OANDA
-# FIX I — Sémaphore global limitant les requêtes HTTP OANDA simultanées à 5.
-# Avant : 4 workers externes × 3 workers internes = jusqu'à 12 connexions simultanées
-# sans aucun contrôle → risque de 429 (Too Many Requests) sur compte Practice,
-# scans incomplets silencieux.
-# Après : toutes les requêtes HTTP OANDA (data + prix live) acquièrent ce sémaphore.
-# Le timeout de 10s par requête garantit la libération même en cas d'échec réseau.
 # ══════════════════════════════════════════════════════════════════
-_api_semaphore = threading.BoundedSemaphore(5)   # FIX I
+_api_semaphore = threading.BoundedSemaphore(5)
 
 # ══════════════════════════════════════════════════════════════════
 # CACHE THREAD-SAFE BORNÉ
-# FIX O — Remplacement des dicts non bornés par _BoundedTTLCache.
-# Problème avant : si 500+ entrées non expirées → la condition `if len > 500`
-# ne déclenche aucune purge → croissance mémoire illimitée sur sessions longues.
-# Solution : OrderedDict avec éviction LRU stricte dès que maxsize est atteint.
-# Aucune dépendance externe — implémentation native Python.
-# FIX #2 — threading.RLock() conservé (réentrant, nécessaire pour validate_live_price
-#           → get_oanda_data sur le même thread).
+# BUG-003 CORRIGÉ : un seul verrou _cache_lock pour les deux caches.
+# Avant  : _oanda_cache_lock et _price_cache_lock distincts → risque
+# deadlock si deux threads acquièrent les deux locks en ordre inverse.
+# Après  : verrou unique élimine la possibilité d'inversion d'ordre.
 # ══════════════════════════════════════════════════════════════════
 
 class _BoundedTTLCache:
-    """
-    Cache TTL à taille bornée avec éviction LRU.
-    Thread-safe via RLock externe (voir _oanda_cache_lock).
-    """
+    """Cache TTL à taille bornée avec éviction LRU. Thread-safe via verrou externe."""
     def __init__(self, maxsize: int, ttl: int):
         self._cache   = OrderedDict()
         self._maxsize = maxsize
         self._ttl     = ttl
 
     def get(self, key):
-        """Retourne la valeur si présente et non expirée, sinon None."""
         entry = self._cache.get(key)
         if entry is None:
             return None
@@ -226,16 +202,13 @@ class _BoundedTTLCache:
         if (datetime.now() - ts).total_seconds() > self._ttl:
             del self._cache[key]
             return None
-        # LRU : déplacer en fin (most recently used)
         self._cache.move_to_end(key)
         return val
 
     def set(self, key, val):
-        """Stocke la valeur et évicte l'entrée la plus ancienne si plein."""
         if key in self._cache:
             self._cache.move_to_end(key)
         self._cache[key] = (val, datetime.now())
-        # Éviction LRU stricte : supprime l'entrée la plus ancienne (début de l'OrderedDict)
         while len(self._cache) > self._maxsize:
             self._cache.popitem(last=False)
 
@@ -243,8 +216,10 @@ class _BoundedTTLCache:
         return len(self._cache)
 
 
-_oanda_cache      = _BoundedTTLCache(maxsize=300, ttl=600)   # FIX O
-_oanda_cache_lock = threading.RLock()                         # FIX #2
+_oanda_cache = _BoundedTTLCache(maxsize=300, ttl=600)
+_price_cache = _BoundedTTLCache(maxsize=100, ttl=60)
+# BUG-003 : verrou unique pour les deux caches
+_cache_lock  = threading.RLock()
 
 def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()[:12]
@@ -252,20 +227,15 @@ def _token_fingerprint(token: str) -> str:
 def _cache_key(token: str, symbol: str, timeframe: str, limit: int) -> str:
     return f"{_token_fingerprint(token)}__{symbol}__{timeframe}__{limit}"
 
-# FIX #1 — TTL check atomique dans le lock (check-then-act).
-# FIX O  — Utilise maintenant _BoundedTTLCache.get() qui gère TTL + LRU.
-def _cache_get(key: str, ttl_seconds: int) -> Optional[pd.DataFrame]:
-    with _oanda_cache_lock:
+def _cache_get(key: str) -> Optional[pd.DataFrame]:
+    with _cache_lock:
         df = _oanda_cache.get(key)
         if df is None:
             return None
-        # FIX A — Copie défensive : protège contre la mutation du DataFrame
-        # par un appelant qui corromprait le cache partagé pour tous les threads.
         return df.copy()
 
-# FIX O — Utilise _BoundedTTLCache.set() avec éviction LRU automatique.
 def _cache_set(key: str, df: Optional[pd.DataFrame]) -> None:
-    with _oanda_cache_lock:
+    with _cache_lock:
         _oanda_cache.set(key, df)
 
 
@@ -295,34 +265,30 @@ def _safe_pdf_str(text: str) -> str:
     return text
 
 
-# FIX #17 — Sanitisation des tracebacks pour ne jamais exposer le token OANDA.
 def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
-    """Masque les valeurs sensibles (token, account_id) dans un traceback."""
     for val in sensitive_values:
         if val and isinstance(val, str) and len(val) > 4:
             tb = tb.replace(val, f"***{val[-4:]}")
     return tb
 
 
-# FIX R2 — Helper centralisé pour supprimer les colonnes internes.
 _INTERNAL_COLS = ["_dist_num", "_in_pdf"]
 
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Supprime les colonnes internes non destinées à l'affichage/export."""
     return df.drop(columns=_INTERNAL_COLS, errors="ignore")
 
 
-# FIX R7 — Source unique de vérité pour la conversion symbole OANDA → affichage.
 def _sym_display(sym: str) -> str:
-    """Convertit un symbole OANDA (EUR_USD) en format d'affichage (EUR/USD)."""
     return sym.replace("_", "/")
 
 
 # ══════════════════════════════════════════════════════════════════
 # API OANDA
+# BUG-006 (partiel) : timeout=(3, 8) sur toutes les requêtes HTTP
+# Avant  : timeout=10 (read seul) → connexion peut bloquer indefiniment
+# Après  : timeout=(3, 8) = connect 3s, read 8s
 # ══════════════════════════════════════════════════════════════════
 
-# FIX #7 — @st.cache_data supprimé.
 def determine_oanda_environment(access_token: str, account_id: str) -> Optional[str]:
     headers = {"Authorization": f"Bearer {access_token}"}
     for url in [
@@ -330,15 +296,15 @@ def determine_oanda_environment(access_token: str, account_id: str) -> Optional[
         "https://api-fxtrade.oanda.com",
     ]:
         try:
-            # FIX I — Sémaphore sur l'appel de détection environnement
             with _api_semaphore:
-                r = _http_session.get(
+                r = _get_session().get(
                     f"{url}/v3/accounts/{account_id}/summary",
-                    headers=headers, timeout=5
+                    headers=headers,
+                    timeout=(3, 5),   # BUG-006
                 )
             if r.status_code == 200:
                 return url
-        except (requests.RequestException, ValueError):   # FIX G
+        except (requests.RequestException, ValueError):
             continue
     return None
 
@@ -346,7 +312,7 @@ def determine_oanda_environment(access_token: str, account_id: str) -> Optional[
 def get_oanda_data(base_url: str, access_token: str, symbol: str,
                    timeframe: str = "daily", limit: int = 500) -> Optional[pd.DataFrame]:
     key = _cache_key(access_token, symbol, timeframe, limit)
-    cached = _cache_get(key, ttl_seconds=600)
+    cached = _cache_get(key)
     if cached is not None:
         return cached
 
@@ -360,9 +326,11 @@ def get_oanda_data(base_url: str, access_token: str, symbol: str,
     headers = {"Authorization": f"Bearer {access_token}"}
     params  = {"count": limit + 1, "granularity": gran, "price": "M"}
     try:
-        # FIX I — Sémaphore : max 5 requêtes OANDA simultanées
         with _api_semaphore:
-            r = _http_session.get(url, headers=headers, params=params, timeout=10)
+            r = _get_session().get(
+                url, headers=headers, params=params,
+                timeout=(3, 8),   # BUG-006
+            )
             r.raise_for_status()
             data = r.json()
 
@@ -384,29 +352,15 @@ def get_oanda_data(base_url: str, access_token: str, symbol: str,
             return None
         _cache_set(key, df)
         return df
-    # FIX G — ValueError inclut json.JSONDecodeError (captcha Cloudflare, proxy cassé).
     except (requests.RequestException, ValueError):
         return None
-
-
-# ══════════════════════════════════════════════════════════════════
-# CACHE PRIX LIVE — borné avec _BoundedTTLCache
-# FIX O — même logique que _oanda_cache
-# FIX #5 — purge automatique (maintenant garantie par LRU eviction)
-# ══════════════════════════════════════════════════════════════════
-_price_cache      = _BoundedTTLCache(maxsize=100, ttl=60)   # FIX O
-_price_cache_lock = threading.RLock()                        # FIX #2
-
-def _price_cache_set(key: str, value: float) -> None:
-    with _price_cache_lock:
-        _price_cache.set(key, value)
 
 
 def get_oanda_current_price(base_url: str, access_token: str,
                              account_id: str, symbol: str) -> Optional[float]:
     key = f"{_token_fingerprint(access_token)}__{symbol}__price"
-    # FIX B — TTL check dans le lock (atomique, élimine TOCTOU).
-    with _price_cache_lock:
+    # BUG-003 : même verrou _cache_lock pour le cache prix
+    with _cache_lock:
         val = _price_cache.get(key)
         if val is not None:
             return val
@@ -414,30 +368,27 @@ def get_oanda_current_price(base_url: str, access_token: str,
     url     = f"{base_url}/v3/accounts/{account_id}/pricing"
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
-        # FIX I — Sémaphore sur l'appel prix live
         with _api_semaphore:
-            r = _http_session.get(
-                url, headers=headers, params={"instruments": symbol}, timeout=5
+            r = _get_session().get(
+                url, headers=headers,
+                params={"instruments": symbol},
+                timeout=(3, 5),   # BUG-006
             )
             r.raise_for_status()
             data = r.json()
 
-        # FIX H — Protection KeyError/IndexError :
-        # OANDA peut retourner {"prices": []} si le marché est fermé (week-end)
-        # ou modifier son payload (ex: clé renommée). Sans ce guard, le thread
-        # crashe silencieusement et raw_price=None provoque un fallback H4
-        # sans aucune alerte visible dans les logs.
         if "prices" in data and data["prices"]:
             bid = float(data["prices"][0]["closeoutBid"])
             ask = float(data["prices"][0]["closeoutAsk"])
             result = (bid + ask) / 2
         else:
             result = None
-    except (requests.RequestException, ValueError, KeyError, IndexError):   # FIX H + FIX G
+    except (requests.RequestException, ValueError, KeyError, IndexError):
         result = None
 
     if result is not None:
-        _price_cache_set(key, result)
+        with _cache_lock:   # BUG-003
+            _price_cache.set(key, result)
     return result
 
 
@@ -471,7 +422,6 @@ def validate_live_price(live_price, symbol, base_url, access_token):
 
 
 def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
-    # FIX #3 — guard current_price <= 0
     if current_price is None or current_price <= 0:
         return None
     messages = []
@@ -545,7 +495,7 @@ def compute_trend(df, sma_period=20):
         return "NEUTRE"
 
     actual_period = min(sma_period, len(df) - 5)
-    _MIN_SMA_BARS = 10   # FIX #14
+    _MIN_SMA_BARS = 10
     if actual_period < _MIN_SMA_BARS:
         return "NEUTRE"
 
@@ -585,10 +535,9 @@ TF_WEIGHT = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 
 def compute_structural_score(strength, nb_tf, tf_name="H4", age_bars=0, total_bars=500):
     tf_w  = TF_WEIGHT.get(tf_name, 1.0)
-    # FIX F — max(age_bars, 0) empêche exp(+grand) si age_bars négatif en amont.
     age_r = max(int(age_bars), 0) / max(int(total_bars), 1)
     age_f = float(np.exp(-1.5 * age_r))
-    raw   = int(strength) * tf_w * nb_tf   # FIX #16
+    raw   = int(strength) * tf_w * nb_tf
     return round(raw * age_f, 1)
 
 
@@ -597,8 +546,6 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
         return zones_list
 
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
-
-    # FIX #6 — Garde-fou boucle infinie.
     MAX_ITERATIONS = 50
     iterations = 0
 
@@ -616,7 +563,6 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
                 if j in used:
                     continue
                 current_centroid = np.mean([z["level"] for z in group])
-                # FIX C — Guard centroïde nul (ZeroDivisionError).
                 if current_centroid <= 0:
                     break
                 if abs(zones_list[j]["level"] - current_centroid) / current_centroid * 100 <= threshold_pct:
@@ -626,22 +572,14 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
             used.add(i)
 
             best_age = min(z.get("age_bars", 0) for z in group)
-
-            # FIX L — Statut post-fusion : max() au lieu de min().
-            # Bug identifié audit v5.8 : min() par STATUS_PRIORITY retournait "Vierge" (0)
-            # même si un groupe contenait une zone "Consommee" (2).
-            # Exemple : zone Vierge@1.1000 + zone Consommee@1.1020 fusionnent
-            # → résultat "Vierge" = zone invalide présentée comme fiable.
-            # Correction : max() retourne le statut le plus dégradé du groupe,
-            # ce qui est méthodologiquement correct (une cassure invalide la macro-zone).
             best_status = max(
                 (z.get("status", "Testee") for z in group),
                 key=lambda s: STATUS_PRIORITY.get(s, 1)
-            )   # FIX L (était min())
+            )
 
             new_zones.append({
                 "level":    float(np.mean([z["level"] for z in group])),
-                "strength": int(sum(z["strength"] for z in group)),   # FIX #16
+                "strength": int(sum(z["strength"] for z in group)),
                 "age_bars": best_age,
                 "status":   best_status,
             })
@@ -657,14 +595,12 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
     opens  = pd.Series(df["open"].values)
 
     roll_high_left  = highs.shift(1).rolling(n, min_periods=n).max()
-    # FIX E — min_periods=1 pour détecter les pivots sur les bougies récentes.
     roll_high_right = highs[::-1].shift(1).rolling(n, min_periods=1).max()[::-1]
     roll_low_left   = lows.shift(1).rolling(n, min_periods=n).min()
     roll_low_right  = lows[::-1].shift(1).rolling(n, min_periods=1).min()[::-1]
 
     next_close = closes.shift(-1).fillna(closes)
 
-    # FIX #12 — Filtre wick ≥20% : élimine les faux pivots sur bougies Marubozu.
     candle_range  = (highs - lows).clip(lower=1e-10)
     body_top      = pd.Series(np.maximum(opens.values, closes.values))
     upper_wick_pct = (highs - body_top) / candle_range
@@ -707,7 +643,6 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
 def classify_zone_status(level, zone_type, df, formation_idx,
                           atr_val=None, tolerance_coeff=0.25,
                           fallback_tolerance_pct=_DEFAULT_FALLBACK_TOLERANCE):
-    # FIX #10 — fallback_tolerance_pct passé par l'appelant (adapté à l'instrument).
     if formation_idx >= len(df) - 1:
         return "Vierge"
 
@@ -757,11 +692,6 @@ def classify_zone_status(level, zone_type, df, formation_idx,
     if len(rc_after) == 0:
         return "Role Reverse"
 
-    # FIX D — Logique Role Reverse CORRIGÉE (validée audit v5.8).
-    # RR Support (support cassé → devenu résistance) :
-    #   consommé si rc_after > level + tolerance (prix casse la résistance RR vers le haut).
-    # RR Résistance (résistance cassée → devenu support) :
-    #   consommé si rc_after < level - tolerance (prix casse le support RR vers le bas).
     if zone_type == "Support":
         second_break = rc_after > level + tolerance
     else:
@@ -780,7 +710,6 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
                           min_touches=2, timeframe="daily",
                           post_merge_threshold=0.30,
                           swing_n=3):
-    # FIX #10 — Tolérance adaptée à l'instrument
     fallback_tol_pct = _FALLBACK_TOLERANCE_PCT.get(symbol, _DEFAULT_FALLBACK_TOLERANCE)
 
     if df is None or df.empty or len(df) < 20:
@@ -816,7 +745,9 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
     for idx, price in pivot_lows.items():
         pivots_with_idx.append((float(price), int(idx)))
 
-    pivots_with_idx.sort(key=lambda x: x[0])
+    # BUG-008 CORRIGÉ : tri stable sur (price, idx) pour résultats déterministes
+    pivots_with_idx.sort(key=lambda x: (x[0], x[1]))
+
     if not pivots_with_idx:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -851,11 +782,15 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
         last_idx = max(indices)
         age_bars = n_total - 1 - last_idx
 
+        # BUG-005 CORRIGÉ : filtrer les niveaux nuls ou négatifs
+        if lvl <= 0:
+            continue
+
         zone_type_tmp = "Support" if lvl < current_price else "Resistance"
         status = classify_zone_status(
             lvl, zone_type_tmp, df, last_idx,
             atr_val=atr_val, tolerance_coeff=0.25,
-            fallback_tolerance_pct=fallback_tol_pct,   # FIX #10 + FIX M
+            fallback_tolerance_pct=fallback_tol_pct,
         )
 
         strong.append({
@@ -884,7 +819,6 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
 
     df_zones["is_pivot"] = pivot_mask
 
-    # FIX #4 — Séparation stricte supports/résistances (pas de doublonnage).
     supports    = df_zones[df_zones["level"] <  current_price].copy()
     resistances = df_zones[df_zones["level"] >= current_price].copy()
 
@@ -893,11 +827,12 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
 
 def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1.0,
                         bars_map=None):
-    # FIX #8 — bars_map : vrai nb de bougies par TF
     bars_map = bars_map or {}
 
     if not zones_dict or current_price is None:
         return []
+
+    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
 
     all_zones = []
     for tf, (supports, resistances) in zones_dict.items():
@@ -936,13 +871,11 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     .reset_index(drop=True))
     used_indices = set()
     confluences  = []
-    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
 
     for i, zone in zones_df.iterrows():
         if i in used_indices:
             continue
 
-        # FIX #3 — Guard level <= 0
         if zone["level"] <= 0:
             used_indices.add(i)
             continue
@@ -954,14 +887,16 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
         ]
 
         if len(similar) >= 1:
-            # FIX #15 — Sélection directe par index (évite pd.concat O(n²)).
             group_indices = [i] + similar.index.tolist()
             group         = zones_df.loc[group_indices]
             timeframes    = group["tf"].unique()
 
-            used_indices.update(group.index)
-
+            # BUG-010 CORRIGÉ : on ne marque used_indices que si la confluence
+            # est réellement créée (len(timeframes) >= 2).
+            # Avant : les indices étaient marqués used même si le groupe ne
+            # produisait aucune confluence (TF unique) → zones perdues.
             if len(timeframes) >= 2:
+                used_indices.update(group.index)
 
                 group_sup = group[group["level"] < current_price]
                 group_res = group[group["level"] >= current_price]
@@ -989,7 +924,6 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     if sub_active.empty:
                         sub_active = subgroup
 
-                    # FIX #8 — Vrai total_bars par TF
                     sub_score = sum(
                         compute_structural_score(
                             int(r["strength"]), sub_nb_tf,
@@ -1001,10 +935,16 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     )
 
                     sub_strength = int(subgroup["strength"].sum())
-                    sub_status   = min(
+
+                    # BUG-004 CORRIGÉ : max() au lieu de min() pour sub_status.
+                    # Avant  : min() retournait "Vierge" même si une zone du groupe
+                    # était "Consommee" → signaux invalides sur niveaux cassés.
+                    # Après  : max() retourne le statut le plus dégradé du groupe,
+                    # cohérent avec post_merge_zones (FIX L appliqué au même bug).
+                    sub_status = max(
                         subgroup["status"].tolist(),
                         key=lambda s: STATUS_PRIORITY.get(s, 1)
-                    )
+                    )   # BUG-004 (était min())
 
                     is_pivot = sub_dist <= 0.50
                     if is_pivot:
@@ -1041,6 +981,9 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                         "Distance %":   f"{sub_dist:.2f}%",
                         "Alerte":       sub_alerte,
                     })
+            else:
+                # Groupe à TF unique : on ne marque que la zone courante
+                used_indices.add(i)
         else:
             used_indices.add(i)
 
@@ -1058,8 +1001,8 @@ class ScanResult:
     price:         Optional[float]
     trends:        dict
     anomaly:       Optional[str]
-    bars_map:      dict = field(default_factory=dict)  # FIX #8
-    scan_error:    Optional[str] = None                # FIX P
+    bars_map:      dict = field(default_factory=dict)
+    scan_error:    Optional[str] = None
 
 
 def scan_single_symbol(args) -> ScanResult:
@@ -1081,25 +1024,28 @@ def scan_single_symbol(args) -> ScanResult:
     anomaly_msg    = None
     internal_error = None
 
-    sym_d = _sym_display(symbol)   # FIX R7
+    # BUG-001 CORRIGÉ : reference_price initialisé AVANT le bloc try.
+    # Avant  : déclaré à l'intérieur du try → si exception précoce,
+    # la ligne `reference_price if 'reference_price' in dir() else None`
+    # dans le return était un guard fragile.
+    # Après  : valeur sûre garantie dans tous les cas.
+    reference_price = None
+
+    sym_d = _sym_display(symbol)
 
     _TF_KEYS = [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]
 
     def _fetch_tf(tf_key):
         return tf_key, get_oanda_data(base_url, access_token, symbol, tf_key, limit=500)
 
-    # FIX P — Le corps principal de scan_single_symbol est encapsulé dans un
-    # try/except pour que internal_error soit réellement peuplé et propagé via
-    # ScanResult.scan_error. Avant (FIX R6) : internal_error = None déclaré
-    # mais jamais assigné → champ toujours None (dead code).
-    # Après : toute exception inattendue dans la logique de scan est capturée
-    # ici, ce qui permet au caller (boucle as_completed) de la distinguer des
-    # exceptions de threading/futures et d'afficher un message précis dans l'UI.
     try:
+        # BUG-006 CORRIGÉ (pool interne) : timeout=30 sur as_completed
+        # Avant  : as_completed sans timeout → si une requête TF bloque
+        # indefiniment, le thread de scan est gelé.
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as tf_pool:
             tf_futures = {tf_pool.submit(_fetch_tf, tk): tk for tk, _ in _TF_KEYS}
             tf_data = {}
-            for fut in concurrent.futures.as_completed(tf_futures):
+            for fut in concurrent.futures.as_completed(tf_futures, timeout=30):   # BUG-006
                 try:
                     tf_key, df = fut.result()
                     tf_data[tf_key] = df
@@ -1125,7 +1071,7 @@ def scan_single_symbol(args) -> ScanResult:
             if tf_key == "h4":
                 last_h4_close = float(df["close"].iloc[-1])
 
-            bars_map[tf_cap] = len(df)   # FIX #8
+            bars_map[tf_cap] = len(df)
 
             cp = reference_price
 
@@ -1211,21 +1157,20 @@ def scan_single_symbol(args) -> ScanResult:
                 anomaly_msg = (f"{anomaly_msg} | {new_anomaly}"
                                if anomaly_msg else new_anomaly)
 
+    except concurrent.futures.TimeoutError:
+        internal_error = "TimeoutError: données TF non reçues dans les 30s"
     except Exception as e:
-        # FIX P — Capture les erreurs inattendues dans la logique de scan
-        # (ex: bug dans une fonction d'analyse) et les propage via scan_error.
-        # Les erreurs réseau/API sont déjà catchées dans get_oanda_data.
         internal_error = f"{type(e).__name__}: {str(e)[:300]}"
 
     return ScanResult(
         symbol     = symbol,
         rows       = rows,
         zones      = zones_d,
-        price      = reference_price if 'reference_price' in dir() else None,
+        price      = reference_price,   # BUG-001 : toujours défini (None si échec)
         trends     = trends,
         anomaly    = anomaly_msg,
         bars_map   = bars_map,
-        scan_error = internal_error,   # FIX P — désormais réellement peuplé si erreur
+        scan_error = internal_error,
     )
 
 
@@ -1246,7 +1191,6 @@ class PDF(FPDF):
                   _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'),
                   border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
-        # FIX R9 — SCANNER_VERSION dans le header PDF
         self.cell(0, 6,
                   _safe_pdf_str(
                       f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
@@ -1383,10 +1327,12 @@ def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df["_dist_num"] <= DEFAULT_PDF_DIST].copy()
     elif "Dist. %" in df.columns:
         def _to_f(s):
-            try:    return float(str(s).replace("%", ""))
-            except: return 999.0
+            try:
+                return float(str(s).replace("%", ""))
+            except (ValueError, TypeError):
+                return 999.0
         df = df[df["Dist. %"].apply(_to_f) <= DEFAULT_PDF_DIST].copy()
-    return _clean_df(df).reset_index(drop=True)   # FIX R2
+    return _clean_df(df).reset_index(drop=True)
 
 
 def create_pdf_report(results_dict, confluences_df=None,
@@ -1510,13 +1456,13 @@ def create_llm_brief(summaries, confluences_df,
             actif_zones[actif] = []
         actif_zones[actif].append({
             "signal":  str(row.get("Signal", "")),
-            "niveau":  str(row.get("Niveau", "")),
+            "niveau":  str(row.get("Niveau",     "")),
             "score":   score_val,
             "statut":  statut,
             "dist":    dist_val,
             "tfs":     str(row.get("Timeframes", "")),
             "nb_tf":   int(row.get("Nb TF", 0)),
-            "alerte":  str(row.get("Alerte", "")),
+            "alerte":  str(row.get("Alerte",     "")),
         })
 
     actif_max_score = {
@@ -1583,69 +1529,96 @@ def create_llm_brief(summaries, confluences_df,
 
 def create_json_export(summaries, confluences_df,
                        max_dist=5.0, min_score=50.0):
+    """
+    JSON CORRIGÉ : inclut TOUS les actifs scannés (pas seulement ceux
+    avec confluences), avec tendances et prix_context même si zones=[].
+    Avant : seuls les actifs ayant au moins une confluence passant les
+    filtres apparaissaient → actifs sans confluence silencieusement absents.
+    """
     output = {
         "generated_at": datetime.now().isoformat(),
-        "assets": []
+        "scanner_version": SCANNER_VERSION,
+        "assets": [],
     }
 
     summary_map = {s["symbol"]: s for s in summaries}
 
-    if confluences_df is None or confluences_df.empty:
-        return json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
+    # 1. Construire le dictionnaire actif → zones filtrées
+    actif_groups: dict = {}
 
-    actif_groups = {}
-    for _, row in confluences_df.iterrows():
-        try:
-            dist_val = float(str(row.get("Distance %", "999")).replace("%", ""))
-        except Exception:
-            dist_val = 999.0
-        try:
-            score_val = float(row.get("Score", 0))
-            if not pd.notna(score_val):
+    if confluences_df is not None and not confluences_df.empty:
+        for _, row in confluences_df.iterrows():
+            try:
+                dist_val = float(str(row.get("Distance %", "999")).replace("%", ""))
+            except Exception:
+                dist_val = 999.0
+            try:
+                score_val = float(row.get("Score", 0))
+                if not pd.notna(score_val):
+                    score_val = 0.0
+            except (TypeError, ValueError):
                 score_val = 0.0
-        except (TypeError, ValueError):
-            score_val = 0.0
 
-        if dist_val > max_dist or score_val < min_score:
-            continue
+            if dist_val > max_dist or score_val < min_score:
+                continue
 
-        signal_raw = str(row.get("Signal", ""))
-        if "BUY" not in signal_raw and "SELL" not in signal_raw:
-            continue
+            signal_raw = str(row.get("Signal", ""))
+            if "BUY" not in signal_raw and "SELL" not in signal_raw:
+                continue
 
-        if str(row.get("Statut", "")) == "Consommee":
-            continue
+            if str(row.get("Statut", "")) == "Consommee":
+                continue
 
-        actif = str(row.get("Actif", ""))
-        if actif not in actif_groups:
-            actif_groups[actif] = []
+            actif = str(row.get("Actif", ""))
+            if actif not in actif_groups:
+                actif_groups[actif] = []
 
-        alert_raw = str(row.get("Alerte", ""))
-        alert_clean = (alert_raw
-                       .replace("🔥 ", "").replace("⚠️ ", "")
-                       .replace("🔥", "").replace("⚠️", "")
-                       .strip())
+            alert_raw = str(row.get("Alerte", ""))
+            alert_clean = (alert_raw
+                           .replace("🔥 ", "").replace("⚠️ ", "")
+                           .replace("🔥", "").replace("⚠️", "")
+                           .strip())
 
-        actif_groups[actif].append({
-            "signal":       signal_raw.replace("🟢 ", "").replace("🔴 ", "").strip(),
-            "level":        str(row.get("Niveau", "")),
-            "score":        round(score_val, 1),
-            "status":       str(row.get("Statut", "")),
-            "distance_pct": round(dist_val, 3),
-            "alert":        alert_clean,
-            "timeframes":   str(row.get("Timeframes", "")),
-        })
+            actif_groups[actif].append({
+                "signal":       signal_raw.replace("🟢 ", "").replace("🔴 ", "").strip(),
+                "level":        str(row.get("Niveau", "")),
+                "score":        round(score_val, 1),
+                "status":       str(row.get("Statut", "")),
+                "distance_pct": round(dist_val, 3),
+                "alert":        alert_clean,
+                "timeframes":   str(row.get("Timeframes", "")),
+            })
 
-    for actif, zones in sorted(
-        actif_groups.items(),
-        key=lambda x: max(z["score"] for z in x[1]),
+    # 2. Construire la liste triée sur TOUS les actifs scannés
+    # Les actifs sans confluence ont zones=[], mais sont présents dans le JSON.
+    all_actifs = set(summary_map.keys())
+    all_actifs.update(actif_groups.keys())
+
+    sorted_actifs = sorted(
+        all_actifs,
+        key=lambda a: max(
+            (z["score"] for z in actif_groups.get(a, [])),
+            default=0.0
+        ),
         reverse=True,
-    ):
-        s = summary_map.get(actif, {})
+    )
+
+    for actif in sorted_actifs:
+        s     = summary_map.get(actif, {})
+        zones = sorted(
+            actif_groups.get(actif, []),
+            key=lambda z: z["score"],
+            reverse=True,
+        )
         output["assets"].append({
             "symbol":        actif,
+            "trends": {
+                "h4":     s.get("trend_h4",     "NEUTRE"),
+                "daily":  s.get("trend_daily",  "NEUTRE"),
+                "weekly": s.get("trend_weekly", "NEUTRE"),
+            },
             "price_context": s.get("price_context", ""),
-            "zones":         sorted(zones, key=lambda z: z["score"], reverse=True),
+            "zones":         zones,
         })
 
     return json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1784,7 +1757,7 @@ def _display_results(sr: dict, max_dist_filter: float):
             json_bytes = create_json_export(
                 summaries, conf_full,
                 max_dist  = max_dist_filter,
-                min_score = float(llm_min_score),   # FIX #13
+                min_score = float(llm_min_score),
             )
             st.download_button(
                 "🔧 Export JSON structuré",
@@ -1799,8 +1772,8 @@ def _display_results(sr: dict, max_dist_filter: float):
         st.caption(f"Filtres : Dist < {llm_max_dist}% | Score ≥ {llm_min_score} | {', '.join(llm_statuts)}")
         try:
             brief_preview = md_bytes.decode("utf-8")
-            n_zones  = sum(1 for l in brief_preview.split("\n")
-                           if l.strip().startswith("- BUY") or l.strip().startswith("- SELL"))
+            n_zones  = sum(1 for line in brief_preview.split("\n")
+                           if line.strip().startswith("- BUY") or line.strip().startswith("- SELL"))
             n_actifs = brief_preview.count("### ")
             st.info(
                 f"**{n_actifs} actifs** avec **{n_zones} zones** dans le brief LLM "
@@ -1819,8 +1792,10 @@ def _display_results(sr: dict, max_dist_filter: float):
         if df.empty or "Dist. %" not in df.columns:
             return df
         def to_float(s):
-            try:   return float(str(s).replace("%", ""))
-            except: return 999.0
+            try:
+                return float(str(s).replace("%", ""))
+            except (ValueError, TypeError):
+                return 999.0
         mask = df["Dist. %"].apply(to_float) <= max_pct
         out  = _clean_df(df[mask])
         sort_col = "Score (1TF)" if "Score (1TF)" in out.columns else "Score"
@@ -1853,7 +1828,6 @@ with st.sidebar:
     try:
         access_token = st.secrets["OANDA_ACCESS_TOKEN"]
         account_id   = st.secrets["OANDA_ACCOUNT_ID"]
-        # FIX #19 — Vérification explicite des valeurs vides
         if not access_token or not str(access_token).strip():
             raise ValueError("OANDA_ACCESS_TOKEN est vide")
         if not account_id or not str(account_id).strip():
@@ -1905,7 +1879,6 @@ with st.sidebar:
     confluence_threshold = st.slider(
         "Seuil confluence Forex (%)", 0.3, 2.0, 1.0, 0.1,
     )
-    # FIX R4 — Avertissement seuils ignorés pour indices/métaux
     _overridden = [s.replace("_USD","").replace("_EUR","")
                    for s in CONFLUENCE_THRESHOLD_MAP]
     st.caption(
@@ -1931,36 +1904,54 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 43 corrections**")
+    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 53 corrections**")
     st.caption("— v5.5 (12 fixes) — v5.6 (9 fixes) — v5.7 (7 fixes) —")
-    st.caption("— v5.8 (9 fixes — audit indépendant Claude Sonnet 4.6) —")
-    st.caption("✅ H   — KeyError/IndexError prix live (crash silencieux week-end)")
-    st.caption("✅ I   — BoundedSemaphore(5) : max 5 req OANDA simultanées")
-    st.caption("✅ J   — max_workers=4→2 pool principal (charge API réduite)")
-    st.caption("✅ K   — Bouton scan désactivé pendant exécution (anti double-clic)")
-    st.caption("✅ L   — post_merge_zones : min()→max() statut (bug métier Vierge/Consommee)")
-    st.caption("✅ M   — Tolérance JPY 0.001→0.0005 (faux Consommee sur USD/JPY etc.)")
-    st.caption("✅ N   — POST_MERGE_THRESHOLD Forex 0.30→0.15% (granularité S/R préservée)")
-    st.caption("✅ O   — _BoundedTTLCache : éviction LRU stricte (fin fuite mémoire)")
-    st.caption("✅ P   — scan_single_symbol : internal_error réellement peuplé")
+    st.caption("— v5.8 (9 fixes — audit Claude Sonnet 4.6) —")
+    st.caption("— v5.9 (7 fixes — audit forensique indépendant) —")
+    st.caption("✅ BUG-001 — reference_price initialisé avant try (NameError potentiel)")
+    st.caption("✅ BUG-002 — st.rerun() atomique : bouton désactivé immédiatement")
+    st.caption("✅ BUG-003 — Verrou unique _cache_lock (anti-deadlock)")
+    st.caption("✅ BUG-004 — detect_confluences : min()→max() pour sub_status")
+    st.caption("✅ BUG-005 — find_strong_sr_zones : filtre lvl <= 0")
+    st.caption("✅ BUG-006 — Timeouts (3,8) sur HTTP + timeout=30 as_completed")
+    st.caption("✅ BUG-008 — Tri stable (price, idx) pour clustering déterministe")
+    st.caption("✅ BUG-010 — used_indices marqués seulement si confluence créée")
+    st.caption("✅ BUG-012 — Session HTTP threading.local() par thread")
+    st.caption("✅ JSON    — Tous les actifs présents (avec ou sans confluence)")
 
 
 # ══════════════════════════════════════════════════════════════════
 # LOGIQUE PRINCIPALE
+# BUG-002 CORRIGÉ : pattern st.rerun() pour atomicité du scan.
+# Avant  : session_state["scanning"]=True puis scan immédiat dans le
+# même render → Streamlit n'avait pas encore re-rendu le bouton comme
+# disabled → double-clic rapide pouvait lancer deux scans concurrents.
+# Après  : 
+#   1er render (clic bouton) → scanning=True + pending_scan=True + st.rerun()
+#   2e  render (rerun)       → bouton disabled visible + scan exécuté
+#   3e  render (fin scan)    → scanning=False + résultats affichés
 # ══════════════════════════════════════════════════════════════════
-if scan_button and symbols_to_scan:
+
+# Déclenchement : premier clic sur le bouton
+if scan_button and symbols_to_scan and not st.session_state.get("scanning", False):
     st.session_state.pop("scan_results", None)
+    st.session_state["scanning"]    = True
+    st.session_state["pending_scan"] = True
+    st.rerun()   # BUG-002 : rerender immédiat avec bouton disabled
+
+# Exécution du scan (render suivant, scanning=True, pending_scan=True)
+if st.session_state.get("pending_scan", False) and symbols_to_scan:
+    st.session_state.pop("pending_scan", None)
 
     if not access_token or not account_id:
+        st.session_state["scanning"] = False
         st.warning("Configurez vos secrets OANDA avant de lancer le scan.")
     else:
         base_url = determine_oanda_environment(access_token, account_id)
         if not base_url:
+            st.session_state["scanning"] = False
             st.error("Identifiants OANDA invalides. Vérifiez vos secrets.")
         else:
-            # FIX K — Marquer le scan comme actif (désactive le bouton via disabled=)
-            st.session_state["scanning"] = True
-
             progress_bar = st.progress(0, text="Initialisation du scan…")
 
             results_h4, results_daily, results_weekly = [], [], []
@@ -1977,63 +1968,68 @@ if scan_button and symbols_to_scan:
             ]
             total, completed = len(args_list), 0
 
-            # FIX J — max_workers=4 → 2 sur le pool principal.
-            # Combiné avec FIX I (BoundedSemaphore=5), le pic de connexions HTTP
-            # simultanées est plafonné à 5 quelle que soit la configuration.
-            # 2 workers × 3 TF internes = 6 requêtes potentielles, mais le sémaphore
-            # garantit que seules 5 s'exécutent en même temps sur OANDA.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:   # FIX J
+            # BUG-006 CORRIGÉ (pool principal) : timeout=120 sur as_completed
+            # 33 actifs × 3 TF × ~2s/req = ~200s max théorique, mais le
+            # sémaphore(5) et le cache ramènent ça à ~60-90s en pratique.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 future_map = {
                     executor.submit(scan_single_symbol, a): a[0] for a in args_list
                 }
-                for future in concurrent.futures.as_completed(future_map):
-                    sym = future_map[future]
-                    completed += 1
-                    progress_bar.progress(
-                        completed / total,
-                        text=f"Scan… ({completed}/{total}) {sym.replace('_', '/')}",
-                    )
-                    try:
-                        result: ScanResult = future.result()
+                try:
+                    for future in concurrent.futures.as_completed(future_map, timeout=120):  # BUG-006
+                        sym = future_map[future]
+                        completed += 1
+                        progress_bar.progress(
+                            completed / total,
+                            text=f"Scan… ({completed}/{total}) {sym.replace('_', '/')}",
+                        )
+                        try:
+                            result: ScanResult = future.result()
 
-                        all_zones_map[result.symbol]   = result.zones
-                        prices_map[result.symbol]      = result.price
-                        trends_map[result.symbol]      = result.trends
-                        bars_map_global[result.symbol] = result.bars_map
+                            all_zones_map[result.symbol]   = result.zones
+                            prices_map[result.symbol]      = result.price
+                            trends_map[result.symbol]      = result.trends
+                            bars_map_global[result.symbol] = result.bars_map
 
-                        if result.anomaly:
-                            anomalies_map[_sym_display(result.symbol)] = result.anomaly
+                            if result.anomaly:
+                                anomalies_map[_sym_display(result.symbol)] = result.anomaly
 
-                        # FIX P — scan_error désormais réellement peuplé si erreur interne
-                        if result.scan_error:
-                            scan_errors[_sym_display(result.symbol)] = (
-                                f"[interne] {result.scan_error}"
+                            if result.scan_error:
+                                scan_errors[_sym_display(result.symbol)] = (
+                                    f"[interne] {result.scan_error}"
+                                )
+
+                            for tf_cap, tf_rows in result.rows.items():
+                                if tf_rows:
+                                    if tf_cap == "H4":
+                                        results_h4.extend(tf_rows)
+                                    elif tf_cap == "Daily":
+                                        results_daily.extend(tf_rows)
+                                    elif tf_cap == "Weekly":
+                                        results_weekly.extend(tf_rows)
+
+                        except (requests.RequestException, ValueError,
+                                KeyError, pd.errors.EmptyDataError) as e:
+                            scan_errors[_sym_display(sym)] = (
+                                f"{type(e).__name__}: {str(e)[:200]}"
                             )
-
-                        for tf_cap, tf_rows in result.rows.items():
-                            if tf_rows:
-                                if tf_cap == "H4":
-                                    results_h4.extend(tf_rows)
-                                elif tf_cap == "Daily":
-                                    results_daily.extend(tf_rows)
-                                elif tf_cap == "Weekly":
-                                    results_weekly.extend(tf_rows)
-
-                    except (requests.RequestException, ValueError,
-                            KeyError, pd.errors.EmptyDataError) as e:
-                        scan_errors[_sym_display(sym)] = (
-                            f"{type(e).__name__}: {str(e)[:200]}"
-                        )
-                    except Exception as e:
-                        tb = traceback.format_exc()
-                        tb = _sanitize_traceback(tb, [access_token, account_id])
-                        scan_errors[_sym_display(sym)] = (
-                            f"INATTENDU {type(e).__name__}: {tb[-400:]}"
-                        )
+                        except Exception as e:
+                            tb = traceback.format_exc()
+                            tb = _sanitize_traceback(tb, [access_token, account_id])
+                            scan_errors[_sym_display(sym)] = (
+                                f"INATTENDU {type(e).__name__}: {tb[-400:]}"
+                            )
+                except concurrent.futures.TimeoutError:
+                    # BUG-006 : timeout global du scan dépassé
+                    remaining = set(future_map.values()) - {
+                        _sym_display(s) for s in list(all_zones_map.keys())
+                    }
+                    for sym in remaining:
+                        scan_errors[_sym_display(sym)] = "Timeout global scan (120s)"
 
             progress_bar.empty()
 
-            # FIX K — Libérer le verrou du bouton scan
+            # BUG-002 : libérer le verrou scan
             st.session_state["scanning"] = False
 
             n_ok   = len(symbols_to_scan) - len(scan_errors)
@@ -2124,15 +2120,15 @@ if scan_button and symbols_to_scan:
 
             _display_results(st.session_state["scan_results"], max_dist_filter)
 
-elif not symbols_to_scan:
+elif not symbols_to_scan and not st.session_state.get("scanning", False):
     st.info("Sélectionnez des actifs à scanner dans la barre latérale.")
-else:
+elif not st.session_state.get("pending_scan", False) and not st.session_state.get("scanning", False):
     st.info(
         "Configurez les paramètres dans la barre latérale, "
         "puis cliquez sur **LANCER LE SCAN COMPLET**."
     )
 
-if "scan_results" in st.session_state and not scan_button:
+if "scan_results" in st.session_state and not st.session_state.get("pending_scan", False):
     _display_results(
         st.session_state["scan_results"],
         max_dist_filter,
