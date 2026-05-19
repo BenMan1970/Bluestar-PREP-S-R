@@ -83,7 +83,7 @@ scan_button = st.button(
 # CONSTANTES
 # ══════════════════════════════════════════════════════════════════
 
-SCANNER_VERSION = "5.10"
+SCANNER_VERSION = "5.11"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -119,8 +119,14 @@ DEFAULT_ZONE_WIDTH = 0.5
 POST_MERGE_THRESHOLD = 0.15
 
 POST_MERGE_MAP = {
+    # Indices : faible volatilité relative, niveaux clés distincts
     "US30_USD": 0.05, "NAS100_USD": 0.05, "SPX500_USD": 0.08, "DE30_EUR": 0.08,
     "XAU_USD": 0.15,
+    # BUG-018 : paires JPY — 0.15% = ~23 pips sur USD/JPY@158 → fusionne
+    # deux niveaux techniquement distincts (ex: 158.00 et 158.20).
+    # 0.08% ≈ 12 pips → granularité correcte pour actifs à 2 décimales.
+    "USD_JPY": 0.08, "EUR_JPY": 0.08, "GBP_JPY": 0.08,
+    "AUD_JPY": 0.08, "CAD_JPY": 0.08, "CHF_JPY": 0.08, "NZD_JPY": 0.08,
 }
 
 CONFLUENCE_THRESHOLD_MAP = {
@@ -604,7 +610,7 @@ def post_merge_zones(zones_list, threshold_pct=0.30):
     return zones_list
 
 
-def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
+def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3, timeframe="daily"):
     highs  = pd.Series(df["high"].values)
     lows   = pd.Series(df["low"].values)
     closes = pd.Series(df["close"].values)
@@ -624,7 +630,11 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3):
     body_bottom   = pd.Series(np.minimum(opens.values, closes.values))
     lower_wick_pct = (body_bottom - lows) / candle_range
 
-    _WICK_THRESHOLD = 0.20
+    # BUG-026 : wick threshold adaptatif par timeframe.
+    # H4 : 0.20 → sensibilité normale pour micro-structure intraday.
+    # Daily / Weekly : 0.30 → filtre les dojis et fausses mèches sur TF HTF,
+    # réduit les faux pivots en période de faible volatilité.
+    _WICK_THRESHOLD = 0.20 if timeframe.lower() in ("h4", "m15", "m30") else 0.30
 
     sh_mask = (
         (highs > roll_high_left) &
@@ -742,7 +752,8 @@ def find_strong_sr_zones(df, current_price, symbol="", atr_val=None,
     n_total = len(df)
 
     pivot_highs, pivot_lows = detect_swing_pivots(
-        df, n=swing_n, atr_val=atr_val, prominence_coeff=prominence_coeff
+        df, n=swing_n, atr_val=atr_val, prominence_coeff=prominence_coeff,
+        timeframe=timeframe  # BUG-026 : wick threshold adaptatif HTF
     )
 
     if len(pivot_highs) + len(pivot_lows) < 3:
@@ -942,12 +953,14 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                         continue
 
                     sub_avg   = subgroup["level"].mean()
-                    # BUG-017 : sub_nb_tf doit refléter la richesse réelle du groupe.
-                    # len(sub_tfs) = nb TFs uniques, mais si plusieurs zones du même TF
-                    # sont présentes (pivots proches), le multiplicateur serait sous-évalué.
-                    # On prend max(nb_TFs_uniques, nb_zones) pour éviter la sous-évaluation
-                    # tout en restant cohérent avec la sémantique "confluence multi-TF".
-                    sub_nb_tf = max(len(sub_tfs), len(subgroup))
+                    # BUG-017 CORRIGÉ v5.11 : sub_nb_tf = nb de timeframes UNIQUES.
+                    # Avant (v5.10) : max(len(sub_tfs), len(subgroup)) multipliait
+                    # le score par le nb de pivots si supérieur au nb de TFs uniques,
+                    # permettant à 3 pivots H4 (même TF) d'obtenir sub_nb_tf=3 alors
+                    # qu'il n'y a aucune confluence inter-TF réelle.
+                    # strength (nb touches) est déjà passé à compute_structural_score ;
+                    # nb_tf doit uniquement refléter la richesse multi-TF du groupe.
+                    sub_nb_tf = len(sub_tfs)  # BUG-017 (était max(len(sub_tfs), len(subgroup)))
                     sub_dist  = abs(current_price - sub_avg) / current_price * 100
 
                     sub_active = subgroup[subgroup["status"] != "Consommee"]
@@ -1560,20 +1573,56 @@ def create_llm_brief(summaries, confluences_df,
 def create_json_export(summaries, confluences_df,
                        max_dist=5.0, min_score=50.0):
     """
-    JSON CORRIGÉ : inclut TOUS les actifs scannés (pas seulement ceux
-    avec confluences), avec tendances et prix_context même si zones=[].
-    Avant : seuls les actifs ayant au moins une confluence passant les
-    filtres apparaissaient → actifs sans confluence silencieusement absents.
+    JSON v5.11 — Sortie structurée pour analyse technique et pipeline Cascade.
+
+    Corrections v5.11 vs v5.10 :
+    - BUG-019 : 'level' exporté en float (était string f"{:.5f}")
+    - BUG-020 : 'timeframes' exporté en array ["H4","Daily"] (était string joinée)
+    - BUG-021 : 'type' (Support/Resistance/Pivot) ajouté dans chaque zone
+    - BUG-022 : 'current_price' ajouté au niveau actif (indispensable downstream)
+    - BUG-023 : 'nb_zones' count ajouté (utile pour scoring Cascade)
+    - BUG-024 : signal normalisé : "BUY" | "SELL" | "PIVOT" (sans emoji)
+    - BUG-025 : alert normalisé : "HOT" | "CLOSE" | "" (sans emoji, cohérent)
+    - Tous les actifs scannés présents dans JSON (pas seulement ceux avec zones)
     """
     output = {
-        "generated_at": datetime.now().isoformat(),
-        "scanner_version": SCANNER_VERSION,
+        "generated_at":     datetime.now().isoformat(),
+        "scanner_version":  SCANNER_VERSION,
+        "filters": {
+            "max_dist_pct": max_dist,
+            "min_score":    min_score,
+        },
         "assets": [],
     }
 
     summary_map = {s["symbol"]: s for s in summaries}
 
-    # 1. Construire le dictionnaire actif → zones filtrées
+    # ── helpers de normalisation ───────────────────────────────────────────────
+    def _normalize_signal(raw: str) -> str:
+        """BUY | SELL | PIVOT — sans emoji, sans suffixe ZONE."""
+        r = raw.replace("🟢", "").replace("🔴", "").replace("↔️", "").replace("↔", "")
+        r = r.replace("ZONE", "").replace("BUY", "BUY").replace("SELL", "SELL").strip()
+        if "BUY"   in r: return "BUY"
+        if "SELL"  in r: return "SELL"
+        if "PIVOT" in r: return "PIVOT"
+        return r.strip()
+
+    def _normalize_alert(raw: str) -> str:
+        """HOT | CLOSE | '' — neutre sans emoji pour parsing LLM / JSON propre."""
+        r = raw.replace("🔥", "").replace("⚠️", "").replace("⚠", "").strip()
+        if "CHAUD" in r.upper() or "HOT" in r.upper():
+            return "HOT"
+        if "PROCHE" in r.upper() or "CLOSE" in r.upper():
+            return "CLOSE"
+        return ""
+
+    def _parse_timeframes(tf_str: str) -> list:
+        """'Daily + H4' → ['Daily', 'H4'] triés par poids TF décroissant."""
+        _order = {"Weekly": 0, "Daily": 1, "H4": 2}
+        parts  = [p.strip() for p in tf_str.replace("+", ",").split(",") if p.strip()]
+        return sorted(parts, key=lambda t: _order.get(t, 99))
+
+    # ── 1. Construire dict actif → zones filtrées ──────────────────────────────
     actif_groups: dict = {}
 
     if confluences_df is not None and not confluences_df.empty:
@@ -1593,34 +1642,41 @@ def create_json_export(summaries, confluences_df,
                 continue
 
             signal_raw = str(row.get("Signal", ""))
-            if "BUY" not in signal_raw and "SELL" not in signal_raw:
+            signal_norm = _normalize_signal(signal_raw)
+            if signal_norm not in ("BUY", "SELL", "PIVOT"):
                 continue
 
-            if str(row.get("Statut", "")) == "Consommee":
+            statut = str(row.get("Statut", ""))
+            if statut == "Consommee":
                 continue
 
             actif = str(row.get("Actif", ""))
             if actif not in actif_groups:
                 actif_groups[actif] = []
 
+            # BUG-019 : level en float (plus de f-string str → float manquant)
+            niveau_raw = row.get("Niveau", "")
+            try:
+                level_float = round(float(str(niveau_raw)), 5)
+            except (TypeError, ValueError):
+                level_float = None
+
+            tf_str    = str(row.get("Timeframes", ""))
             alert_raw = str(row.get("Alerte", ""))
-            alert_clean = (alert_raw
-                           .replace("🔥 ", "").replace("⚠️ ", "")
-                           .replace("🔥", "").replace("⚠️", "")
-                           .strip())
 
             actif_groups[actif].append({
-                "signal":       signal_raw.replace("🟢 ", "").replace("🔴 ", "").strip(),
-                "level":        str(row.get("Niveau", "")),
-                "score":        round(score_val, 1),
-                "status":       str(row.get("Statut", "")),
-                "distance_pct": round(dist_val, 3),
-                "alert":        alert_clean,
-                "timeframes":   str(row.get("Timeframes", "")),
+                "signal":        signal_norm,                         # BUG-024
+                "type":          str(row.get("Type", "")),            # BUG-021
+                "level":         level_float,                         # BUG-019
+                "score":         round(score_val, 1),
+                "status":        statut,
+                "distance_pct":  round(dist_val, 3),
+                "alert":         _normalize_alert(alert_raw),        # BUG-025
+                "timeframes":    _parse_timeframes(tf_str),          # BUG-020
+                "nb_tf":         int(row.get("Nb TF", len(_parse_timeframes(tf_str)))),
             })
 
-    # 2. Construire la liste triée sur TOUS les actifs scannés
-    # Les actifs sans confluence ont zones=[], mais sont présents dans le JSON.
+    # ── 2. Construire liste triée sur TOUS les actifs scannés ─────────────────
     all_actifs = set(summary_map.keys())
     all_actifs.update(actif_groups.keys())
 
@@ -1640,14 +1696,18 @@ def create_json_export(summaries, confluences_df,
             key=lambda z: z["score"],
             reverse=True,
         )
+        cp_val = s.get("current_price")  # BUG-022
+
         output["assets"].append({
             "symbol":        actif,
+            "current_price": round(cp_val, 5) if cp_val else None,  # BUG-022
             "trends": {
                 "h4":     s.get("trend_h4",     "NEUTRE"),
                 "daily":  s.get("trend_daily",  "NEUTRE"),
                 "weekly": s.get("trend_weekly", "NEUTRE"),
             },
             "price_context": s.get("price_context", ""),
+            "nb_zones":      len(zones),                            # BUG-023
             "zones":         zones,
         })
 
@@ -1934,7 +1994,7 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 57 corrections**")
+    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 65 corrections (BUG-018→026)**")
     st.caption("— v5.5 (12) — v5.6 (9) — v5.7 (7) — v5.8 (9) — v5.9 (10) —")
     st.caption("— v5.10 (5 fixes — audit forensique niveau expert) —")
     st.caption("✅ BUG-013 — base_url masqué dans _sanitize_traceback (sécurité)")
@@ -2118,6 +2178,7 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
                     "trend_weekly":  trends.get("Weekly", "NEUTRE"),
                     "price_context": price_ctx,
                     "top_zones":     top_zones,
+                    "current_price": cp,          # BUG-019 : ajout prix live pour JSON export
                 })
 
             df_h4     = pd.DataFrame(results_h4)
