@@ -1,9 +1,7 @@
-streamlit
-pandas
-numpy
-matplotlib
-oandapyV20
-reportlab
-scipy
-fpdf2
-aiohttp==3.9.5
+aiohttp>=3.9.5
+nest_asyncio>=1.6.0
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+fpdf2>=2.7
+streamlit>=1.32
