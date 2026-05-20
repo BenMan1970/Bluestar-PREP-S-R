@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import traceback
-import nest_asyncio  # ✅ Pour compatibilité async Streamlit Cloud
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,11 +16,8 @@ import aiohttp
 import numpy as np
 import pandas as pd
 import streamlit as st
-from fpdf import FPDF  # ✅ fpdf v1.x, PAS fpdf2
+from fpdf import FPDF  # ✅ Utiliser fpdf==1.7.2 (PAS fpdf2)
 from scipy.signal import find_peaks
-
-# Appliquer nest_asyncio dès le démarrage pour éviter les conflits de event loop
-nest_asyncio.apply()
 
 # ==============================================================================
 # [ LAYER 0: GLOBAL CONFIG & LOGGING ]
@@ -48,13 +44,13 @@ TF_WEIGHT = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 @dataclass(frozen=True)
 class InstrumentProfile:
     symbol: str
-    asset_class: str
+    asset_class: str           # FOREX, INDEX, METAL
     pip_value: float
-    cluster_radius_atr: float
-    merge_threshold_atr: float
-    pivot_prominence_atr: float
-    dev_threshold_pct: float
-    skip_ratio_check: bool
+    cluster_radius_atr: float  # Radius for 1D Agglomerative Clustering
+    merge_threshold_atr: float # Distance for post-cluster merging
+    pivot_prominence_atr: float# Rejection significance
+    dev_threshold_pct: float   # Price anomaly threshold
+    skip_ratio_check: bool     # Skip median vs price sanity check
 
 _PROFILES = {
     "EUR_USD": InstrumentProfile("EUR_USD", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False),
@@ -69,8 +65,7 @@ _PROFILES = {
 _DEFAULT_PROFILE = InstrumentProfile("DEFAULT", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
 
 def get_profile(symbol: str) -> InstrumentProfile:
-    if symbol in _PROFILES: 
-        return _PROFILES[symbol]
+    if symbol in _PROFILES: return _PROFILES[symbol]
     base = symbol.split("_")[0]
     if base in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF"):
         return InstrumentProfile(symbol, "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
@@ -92,8 +87,7 @@ class AsyncOandaClient:
         """Determines Live vs Practice environment dynamically."""
         for url in ["https://api-fxpractice.oanda.com", "https://api-fxtrade.oanda.com"]:
             try:
-                async with session.get(f"{url}/v3/accounts/{self.account_id}/summary", 
-                                     headers=self.headers, timeout=5) as r:
+                async with session.get(f"{url}/v3/accounts/{self.account_id}/summary", headers=self.headers, timeout=5) as r:
                     if r.status == 200:
                         self.env_url = url
                         return True
@@ -101,19 +95,16 @@ class AsyncOandaClient:
                 continue
         return False
 
-    async def fetch_candles(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, 
-                          symbol: str, tf: str, limit: int = 500) -> Tuple[str, str, Optional[pd.DataFrame]]:
+    async def fetch_candles(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, symbol: str, tf: str, limit: int = 500) -> Tuple[str, str, Optional[pd.DataFrame]]:
         gran = _GRANULARITY_MAP.get(tf)
-        if not self.env_url:
-            return symbol, tf, None
+        if not self.env_url: return symbol, tf, None
         url = f"{self.env_url}/v3/instruments/{symbol}/candles"
         params = {"count": limit + 1, "granularity": gran, "price": "M"}
         
         async with sem:
             try:
                 async with session.get(url, headers=self.headers, params=params, timeout=15) as r:
-                    if r.status != 200: 
-                        return symbol, tf, None
+                    if r.status != 200: return symbol, tf, None
                     data = await r.json()
                     candles = [
                         {
@@ -125,28 +116,22 @@ class AsyncOandaClient:
                     ]
                     df = pd.DataFrame(candles).tail(limit).set_index("date")
                     return symbol, tf, df if not df.empty else None
-            except Exception as e:
-                logging.warning(f"Error fetching candles for {symbol}/{tf}: {e}")
+            except Exception:
                 return symbol, tf, None
 
-    async def fetch_price(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, 
-                         symbol: str) -> Tuple[str, Optional[float]]:
-        if not self.env_url:
-            return symbol, None
+    async def fetch_price(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, symbol: str) -> Tuple[str, Optional[float]]:
+        if not self.env_url: return symbol, None
         url = f"{self.env_url}/v3/accounts/{self.account_id}/pricing"
         async with sem:
             try:
-                async with session.get(url, headers=self.headers, 
-                                     params={"instruments": symbol}, timeout=10) as r:
-                    if r.status != 200: 
-                        return symbol, None
+                async with session.get(url, headers=self.headers, params={"instruments": symbol}, timeout=10) as r:
+                    if r.status != 200: return symbol, None
                     data = await r.json()
                     if "prices" in data and data["prices"]:
                         bid = float(data["prices"][0]["closeoutBid"])
                         ask = float(data["prices"][0]["closeoutAsk"])
                         return symbol, (bid + ask) / 2
-            except Exception as e:
-                logging.warning(f"Error fetching price for {symbol}: {e}")
+            except Exception:
                 pass
         return symbol, None
 
@@ -164,23 +149,18 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
 
 def compute_institutional_trend(closes: pd.Series, lookback: int = 20) -> str:
     """Z-Score Normalized Linear Regression (Institutional Standard)."""
-    if len(closes) < lookback: 
-        return "NEUTRE"
+    if len(closes) < lookback: return "NEUTRE"
     y = closes.tail(lookback).values
     x = np.arange(len(y))
     slope, _ = np.polyfit(x, y, 1)
     std_dev = np.std(y)
-    if std_dev == 0: 
-        return "NEUTRE"
+    if std_dev == 0: return "NEUTRE"
     z_score = slope / std_dev
-    if z_score > 0.15: 
-        return "HAUSSIER"
-    if z_score < -0.15: 
-        return "BAISSIER"
+    if z_score > 0.15: return "HAUSSIER"
+    if z_score < -0.15: return "BAISSIER"
     return "NEUTRE"
 
-def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, 
-                       atr_val: float, timeframe: str) -> Tuple[pd.Series, pd.Series]:
+def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: float, timeframe: str) -> Tuple[pd.Series, pd.Series]:
     """Strictly ATR-based swing detection."""
     prominence = atr_val * profile.pivot_prominence_atr
     n = 3
@@ -224,8 +204,7 @@ def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile,
 
 def agglomerative_1d_clustering(prices: List[float], bandwidth: float) -> List[List[float]]:
     """Deterministic 1D KDE-like Agglomerative Clustering."""
-    if not prices: 
-        return []
+    if not prices: return []
     sorted_p = sorted(prices)
     clusters = []
     curr_cluster = [sorted_p[0]]
@@ -239,18 +218,15 @@ def agglomerative_1d_clustering(prices: List[float], bandwidth: float) -> List[L
     clusters.append(curr_cluster)
     return clusters
 
-def classify_zone_status(level: float, zone_type: str, df: pd.DataFrame, 
-                        formation_idx: int, atr_val: float) -> str:
+def classify_zone_status(level: float, zone_type: str, df: pd.DataFrame, formation_idx: int, atr_val: float) -> str:
     """Dynamic ATR tolerance for Status Classification."""
-    if formation_idx >= len(df) - 1: 
-        return "Vierge"
+    if formation_idx >= len(df) - 1: return "Vierge"
     tolerance = atr_val * 0.25
 
     c_arr = df["close"].values[formation_idx + 1:]
     h_arr = df["high"].values[formation_idx + 1:]
     l_arr = df["low"].values[formation_idx + 1:]
-    if len(c_arr) == 0: 
-        return "Vierge"
+    if len(c_arr) == 0: return "Vierge"
 
     near = (np.abs(c_arr - level) <= tolerance) | ((l_arr <= level + tolerance) & (h_arr >= level - tolerance))
     has_approach = bool(near.any())
@@ -258,8 +234,7 @@ def classify_zone_status(level: float, zone_type: str, df: pd.DataFrame,
     break_mask = (c_arr < level - tolerance) if zone_type == "Support" else (c_arr > level + tolerance)
     break_positions = np.where(break_mask)[0]
     
-    if len(break_positions) == 0: 
-        return "Testee" if has_approach else "Vierge"
+    if len(break_positions) == 0: return "Testee" if has_approach else "Vierge"
 
     break_idx = int(break_positions[0])
     retest_tol = tolerance * 2
@@ -267,29 +242,24 @@ def classify_zone_status(level: float, zone_type: str, df: pd.DataFrame,
     rh = h_arr[break_idx + 1:]
     rl = l_arr[break_idx + 1:]
 
-    if len(rc) == 0: 
-        return "Consommee"
+    if len(rc) == 0: return "Consommee"
     retest_mask = (rl <= level + retest_tol) & (rh >= level - retest_tol)
-    if not retest_mask.any(): 
-        return "Consommee"
+    if not retest_mask.any(): return "Consommee"
 
     retest_idx = int(np.where(retest_mask)[0][0])
     rc_after = rc[retest_idx + 1:]
-    if len(rc_after) == 0: 
-        return "Role Reverse"
+    if len(rc_after) == 0: return "Role Reverse"
 
     second_break = (rc_after > level + tolerance) if zone_type == "Support" else (rc_after < level - tolerance)
     return "Consommee" if second_break.any() else "Role Reverse"
 
-def compute_structural_score(strength: int, nb_tf: int, tf_name: str, 
-                           age_bars: int, total_bars: int) -> float:
+def compute_structural_score(strength: int, nb_tf: int, tf_name: str, age_bars: int, total_bars: int) -> float:
     tf_w = TF_WEIGHT.get(tf_name, 1.0)
     age_r = max(age_bars, 0) / max(total_bars, 1)
     age_f = np.exp(-1.5 * age_r)
     return round((strength * tf_w * nb_tf) * age_f, 1)
 
-def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, 
-                        atr_val: float, timeframe: str, min_touches: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, atr_val: float, timeframe: str, min_touches: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     profile = get_profile(symbol)
     n_total = len(df)
 
@@ -305,8 +275,7 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str,
         pivot_lows = pd.Series(df["low"].values[s_idx], index=s_idx) if len(s_idx) else pd.Series(dtype=float)
 
     all_pivots = [(float(p), int(i)) for i, p in pivot_highs.items()] + [(float(p), int(i)) for i, p in pivot_lows.items()]
-    if not all_pivots: 
-        return pd.DataFrame(), pd.DataFrame()
+    if not all_pivots: return pd.DataFrame(), pd.DataFrame()
 
     # Deterministic Agglomerative Clustering
     bandwidth = atr_val * profile.cluster_radius_atr
@@ -317,14 +286,11 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str,
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
 
     for grp_prices in clusters_raw:
-        if len(grp_prices) < min_touches: 
-            continue
+        if len(grp_prices) < min_touches: continue
         
-        # Map prices back to original indices to find the latest touch (age)
         grp_indices = [idx for p, idx in all_pivots if p in grp_prices]
         lvl = np.mean(grp_prices)
-        if lvl <= 0: 
-            continue
+        if lvl <= 0: continue
 
         last_idx = max(grp_indices)
         age = max(0, n_total - 1 - last_idx)
@@ -332,12 +298,10 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str,
         status = classify_zone_status(lvl, ztype, df, last_idx, atr_val)
 
         strong.append({
-            "level": float(lvl), "strength": len(grp_prices), 
-            "age_bars": age, "status": status
+            "level": float(lvl), "strength": len(grp_prices), "age_bars": age, "status": status
         })
 
-    if not strong: 
-        return pd.DataFrame(), pd.DataFrame()
+    if not strong: return pd.DataFrame(), pd.DataFrame()
 
     # Post-merge cleanup
     strong.sort(key=lambda x: x["level"])
@@ -368,8 +332,7 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str,
 
 def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars_map: dict) -> list:
     """Vectorized-friendly Confluence Detection."""
-    if not zones_dict or not current_price: 
-        return []
+    if not zones_dict or not current_price: return []
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
     
     all_zones = []
@@ -377,23 +340,19 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
         for df_z, ztype in [(sup, "Support"), (res, "Resistance")]:
             for _, z in df_z.iterrows():
                 is_piv = z.get("is_pivot", False)
-                if z.get("status") == "Consommee": 
-                    continue
+                if z.get("status") == "Consommee": continue
                 all_zones.append({
                     "tf": tf, "level": z["level"], "strength": z["strength"],
                     "age_bars": z.get("age_bars", 0), "status": z.get("status", "Testee"),
                     "type": "Pivot" if is_piv else ztype, "is_pivot": is_piv
                 })
 
-    if not all_zones: 
-        return []
+    if not all_zones: return []
     z_df = pd.DataFrame(all_zones).sort_values("level").reset_index(drop=True)
     used = set()
     confluences = []
 
-    # OANDA Confluence threshold mapped natively or fallback 1.0%
-    threshold = {"US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, 
-                "DE30_EUR": 1.2, "XAU_USD": 1.5}.get(symbol, 1.0)
+    threshold = {"US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, "DE30_EUR": 1.2, "XAU_USD": 1.5}.get(symbol, 1.0)
 
     for i, z in z_df.iterrows():
         if i in used or z["level"] <= 0:
@@ -412,9 +371,7 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
                 sub_nb_tf = len(tfs)
                 sub_dist = abs(current_price - sub_avg) / current_price * 100
                 
-                score = sum(compute_structural_score(
-                    r["strength"], sub_nb_tf, r["tf"], r["age_bars"], bars_map.get(r["tf"], 500)
-                ) for _, r in group.iterrows())
+                score = sum(compute_structural_score(r["strength"], sub_nb_tf, r["tf"], r["age_bars"], bars_map.get(r["tf"], 500)) for _, r in group.iterrows())
                 status = max(group["status"].tolist(), key=lambda s: STATUS_PRIORITY.get(s, 1))
                 
                 is_pivot = sub_dist <= 0.50
@@ -452,42 +409,33 @@ class ScanResult:
     scan_error: Optional[str] = None
     price_context: str = ""
 
-async def run_institutional_scan(symbols: List[str], token: str, account_id: str, 
-                               min_touches_ui: int) -> List[ScanResult]:
+async def run_institutional_scan(symbols: List[str], token: str, account_id: str, min_touches_ui: int) -> List[ScanResult]:
     """Async Orchestrator for Maximum Performance."""
     client = AsyncOandaClient(token, account_id)
     async with aiohttp.ClientSession() as session:
         if not await client.initialize(session):
-            st.error("❌ Failed to authenticate with OANDA. Vérifiez vos tokens.")
+            st.error("❌ Failed to authenticate with OANDA. Check secrets.")
             return []
 
-        sem = asyncio.Semaphore(10)  # ✅ Réduit à 10 pour éviter rate-limit Cloud
+        sem = asyncio.Semaphore(10) # Rate limit protection
         
         # 1. Fetch Prices
         price_tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
         prices_res = await asyncio.gather(*price_tasks, return_exceptions=True)
+        live_prices = {sym: p for res in prices_res if isinstance(res, tuple) and len(res)==2 and (sym, p) := res if p is not None else None for p in [None]} # Clean comprehension fallback
         live_prices = {}
         for res in prices_res:
-            if isinstance(res, tuple) and len(res) == 2:
-                sym, p = res
-                if p is not None:
-                    live_prices[sym] = p
+            if isinstance(res, tuple) and len(res) == 2 and res[1] is not None:
+                live_prices[res[0]] = res[1]
 
-        # 2. Fetch Candles (All symbols, All TFs)
-        candle_tasks = []
-        for sym in symbols:
-            for tf in _GRANULARITY_MAP.keys():
-                candle_tasks.append(client.fetch_candles(session, sem, sym, tf))
-        
+        # 2. Fetch Candles
+        candle_tasks = [client.fetch_candles(session, sem, sym, tf) for sym in symbols for tf in _GRANULARITY_MAP.keys()]
         candles_res = await asyncio.gather(*candle_tasks, return_exceptions=True)
         data_cube = {}
         for res in candles_res:
-            if isinstance(res, tuple) and len(res) == 3:
+            if isinstance(res, tuple) and len(res) == 3 and res[2] is not None:
                 sym, tf, df = res
-                if df is not None and not df.empty:
-                    if sym not in data_cube: 
-                        data_cube[sym] = {}
-                    data_cube[sym][tf] = df
+                data_cube.setdefault(sym, {})[tf] = df
 
     # 3. Process Quant Engine Locally
     results = []
@@ -505,11 +453,9 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
             
             for tf_k, tf_name in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
                 df = data_cube.get(sym, {}).get(tf_k)
-                if df is None or df.empty: 
-                    continue
+                if df is None or df.empty: continue
                 
-                if not cp and not df.empty: 
-                    cp = float(df["close"].iloc[-1])
+                if not cp and not df.empty: cp = float(df["close"].iloc[-1])
                 bars_map[tf_name] = len(df)
                 trends[tf_name] = compute_institutional_trend(df["close"])
                 atr_val = compute_atr(df)
@@ -519,7 +465,6 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
                 zones_d[tf_name] = (sup, res)
                 
                 if tf_k == "daily" and cp:
-                    # Quick context string builder
                     parts = []
                     if not sup.empty:
                         s_near = sup[(sup["level"] < cp) & (abs(sup["level"] - cp)/cp*100 <= 5.0)]
@@ -556,12 +501,10 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
                     if (r["Niveau"], r["Type"]) not in seen:
                         seen.add((r["Niveau"], r["Type"]))
                         uniq.append(r)
-                if uniq: 
-                    rows[tf_name] = uniq
+                if uniq: rows[tf_name] = uniq
 
             results.append(ScanResult(sym, rows, zones_d, cp, trends, bars_map, price_context=price_ctx))
         except Exception as e:
-            logging.error(f"Error processing {sym}: {e}")
             results.append(ScanResult(sym, {}, {}, None, {}, {}, scan_error=str(e)))
             
     return results
@@ -569,23 +512,17 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
 # ==============================================================================
 # [ LAYER 5: EXPORTERS & UTILS ]
 # ==============================================================================
-_ACCENT_MAP = str.maketrans('àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ', 
-                           'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN')
-_EMOJI_MAP = [('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔️', '[PIVOT]'), 
-              ('↔', '[PIVOT]'), ('⚠️', '[PROCHE]'), ('⚠', '[PROCHE]'), ('📈', ''), 
-              ('📉', ''), ('✅', '[OK]'), ('❌', '[X]'), ('⚡', '[!]'), ('📡', ''), 
-              ('📅', ''), ('↩️', '[RR]'), ('↑', '[HAUSSE]'), ('↓', '[BAISSE]'), ('→', '[NEUTRE]')]
+_ACCENT_MAP = str.maketrans('àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ', 'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN')
+_EMOJI_MAP = [('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔️', '[PIVOT]'), ('↔', '[PIVOT]'), ('⚠️', '[PROCHE]'), ('⚠', '[PROCHE]'), ('📈', ''), ('📉', ''), ('✅', '[OK]'), ('❌', '[X]'), ('⚡', '[!]'), ('📡', ''), ('📅', ''), ('↩️', '[RR]'), ('↑', '[HAUSSE]'), ('↓', '[BAISSE]'), ('→', '[NEUTRE]')]
 
 def _safe_pdf_str(text: str) -> str:
     text = str(text).translate(_ACCENT_MAP)
-    for e, r in _EMOJI_MAP: 
-        text = text.replace(e, r)
+    for e, r in _EMOJI_MAP: text = text.replace(e, r)
     return text
 
 def strip_emojis_df(df):
     cln = df.copy()
-    for col in cln.select_dtypes(include='object').columns: 
-        cln[col] = cln[col].apply(_safe_pdf_str)
+    for col in cln.select_dtypes(include='object').columns: cln[col] = cln[col].apply(_safe_pdf_str)
     return cln
 
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -594,11 +531,9 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
 class PDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 15)
-        self.cell(0, 10, _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'), 
-                 border=0, align='C', new_x='LMARGIN', new_y='NEXT')
+        self.cell(0, 10, _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'), border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
-        self.cell(0, 6, _safe_pdf_str(f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  v{SCANNER_VERSION}"), 
-                 border=0, align='C', new_x='LMARGIN', new_y='NEXT')
+        self.cell(0, 6, _safe_pdf_str(f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  v{SCANNER_VERSION}"), border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
     def footer(self):
         self.set_y(-15)
@@ -610,18 +545,12 @@ class PDF(FPDF):
         self.ln(4)
     def chapter_summary(self, summaries):
         self.set_font('Helvetica', 'B', 10)
-        self.cell(0, 7, _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'), 
-                 border=0, align='L', new_x='LMARGIN', new_y='NEXT')
+        self.cell(0, 7, _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'), border=0, align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(2)
         for s in summaries:
-            sym, t_h4, t_d, t_w, ctx = (_safe_pdf_str(s.get('symbol','')), 
-                                       _safe_pdf_str(s.get('trend_h4','N/A')), 
-                                       _safe_pdf_str(s.get('trend_daily','N/A')), 
-                                       _safe_pdf_str(s.get('trend_weekly','N/A')), 
-                                       _safe_pdf_str(s.get('price_context','')))
+            sym, t_h4, t_d, t_w, ctx = _safe_pdf_str(s.get('symbol','')), _safe_pdf_str(s.get('trend_h4','N/A')), _safe_pdf_str(s.get('trend_daily','N/A')), _safe_pdf_str(s.get('trend_weekly','N/A')), _safe_pdf_str(s.get('price_context',''))
             self.set_font('Helvetica', 'B', 8)
-            self.cell(0, 5, _safe_pdf_str(f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}"), 
-                     border=0, new_x='LMARGIN', new_y='NEXT')
+            self.cell(0, 5, _safe_pdf_str(f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}"), border=0, new_x='LMARGIN', new_y='NEXT')
             if ctx:
                 self.set_font('Helvetica', 'I', 7)
                 self.cell(0, 4, f"  Position : {ctx[:120]}", border=0, new_x='LMARGIN', new_y='NEXT')
@@ -641,17 +570,12 @@ class PDF(FPDF):
             self.multi_cell(self.w - self.l_margin - self.r_margin, 10, "Aucune donnee a afficher.")
             self.ln()
             return
-        col_w = ({'Actif': 20, 'Signal': 26, 'Niveau': 22, 'Type': 22, 'Timeframes': 50, 
-                 'Nb TF': 12, 'Force Totale': 20, 'Score': 18, 'Statut': 22, 'Distance %': 18, 'Alerte': 55} 
-                if 'Timeframes' in df.columns else 
-                {'Actif': 24, 'Prix Actuel': 24, 'Type': 20, 'Niveau': 24, 'Force': 20, 
-                 'Score (1TF)': 18, 'Statut': 22, 'Dist. %': 16, 'Dist. ATR': 16})
+        col_w = {'Actif': 20, 'Signal': 26, 'Niveau': 22, 'Type': 22, 'Timeframes': 50, 'Nb TF': 12, 'Force Totale': 20, 'Score': 18, 'Statut': 22, 'Distance %': 18, 'Alerte': 55} if 'Timeframes' in df.columns else {'Actif': 24, 'Prix Actuel': 24, 'Type': 20, 'Niveau': 24, 'Force': 20, 'Score (1TF)': 18, 'Statut': 22, 'Dist. %': 16, 'Dist. ATR': 16}
         cols = [c for c in col_w if c in df.columns]
         x_start = self.l_margin + max(0, ((self.w - self.l_margin - self.r_margin) - sum(col_w[c] for c in cols)) / 2)
         self.set_font('Helvetica', 'B', 7)
         self.set_x(x_start)
-        for c in cols: 
-            self.cell(col_w[c], 6, _safe_pdf_str(c), border=1, align='C', new_x='RIGHT', new_y='TOP')
+        for c in cols: self.cell(col_w[c], 6, _safe_pdf_str(c), border=1, align='C', new_x='RIGHT', new_y='TOP')
         self.ln()
         self.set_font('Helvetica', '', 7)
         for _, row in df.iterrows():
@@ -659,8 +583,7 @@ class PDF(FPDF):
             for c in cols:
                 val = _safe_pdf_str(str(row[c]))
                 mx = int(col_w[c] / 1.25)
-                self.cell(col_w[c], 5, val[:mx-1]+'.' if len(val)>mx else val, 
-                         border=1, align='C', new_x='RIGHT', new_y='TOP')
+                self.cell(col_w[c], 5, val[:mx-1]+'.' if len(val)>mx else val, border=1, align='C', new_x='RIGHT', new_y='TOP')
             self.ln()
 
 def create_pdf_report(rep_dict, conf_df, summaries):
@@ -668,24 +591,19 @@ def create_pdf_report(rep_dict, conf_df, summaries):
     pdf.set_margins(5, 10, 5)
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    if summaries:
-        pdf.chapter_summary(summaries)
-        pdf.add_page()
+    if summaries: pdf.chapter_summary(summaries); pdf.add_page()
     if conf_df is not None and not conf_df.empty:
         pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
         cln = strip_emojis_df(_clean_df(conf_df.copy()))
-        if "Score" in cln.columns: 
-            cln = cln.sort_values("Score", ascending=False)
+        if "Score" in cln.columns: cln = cln.sort_values("Score", ascending=False)
         pdf.chapter_body(cln)
         pdf.ln(10)
     tmap = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journaliere (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
     for tf, df in rep_dict.items():
-        if df is None or df.empty: 
-            continue
+        if df is None or df.empty: continue
         pdf.chapter_title(tmap.get(tf, tf))
         cln = strip_emojis_df(_clean_df(df.copy()))
-        if "Score (1TF)" in cln.columns: 
-            cln = cln.sort_values("Score (1TF)", ascending=False)
+        if "Score (1TF)" in cln.columns: cln = cln.sort_values("Score (1TF)", ascending=False)
         pdf.chapter_body(cln)
         pdf.ln(10)
     return bytes(pdf.output())
@@ -693,142 +611,76 @@ def create_pdf_report(rep_dict, conf_df, summaries):
 def create_csv_report(rep_dict, conf_df):
     dfs = []
     if conf_df is not None and not conf_df.empty:
-        c = _clean_df(conf_df).copy()
-        c["Section"] = "CONFLUENCES"
-        dfs.append(c)
+        c = _clean_df(conf_df).copy(); c["Section"] = "CONFLUENCES"; dfs.append(c)
     for tf, df in rep_dict.items():
         if df is not None and not df.empty:
-            d = _clean_df(df).copy()
-            d["Timeframe"] = tf
-            dfs.append(d)
-    if not dfs: 
-        return b""
+            d = _clean_df(df).copy(); d["Timeframe"] = tf; dfs.append(d)
+    if not dfs: return b""
     buf = BytesIO()
     pd.concat(dfs, ignore_index=True).to_csv(buf, index=False, encoding="utf-8-sig")
     return buf.getvalue()
 
-def create_json_export(summaries, conf_df, max_dist=5.0, min_score=60.0, 
-                      allowed_statuts=("Vierge", "Testee", "Role Reverse")):
-    out = {"generated_at": datetime.now().isoformat(), "scanner_version": SCANNER_VERSION, 
-           "filters": {"max_dist_pct": max_dist, "min_score": min_score}, "assets": []}
+def create_json_export(summaries, conf_df, max_dist=5.0, min_score=60.0, allowed_statuts=("Vierge", "Testee", "Role Reverse")):
+    out = {"generated_at": datetime.now().isoformat(), "scanner_version": SCANNER_VERSION, "filters": {"max_dist_pct": max_dist, "min_score": min_score}, "assets": []}
     smap = {s["symbol"]: s for s in summaries}
-    
     agrp = {}
     if conf_df is not None and not conf_df.empty:
         for _, r in conf_df.iterrows():
-            try: 
-                dist = float(str(r.get("Distance %", 999)).replace("%", ""))
-            except: 
-                dist = 999.0
-            try: 
-                score = float(r.get("Score", 0))
-            except: 
-                score = 0.0
-            
+            try: dist = float(str(r.get("Distance %", 999)).replace("%", ""))
+            except: dist = 999.0
+            try: score = float(r.get("Score", 0))
+            except: score = 0.0
             sig = str(r.get("Signal", "")).replace("🟢","").replace("🔴","").replace("↔️","").replace("↔","").replace("ZONE","").strip()
-            if "PIVOT" in sig: 
-                sig = "PIVOT"
-            elif "BUY" in sig: 
-                sig = "BUY"
-            elif "SELL" in sig: 
-                sig = "SELL"
-            
+            if "PIVOT" in sig: sig = "PIVOT"
+            elif "BUY" in sig: sig = "BUY"
+            elif "SELL" in sig: sig = "SELL"
             stat = str(r.get("Statut", ""))
-            if dist > max_dist or score < min_score or sig not in ("BUY","SELL","PIVOT") or stat not in allowed_statuts: 
-                continue
-            
+            if dist > max_dist or score < min_score or sig not in ("BUY","SELL","PIVOT") or stat not in allowed_statuts: continue
             sym = str(r.get("Actif", ""))
-            if sym not in agrp: 
-                agrp[sym] = []
-            
-            try: 
-                lvl = round(float(r.get("Niveau", 0)), 5)
-            except: 
-                continue
-            
-            tfs = sorted([p.strip() for p in str(r.get("Timeframes", "")).replace("+",",").split(",") if p.strip()], 
-                        key=lambda t: {"Weekly":0,"Daily":1,"H4":2}.get(t,99))
+            if sym not in agrp: agrp[sym] = []
+            try: lvl = round(float(r.get("Niveau", 0)), 5)
+            except: continue
+            tfs = sorted([p.strip() for p in str(r.get("Timeframes", "")).replace("+",",").split(",") if p.strip()], key=lambda t: {"Weekly":0,"Daily":1,"H4":2}.get(t,99))
             alrt = str(r.get("Alerte", "")).replace("🔥","").replace("⚠️","").replace("⚠","").strip()
-            alrt = "HOT" if "CHAUD" in alrt.upper() or "HOT" in alrt.upper() else ("CLOSE" if "PROCHE" in alrt.upper() or "CLOSE" in alrt.upper() else "")
-            
-            agrp[sym].append({"signal": sig, "type": str(r.get("Type", "")), "level": lvl, 
-                            "score": round(score, 1), "status": stat, "distance_pct": round(dist, 3), 
-                            "alert": alrt, "timeframes": tfs, "nb_tf": int(r.get("Nb TF", len(tfs)))})
+            alrt = "HOT" if "CHAUD" in alrt.upper() else ("CLOSE" if "PROCHE" in alrt.upper() else "")
+            agrp[sym].append({"signal": sig, "type": str(r.get("Type", "")), "level": lvl, "score": round(score, 1), "status": stat, "distance_pct": round(dist, 3), "alert": alrt, "timeframes": tfs, "nb_tf": int(r.get("Nb TF", len(tfs)))})
 
     all_syms = set(smap.keys()).union(agrp.keys())
     for sym in sorted(all_syms, key=lambda a: max((z["score"] for z in agrp.get(a, [])), default=0.0), reverse=True):
         s = smap.get(sym, {})
         cp = s.get("current_price")
-        
         bmap = {"HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL"}
-        bh4 = bmap.get(s.get("trend_h4","NEUTRE"),"NEUTRAL")
-        bd = bmap.get(s.get("trend_daily","NEUTRE"),"NEUTRAL")
-        bw = bmap.get(s.get("trend_weekly","NEUTRE"),"NEUTRAL")
-        
-        if bd == bw and bd != "NEUTRAL": 
-            dom, align = bd, "ALIGNED" if bh4 == bd else "CONFLICTED"
-        elif bd == "NEUTRAL" and bw != "NEUTRAL": 
-            dom, align = bw, "ALIGNED" if bh4 == bw else "CONFLICTED"
-        elif bw == "NEUTRAL" and bd != "NEUTRAL": 
-            dom, align = bd, "ALIGNED" if bh4 == bd else "CONFLICTED"
-        else: 
-            dom, align = "NEUTRAL", "MIXED"
-        
-        out["assets"].append({
-            "symbol": sym, 
-            "current_price": round(cp, 5) if cp else None, 
-            "trends": {"h4": s.get("trend_h4","NEUTRE"), "daily": s.get("trend_daily","NEUTRE"), "weekly": s.get("trend_weekly","NEUTRE")}, 
-            "trend_alignment": align, 
-            "dominant_bias": dom, 
-            "price_context": s.get("price_context", ""), 
-            "nb_zones": len(agrp.get(sym, [])), 
-            "zones": sorted(agrp.get(sym, []), key=lambda z: z["score"], reverse=True)
-        })
-    
+        bh4, bd, bw = bmap.get(s.get("trend_h4","NEUTRE"),"NEUTRAL"), bmap.get(s.get("trend_daily","NEUTRE"),"NEUTRAL"), bmap.get(s.get("trend_weekly","NEUTRE"),"NEUTRAL")
+        if bd == bw and bd != "NEUTRAL": dom, align = bd, "ALIGNED" if bh4 == bd else "CONFLICTED"
+        elif bd == "NEUTRAL" and bw != "NEUTRAL": dom, align = bw, "ALIGNED" if bh4 == bw else "CONFLICTED"
+        elif bw == "NEUTRAL" and bd != "NEUTRAL": dom, align = bd, "ALIGNED" if bh4 == bd else "CONFLICTED"
+        else: dom, align = "NEUTRAL", "MIXED"
+        out["assets"].append({"symbol": sym, "current_price": round(cp, 5) if cp else None, "trends": {"h4": s.get("trend_h4","NEUTRE"), "daily": s.get("trend_daily","NEUTRE"), "weekly": s.get("trend_weekly","NEUTRE")}, "trend_alignment": align, "dominant_bias": dom, "price_context": s.get("price_context", ""), "nb_zones": len(agrp.get(sym, [])), "zones": sorted(agrp.get(sym, []), key=lambda z: z["score"], reverse=True)})
     return json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8")
 
-def create_llm_brief(summaries, conf_df, max_dist=2.0, min_score=100.0, 
-                    allowed_statuts=("Vierge", "Testee", "Role Reverse")):
-    lines = [f"# BRIEF INSTITUTIONNEL S/R — v{SCANNER_VERSION}", 
-            f"_Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}_", "", "## LEGEND", 
-            "- Sc > 300: Institutional / 100-300: Strong / < 100: Standard", ""]
-    if conf_df is None or conf_df.empty: 
-        return "\n".join(lines).encode("utf-8")
-    
+def create_llm_brief(summaries, conf_df, max_dist=2.0, min_score=100.0, allowed_statuts=("Vierge", "Testee", "Role Reverse")):
+    lines = [f"# BRIEF INSTITUTIONNEL S/R — v{SCANNER_VERSION}", f"_Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}_", "", "## LEGEND", "- Sc > 300: Institutional / 100-300: Strong / < 100: Standard", ""]
+    if conf_df is None or conf_df.empty: return "\n".join(lines).encode("utf-8")
     agrp = {}
     for _, r in conf_df.iterrows():
-        try: 
-            dist = float(str(r.get("Distance %", 999)).replace("%", ""))
-        except: 
-            dist = 999.0
-        try: 
-            score = float(r.get("Score", 0))
-        except: 
-            score = 0.0
+        try: dist = float(str(r.get("Distance %", 999)).replace("%", ""))
+        except: dist = 999.0
+        try: score = float(r.get("Score", 0))
+        except: score = 0.0
         stat = str(r.get("Statut", ""))
-        
         if dist <= max_dist and score >= min_score and stat in allowed_statuts:
             sym = str(r.get("Actif", ""))
-            if sym not in agrp: 
-                agrp[sym] = []
-            agrp[sym].append({
-                "sig": str(r.get("Signal","")), "lvl": str(r.get("Niveau","")), 
-                "sc": score, "st": stat, "d": dist, 
-                "tf": str(r.get("Timeframes","")).replace("Daily","D").replace("Weekly","W").replace(" + ","+"), 
-                "al": str(r.get("Alerte",""))
-            })
-
+            if sym not in agrp: agrp[sym] = []
+            agrp[sym].append({"sig": str(r.get("Signal","")), "lvl": str(r.get("Niveau","")), "sc": score, "st": stat, "d": dist, "tf": str(r.get("Timeframes","")).replace("Daily","D").replace("Weekly","W").replace(" + ","+"), "al": str(r.get("Alerte",""))})
     smap = {s["symbol"]: s for s in summaries}
     tarr = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
     stlb = {"Vierge": "V", "Testee": "T", "Role Reverse": "RR", "Consommee": "C"}
     allb = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠"}
-
     for sym in sorted(agrp.keys(), key=lambda a: max(z["sc"] for z in agrp[a]), reverse=True):
         s = smap.get(sym, {})
         ctx = s.get("price_context", "")
         lines.append(f"### {sym} | H4:{tarr.get(s.get('trend_h4','NEUTRE'),'→')} D:{tarr.get(s.get('trend_daily','NEUTRE'),'→')} W:{tarr.get(s.get('trend_weekly','NEUTRE'),'→')}")
-        if ctx: 
-            lines.append(f"> {ctx}")
+        if ctx: lines.append(f"> {ctx}")
         for z in sorted(agrp[sym], key=lambda x: x["sc"], reverse=True):
             sg = "BUY  " if "BUY" in z["sig"] else ("SELL " if "SELL" in z["sig"] else "PIVOT")
             lines.append(f"- {sg} `{z['lvl']}` | Sc:{z['sc']:.0f} | {stlb.get(z['st'], z['st'])} | {z['d']:.2f}% | {z['tf']} {allb.get(z['al'], '')}")
@@ -855,143 +707,93 @@ with st.sidebar:
     st.header("1. OANDA API (Live/Practice)")
     token = st.secrets.get("OANDA_ACCESS_TOKEN", "")
     acc_id = st.secrets.get("OANDA_ACCOUNT_ID", "")
-    if token and acc_id: 
-        st.success("✅ Secrets OK")
-    else: 
-        st.error("❌ Missing Secrets - Configurez dans Settings > Secrets")
+    if token and acc_id: st.success("✅ Secrets OK ✓")
+    else: st.error("❌ Missing Secrets")
 
     st.header("2. Assets")
     sel_all = st.checkbox(f"All Assets ({len(ALL_SYMBOLS)})", value=True)
     max_symbols = st.number_input("⚡ Max Symboles (évite timeout Cloud)", 1, len(ALL_SYMBOLS), 15)
-    
-    if sel_all:
-        syms_to_scan = ALL_SYMBOLS[:max_symbols]
-    else:
-        selected = st.multiselect("Sélectionner:", ALL_SYMBOLS, default=["XAU_USD", "EUR_USD"])
-        syms_to_scan = selected[:max_symbols]
+    syms_to_scan = ALL_SYMBOLS[:max_symbols] if sel_all else st.multiselect("Select:", ALL_SYMBOLS, default=["XAU_USD", "EUR_USD"])[:max_symbols]
 
     st.header("3. LLM / Quant Export Filters")
     llm_max_dist = st.slider("Max Dist (%)", 0.5, 5.0, 2.0, 0.5)
     llm_min_score = st.slider("Min Score", 40, 300, 60, 10)
-    llm_statuts = st.multiselect("Valid Status", ["Vierge", "Testee", "Role Reverse", "Consommee"], 
-                                default=["Vierge", "Testee", "Role Reverse"])
+    llm_statuts = st.multiselect("Valid Status", ["Vierge", "Testee", "Role Reverse", "Consommee"], default=["Vierge", "Testee", "Role Reverse"])
 
     st.header("4. Display Filters")
     min_touches = st.slider("Min Touches", 2, 10, 2)
     max_dist_filter = st.slider("UI Max Dist (%)", 1.0, 15.0, 3.0, 0.5)
 
 def _display_results(sr: dict, max_dist_filter: float):
-    """Affiche les résultats du scan dans l'UI Streamlit."""
-    df_h4 = sr.get("df_h4", pd.DataFrame())
-    df_daily = sr.get("df_daily", pd.DataFrame())
-    df_wk = sr.get("df_weekly", pd.DataFrame())
+    df_h4, df_daily, df_wk = sr.get("df_h4", pd.DataFrame()), sr.get("df_daily", pd.DataFrame()), sr.get("df_weekly", pd.DataFrame())
     conf_full = sr.get("conf_full", pd.DataFrame())
     errors = sr.get("scan_errors", {})
     
-    # Afficher les erreurs si présentes
     if errors:
-        with st.expander(f"❌ {len(errors)} erreurs de traitement"):
-            for k, v in errors.items(): 
-                st.error(f"{k}: {v}")
+        with st.expander(f"❌ {len(errors)} errors"):
+            for k, v in errors.items(): st.error(f"{k}: {v}")
 
-    # Afficher les confluences si disponibles
     if not conf_full.empty:
-        # Filtrer par distance
         conf_full["Distance %"] = pd.to_numeric(conf_full["Distance %"].astype(str).str.replace("%",""), errors="coerce")
         c_filt = conf_full[conf_full["Distance %"] <= max_dist_filter].reset_index(drop=True)
-        
         if not c_filt.empty:
             st.subheader("🔥 HIGH PROBABILITY CONFLUENCES (MULTI-TF)")
-            st.dataframe(
-                c_filt.sort_values("Score", ascending=False), 
-                hide_index=True, 
-                use_container_width=True, 
-                height=400
-            )
+            st.dataframe(c_filt.sort_values("Score", ascending=False), hide_index=True, use_container_width=True, height=400)
     
-    # Section Export
     st.subheader("📋 Exports")
     c1, c2, c3, c4 = st.columns(4)
-    
     if not conf_full.empty:
-        pdf_data = create_pdf_report(sr["report_dict"], conf_full, sr["summaries"])
-        csv_data = create_csv_report(sr["report_dict"], conf_full)
-        llm_data = create_llm_brief(sr["summaries"], conf_full, llm_max_dist, llm_min_score, tuple(llm_statuts))
-        json_data = create_json_export(sr["summaries"], conf_full, llm_max_dist, llm_min_score, tuple(llm_statuts))
-        
-        c1.download_button("📄 PDF", data=pdf_data, file_name="report.pdf", use_container_width=True)
-        c2.download_button("📊 CSV", data=csv_data, file_name="data.csv", use_container_width=True)
-        c3.download_button("🤖 LLM MD", data=llm_data, file_name="llm.md", use_container_width=True)
-        c4.download_button("🔧 JSON", data=json_data, file_name="quant.json", use_container_width=True)
+        c1.download_button("📄 PDF", data=create_pdf_report(sr["report_dict"], conf_full, sr["summaries"]), file_name="report.pdf", use_container_width=True)
+        c2.download_button("📊 CSV", data=create_csv_report(sr["report_dict"], conf_full), file_name="data.csv", use_container_width=True)
+        c3.download_button("🤖 LLM MD", data=create_llm_brief(sr["summaries"], conf_full, llm_max_dist, llm_min_score, tuple(llm_statuts)), file_name="llm.md", use_container_width=True)
+        c4.download_button("🔧 JSON", data=create_json_export(sr["summaries"], conf_full, llm_max_dist, llm_min_score, tuple(llm_statuts)), file_name="quant.json", use_container_width=True)
 
-    # Fonction helper pour filtrer les dataframes
-    def _filter_df(df):
-        if df.empty or "Dist. %" not in df.columns: 
-            return df
+    def _f(df):
+        if df.empty or "Dist. %" not in df.columns: return df
         df_copy = df.copy()
         df_copy["Dist. %"] = pd.to_numeric(df_copy["Dist. %"].astype(str).str.replace("%",""), errors="coerce")
         return df_copy[df_copy["Dist. %"] <= max_dist_filter].sort_values("Score (1TF)", ascending=False).reset_index(drop=True)
 
     st.divider()
-    
-    # Afficher les résultats par timeframe
     c_h4, c_d, c_w = st.columns(3)
-    with c_h4:
-        st.write("📅 **H4**")
-        st.dataframe(_filter_df(df_h4), hide_index=True, use_container_width=True)
-    with c_d:
-        st.write("📅 **Daily**")
-        st.dataframe(_filter_df(df_daily), hide_index=True, use_container_width=True)
-    with c_w:
-        st.write("📅 **Weekly**")
-        st.dataframe(_filter_df(df_wk), hide_index=True, use_container_width=True)
-
+    with c_h4: st.write("📅 H4"); st.dataframe(_f(df_h4), hide_index=True, use_container_width=True)
+    with c_d: st.write("📅 Daily"); st.dataframe(_f(df_daily), hide_index=True, use_container_width=True)
+    with c_w: st.write("📅 Weekly"); st.dataframe(_f(df_wk), hide_index=True, use_container_width=True)
 
 # ==============================================================================
 # [ MAIN EXECUTION ]
 # ==============================================================================
 if st.button("🚀 RUN INSTITUTIONAL QUANT SCAN", type="primary", use_container_width=True):
     if not token or not acc_id:
-        st.error("❌ Missing OANDA Secrets. Configurez-les dans Settings > Secrets ou localement dans .streamlit/secrets.toml")
+        st.error("Missing OANDA Secrets.")
     else:
-        with st.spinner("🔄 Execution du scan institutionnel (Async I/O + Quant Agglomeration)..."):
+        with st.spinner("Executing High-Frequency Async I/O & Quant Agglomeration..."):
             try:
-                # ✅ Correction critique: utiliser une approche compatible Streamlit Cloud
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Streamlit Cloud: loop déjà actif, créer un nouveau pour éviter les conflits
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        raw_results = new_loop.run_until_complete(
-                            run_institutional_scan(syms_to_scan, token, acc_id, min_touches)
-                        )
-                    finally:
-                        new_loop.close()
-                        asyncio.set_event_loop(loop)
-                else:
-                    # Local: loop non actif, utiliser asyncio.run normalement
-                    raw_results = asyncio.run(
-                        run_institutional_scan(syms_to_scan, token, acc_id, min_touches)
-                    )
+                # ✅ Async runner compatible Streamlit Cloud (sans nest_asyncio)
+                async def _run_wrapper():
+                    return await run_institutional_scan(syms_to_scan, token, acc_id, min_touches)
                 
-                # Post-Process pour l'UI State
-                h4_r, d_r, w_r, confs, summaries, errs = [], [], [], [], [], {}
-                
-                for r in raw_results:
-                    if r.scan_error: 
-                        errs[r.symbol] = r.scan_error
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try: raw_results = new_loop.run_until_complete(_run_wrapper())
+                        finally: new_loop.close(); asyncio.set_event_loop(loop)
                     else:
-                        if r.rows.get("H4"): 
-                            h4_r.extend(r.rows["H4"])
-                        if r.rows.get("Daily"): 
-                            d_r.extend(r.rows["Daily"])
-                        if r.rows.get("Weekly"): 
-                            w_r.extend(r.rows["Weekly"])
-                        
+                        raw_results = loop.run_until_complete(_run_wrapper())
+                except RuntimeError:
+                    raw_results = asyncio.run(_run_wrapper())
+                
+                h4_r, d_r, w_r, confs, summaries, errs = [], [], [], [], [], {}
+                for r in raw_results:
+                    if r.scan_error: errs[r.symbol] = r.scan_error
+                    else:
+                        if r.rows.get("H4"): h4_r.extend(r.rows["H4"])
+                        if r.rows.get("Daily"): d_r.extend(r.rows["Daily"])
+                        if r.rows.get("Weekly"): w_r.extend(r.rows["Weekly"])
                         c = detect_confluences(r.symbol.replace("_","/"), r.zones, r.price, r.bars_map)
                         confs.extend(c)
-                        
                         summaries.append({
                             "symbol": r.symbol.replace("_","/"),
                             "trend_h4": r.trends.get("H4", "NEUTRE"),
@@ -1006,30 +808,22 @@ if st.button("🚀 RUN INSTITUTIONAL QUANT SCAN", type="primary", use_container_
                 df_d = pd.DataFrame(d_r) if d_r else pd.DataFrame()
                 df_w = pd.DataFrame(w_r) if w_r else pd.DataFrame()
                 
-                # Filtrer les colonnes internes pour le rapport PDF
                 r_dict = {
                     "H4": _clean_df(df_h4[df_h4["_in_pdf"]]) if not df_h4.empty and "_in_pdf" in df_h4.columns else pd.DataFrame(),
                     "Daily": _clean_df(df_d[df_d["_in_pdf"]]) if not df_d.empty and "_in_pdf" in df_d.columns else pd.DataFrame(),
                     "Weekly": _clean_df(df_w[df_w["_in_pdf"]]) if not df_w.empty and "_in_pdf" in df_w.columns else pd.DataFrame(),
                 }
 
-                # Stocker dans session_state pour persistance
                 st.session_state["scan_results"] = {
-                    "df_h4": _clean_df(df_h4), 
-                    "df_daily": _clean_df(df_d), 
-                    "df_weekly": _clean_df(df_w),
-                    "conf_full": pd.DataFrame(confs) if confs else pd.DataFrame(), 
-                    "report_dict": r_dict,
-                    "summaries": summaries, 
-                    "scan_errors": errs
+                    "df_h4": _clean_df(df_h4), "df_daily": _clean_df(df_d), "df_weekly": _clean_df(df_w),
+                    "conf_full": pd.DataFrame(confs) if confs else pd.DataFrame(), "report_dict": r_dict,
+                    "summaries": summaries, "scan_errors": errs
                 }
-                
                 st.success(f"✅ Scan terminé ! {len(syms_to_scan)} actifs analysés.")
-                
             except Exception as e:
-                st.error(f"❌ Erreur lors du scan: {str(e)}")
-                logging.error(f"Scan error: {traceback.format_exc()}")
+                st.error(f"❌ Erreur critique: {str(e)}")
+                logging.error(traceback.format_exc())
 
-# ✅ Correction finale: afficher les résultats si disponibles dans session_state
+# ✅ Correction syntaxique finale (suppression du 'streamlit' collé)
 if "scan_results" in st.session_state:
     _display_results(st.session_state["scan_results"], max_dist_filter)
