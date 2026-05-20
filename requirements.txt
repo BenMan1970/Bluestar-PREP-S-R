@@ -6,3 +6,4 @@ oandapyV20
 reportlab
 scipy
 fpdf2
+aiohttp==3.9.5
