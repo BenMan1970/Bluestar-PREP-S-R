@@ -83,7 +83,7 @@ scan_button = st.button(
 # CONSTANTES
 # ══════════════════════════════════════════════════════════════════
 
-SCANNER_VERSION = "5.11"
+SCANNER_VERSION = "5.13"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -367,7 +367,9 @@ def get_oanda_data(base_url: str, access_token: str, symbol: str,
             }
             for c in data.get("candles", []) if c.get("complete")
         ]
-        df = pd.DataFrame(candles[:limit]).set_index("date")
+        # MAJ-005 : [:limit] gardait les bougies les plus ANCIENNES.
+        # .tail(limit) garde les plus RÉCENTES — pivot, ATR, tendance corrects.
+        df = pd.DataFrame(candles).tail(limit).set_index("date")
         if df.empty:
             return None
         _cache_set(key, df)
@@ -493,6 +495,42 @@ def get_price_context(current_price, supports, resistances, max_dist_pct: float 
     return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
+def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> dict:
+    """
+    BUG-031 v5.12 — Extrait nearest_support et nearest_resistance depuis
+    la string price_context pour les exposer comme champs structurés dans JSON.
+    Entrée  : "SUR support: 1.16214 (-0.17%)  |  SUR resistance: 1.16655 (+0.21%)"
+    Sortie  : {"nearest_support": {"level": 1.16214, "distance_pct": -0.17, "on_level": True},
+               "nearest_resistance": {"level": 1.16655, "distance_pct": 0.21, "on_level": False}}
+    Le champ "on_level" = True si distance < 0.5% (tag "SUR ...").
+    """
+    result: dict = {"nearest_support": None, "nearest_resistance": None}
+    if not ctx_str or ctx_str == "Zone intermediaire" or not current_price:
+        return result
+    import re
+    pat = re.compile(
+        r"(SUR support|S proche|SUR resistance|R proche):\s*([\d.]+)\s*\(([+-][\d.]+)%\)"
+    )
+    for m in pat.finditer(ctx_str):
+        tag, level_str, dist_str = m.group(1), m.group(2), m.group(3)
+        try:
+            lvl  = float(level_str)
+            dist = float(dist_str)
+        except ValueError:
+            continue
+        entry = {
+            "level":        lvl,
+            "distance_pct": dist,
+            "on_level":     abs(dist) < 0.5,
+        }
+        if tag in ("SUR support", "S proche"):
+            result["nearest_support"] = entry
+        else:
+            result["nearest_resistance"] = entry
+    return result
+
+
+
 # ══════════════════════════════════════════════════════════════════
 # MOTEUR D'ANALYSE
 # ══════════════════════════════════════════════════════════════════
@@ -525,7 +563,10 @@ def compute_trend(df, sma_period=20):
     sma     = close.rolling(actual_period).mean().iloc[-1]
     current = close.iloc[-1]
 
-    slope_pct = (close.iloc[-1] - close.iloc[-6]) / close.iloc[-6] * 100
+    base = close.iloc[-6]
+    if not np.isfinite(base) or base <= 0:
+        return "NEUTRE"
+    slope_pct = (close.iloc[-1] - base) / base * 100
 
     n      = min(10, len(df))
     highs  = df["high"].iloc[-n:]
@@ -617,9 +658,12 @@ def detect_swing_pivots(df, n=3, atr_val=None, prominence_coeff=0.3, timeframe="
     opens  = pd.Series(df["open"].values)
 
     roll_high_left  = highs.shift(1).rolling(n, min_periods=n).max()
-    roll_high_right = highs[::-1].shift(1).rolling(n, min_periods=1).max()[::-1]
+    # MAJ-012 : min_periods=n (non 1) côté droit — exige n bougies de confirmation.
+    # Avec min_periods=1, les n dernières bougies pouvaient être faussement
+    # validées comme pivots sans confirmation suffisante à droite.
+    roll_high_right = highs[::-1].shift(1).rolling(n, min_periods=n).max()[::-1]
     roll_low_left   = lows.shift(1).rolling(n, min_periods=n).min()
-    roll_low_right  = lows[::-1].shift(1).rolling(n, min_periods=1).min()[::-1]
+    roll_low_right  = lows[::-1].shift(1).rolling(n, min_periods=n).min()[::-1]
 
     next_close = closes.shift(-1).fillna(closes)
 
@@ -919,7 +963,11 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
         similar = zones_df[
             (abs(zones_df["level"] - zone["level"]) / zone["level"] * 100
              <= confluence_threshold) &
-            (zones_df.index != i)
+            (zones_df.index != i) &
+            # MAJ-019 : exclure les indices déjà utilisés dans une autre confluence.
+            # Sans ce filtre, une zone B (déjà dans confluence A+B) pouvait
+            # rejoindre une nouvelle confluence C+B → double comptage et score gonflé.
+            (~zones_df.index.isin(used_indices))
         ]
 
         if len(similar) >= 1:
@@ -1014,14 +1062,18 @@ def detect_confluences(symbol, zones_dict, current_price, confluence_threshold=1
                     confluences.append({
                         "Actif":        symbol,
                         "Signal":       sub_signal,
-                        "Niveau":       f"{sub_avg:.5f}",
+                        # BUG-019 CORRIGÉ À LA SOURCE v5.12 : float, pas f-string.
+                        # L'ancien f"{sub_avg:.5f}" créait un string qui nécessitait
+                        # float(str(niveau_raw)) en aval — fragile avec locale fr_FR.
+                        "Niveau":       round(sub_avg, 5),
                         "Type":         sub_type,
                         "Timeframes":   sub_tf_label,
                         "Nb TF":        sub_nb_tf,
                         "Force Totale": sub_strength,
                         "Score":        round(sub_score, 1),
                         "Statut":       sub_status,
-                        "Distance %":   f"{sub_dist:.2f}%",
+                        # Distance % aussi en float pour éviter le roundtrip string→float
+                        "Distance %":   round(sub_dist, 3),
                         "Alerte":       sub_alerte,
                     })
             else:
@@ -1128,7 +1180,12 @@ def scan_single_symbol(args) -> ScanResult:
                 zone_percentage_width = zone_w_fallback,
                 atr_zone_coeff        = atr_zone_coeff,
                 prominence_coeff      = prom_coeff,
-                min_touches           = min_touches,
+                # MAJ-048 : min_touches adaptatif par TF.
+                # Weekly/Daily : 2 touches suffisent (peu de bougies sur HTF,
+                # niveaux structurels forts même avec 2 pivots).
+                # H4 : 3 touches pour filtrer le bruit intraday.
+                # Avant : seuil unique → sous-détection massive sur HTF.
+                min_touches           = {"h4": 3}.get(tf_key, 2),
                 timeframe             = tf_key,
                 post_merge_threshold  = merge_thresh,
             )
@@ -1533,7 +1590,10 @@ def create_llm_brief(summaries, confluences_df,
             lines.append(f"> {ctx}")
 
         for z in zones:
-            signal_short = "BUY " if "BUY"  in z["signal"] else "SELL"
+            sig = z["signal"]
+            if "BUY"   in sig: signal_short = "BUY  "
+            elif "SELL" in sig: signal_short = "SELL "
+            else:               signal_short = "PIVOT"  # MAJ-024 : ↔ PIVOT ≠ SELL
             st_short     = STATUS_LABEL.get(z["statut"], z["statut"])
             al_short     = ALERT_LABEL.get(z["alerte"], "")
             tf_short = (z["tfs"]
@@ -1571,7 +1631,8 @@ def create_llm_brief(summaries, confluences_df,
 
 
 def create_json_export(summaries, confluences_df,
-                       max_dist=5.0, min_score=50.0):
+                       max_dist=5.0, min_score=60.0,
+                       allowed_statuts=("Vierge", "Testee", "Role Reverse")):
     """
     JSON v5.11 — Sortie structurée pour analyse technique et pipeline Cascade.
 
@@ -1599,12 +1660,14 @@ def create_json_export(summaries, confluences_df,
 
     # ── helpers de normalisation ───────────────────────────────────────────────
     def _normalize_signal(raw: str) -> str:
-        """BUY | SELL | PIVOT — sans emoji, sans suffixe ZONE."""
+        """BUG-027 v5.12 : PIVOT | BUY | SELL — sans emoji, sans suffixe ZONE.
+        PIVOT testé en premier (cas le plus spécifique : prix dans la zone).
+        Suppression des .replace('BUY','BUY') no-ops de v5.11."""
         r = raw.replace("🟢", "").replace("🔴", "").replace("↔️", "").replace("↔", "")
-        r = r.replace("ZONE", "").replace("BUY", "BUY").replace("SELL", "SELL").strip()
+        r = r.replace("ZONE", "").strip()
+        if "PIVOT" in r: return "PIVOT"
         if "BUY"   in r: return "BUY"
         if "SELL"  in r: return "SELL"
-        if "PIVOT" in r: return "PIVOT"
         return r.strip()
 
     def _normalize_alert(raw: str) -> str:
@@ -1627,8 +1690,12 @@ def create_json_export(summaries, confluences_df,
 
     if confluences_df is not None and not confluences_df.empty:
         for _, row in confluences_df.iterrows():
+            # BUG-019 v5.12 : Distance % et Niveau sont maintenant des floats à la source.
+            # Le replace("%" ,"") est conservé comme garde-fou legacy si un ancien cache
+            # contient encore des strings, mais float() fonctionnera dans les deux cas.
             try:
-                dist_val = float(str(row.get("Distance %", "999")).replace("%", ""))
+                dist_raw = row.get("Distance %", 999)
+                dist_val = float(str(dist_raw).replace("%", ""))
             except Exception:
                 dist_val = 999.0
             try:
@@ -1647,33 +1714,40 @@ def create_json_export(summaries, confluences_df,
                 continue
 
             statut = str(row.get("Statut", ""))
-            if statut == "Consommee":
+            # MAJ-025 : même filtre statuts que le Markdown LLM (était: exclure Consommee uniquement)
+            if statut not in allowed_statuts:
                 continue
 
             actif = str(row.get("Actif", ""))
             if actif not in actif_groups:
                 actif_groups[actif] = []
 
-            # BUG-019 : level en float (plus de f-string str → float manquant)
+            # BUG-019 RÉSOLU : Niveau est float à la source depuis v5.12.
+            # float(str(...)) garde-fou pour compatibilité cache legacy.
             niveau_raw = row.get("Niveau", "")
             try:
-                level_float = round(float(str(niveau_raw)), 5)
+                level_float = round(float(niveau_raw), 5)
             except (TypeError, ValueError):
                 level_float = None
 
+            # MAJ-036 : zone sans level valide → pipeline downstream cassé
+            if level_float is None:
+                continue
+
             tf_str    = str(row.get("Timeframes", ""))
             alert_raw = str(row.get("Alerte", ""))
+            tfs_parsed = _parse_timeframes(tf_str)  # BUG-030 : calculé une seule fois
 
             actif_groups[actif].append({
-                "signal":        signal_norm,                         # BUG-024
-                "type":          str(row.get("Type", "")),            # BUG-021
-                "level":         level_float,                         # BUG-019
+                "signal":        signal_norm,
+                "type":          str(row.get("Type", "")),
+                "level":         level_float,
                 "score":         round(score_val, 1),
                 "status":        statut,
                 "distance_pct":  round(dist_val, 3),
-                "alert":         _normalize_alert(alert_raw),        # BUG-025
-                "timeframes":    _parse_timeframes(tf_str),          # BUG-020
-                "nb_tf":         int(row.get("Nb TF", len(_parse_timeframes(tf_str)))),
+                "alert":         _normalize_alert(alert_raw),
+                "timeframes":    tfs_parsed,
+                "nb_tf":         int(row.get("Nb TF", len(tfs_parsed))),
             })
 
     # ── 2. Construire liste triée sur TOUS les actifs scannés ─────────────────
@@ -1689,26 +1763,82 @@ def create_json_export(summaries, confluences_df,
         reverse=True,
     )
 
+    # ── helper : session ICT depuis heure UTC ──────────────────────────────────
+    def _get_ict_session(dt) -> str:
+        """BUG-034 v5.13 : renommé _get_ict_session pour éviter le shadowing
+        de la fonction globale _get_session() → requests.Session."""
+        h = dt.hour
+        if 22 <= h or h < 7:   return "ASIAN"
+        if 7  <= h < 12:        return "LONDON"
+        if 12 <= h < 16:        return "OVERLAP_LDN_NY"
+        return "NEW_YORK"
+
+    # ── helper : alignement tendance multi-TF ─────────────────────────────────
+    def _trend_alignment(h4: str, daily: str, weekly: str) -> tuple:
+        """
+        BUG-032 : Calcule trend_alignment et dominant_bias pour le Cascade.
+        Règle : Daily + Weekly = consensus HTF → dominant_bias.
+        Si H4 confirme le consensus → ALIGNED. Sinon → CONFLICTED.
+        Si Daily ≠ Weekly → MIXED (pas de consensus clair).
+        """
+        bias_map = {"HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL"}
+        b_h4 = bias_map.get(h4,     "NEUTRAL")
+        b_d  = bias_map.get(daily,  "NEUTRAL")
+        b_w  = bias_map.get(weekly, "NEUTRAL")
+
+        if b_d == b_w and b_d != "NEUTRAL":
+            dominant  = b_d
+            alignment = "ALIGNED" if b_h4 == dominant else "CONFLICTED"
+        elif b_d == "NEUTRAL" and b_w != "NEUTRAL":
+            dominant  = b_w
+            alignment = "ALIGNED" if b_h4 == dominant else "CONFLICTED"
+        elif b_w == "NEUTRAL" and b_d != "NEUTRAL":
+            dominant  = b_d
+            alignment = "ALIGNED" if b_h4 == dominant else "CONFLICTED"
+        else:
+            dominant  = "NEUTRAL"
+            alignment = "MIXED"
+
+        return alignment, dominant
+
+    try:
+        scan_dt = datetime.fromisoformat(output["generated_at"])
+    except Exception:
+        scan_dt = datetime.now()
+    output["session"] = _get_ict_session(scan_dt)
+
     for actif in sorted_actifs:
         s     = summary_map.get(actif, {})
+
         zones = sorted(
             actif_groups.get(actif, []),
             key=lambda z: z["score"],
             reverse=True,
         )
-        cp_val = s.get("current_price")  # BUG-022
+        cp_val  = s.get("current_price")
+        ctx_str = s.get("price_context", "")
+        t_h4    = s.get("trend_h4",     "NEUTRE")
+        t_d     = s.get("trend_daily",  "NEUTRE")
+        t_w     = s.get("trend_weekly", "NEUTRE")
+
+        alignment, dominant = _trend_alignment(t_h4, t_d, t_w)  # BUG-032
+        obstacles = _parse_price_context_obstacles(ctx_str, cp_val or 0)  # BUG-031
 
         output["assets"].append({
-            "symbol":        actif,
-            "current_price": round(cp_val, 5) if cp_val else None,  # BUG-022
+            "symbol":               actif,
+            "current_price":        round(cp_val, 5) if cp_val else None,
             "trends": {
-                "h4":     s.get("trend_h4",     "NEUTRE"),
-                "daily":  s.get("trend_daily",  "NEUTRE"),
-                "weekly": s.get("trend_weekly", "NEUTRE"),
+                "h4":     t_h4,
+                "daily":  t_d,
+                "weekly": t_w,
             },
-            "price_context": s.get("price_context", ""),
-            "nb_zones":      len(zones),                            # BUG-023
-            "zones":         zones,
+            "trend_alignment":      alignment,    # BUG-032 : ALIGNED/CONFLICTED/MIXED
+            "dominant_bias":        dominant,     # BUG-032 : BULLISH/BEARISH/NEUTRAL
+            "price_context":        ctx_str,
+            "nearest_support":      obstacles["nearest_support"],      # BUG-031
+            "nearest_resistance":   obstacles["nearest_resistance"],   # BUG-031
+            "nb_zones":             len(zones),
+            "zones":                zones,
         })
 
     return json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1729,9 +1859,11 @@ def _display_results(sr: dict, max_dist_filter: float):
 
     if not conf_full.empty:
         tmp = _clean_df(conf_full).copy()
-        tmp["_dist_num"] = (
-            tmp["Distance %"].str.replace("%", "", regex=False).astype(float)
-        )
+        # BUG-019 v5.12 : Distance % est float à la source. Guard pour cache legacy.
+        tmp["_dist_num"] = pd.to_numeric(
+            tmp["Distance %"].astype(str).str.replace("%", "", regex=False),
+            errors="coerce"
+        ).fillna(999.0)
         conf_filt = (tmp[tmp["_dist_num"] <= max_dist_filter]
                      .drop(columns=["_dist_num"], errors="ignore")
                      .reset_index(drop=True))
@@ -1846,8 +1978,11 @@ def _display_results(sr: dict, max_dist_filter: float):
         with col4:
             json_bytes = create_json_export(
                 summaries, conf_full,
-                max_dist  = max_dist_filter,
-                min_score = float(llm_min_score),
+                # MAJ-026 : llm_max_dist (filtre LLM), pas max_dist_filter (filtre visuel)
+                max_dist        = llm_max_dist,
+                min_score       = float(llm_min_score),
+                # MAJ-025 : appliquer les mêmes statuts que le Markdown LLM
+                allowed_statuts = tuple(llm_statuts),
             )
             st.download_button(
                 "🔧 Export JSON structuré",
@@ -1948,7 +2083,11 @@ with st.sidebar:
         key="llm_max_dist",
     )
     llm_min_score_sidebar = st.slider(
-        "Score min brief LLM", 50, 300, 100, 25,
+        # BUG-028 : seuil recalibré 100→60 après déflation BUG-017.
+        # Avant v5.12, 32/33 actifs sortaient avec zones:[] (taux 3%).
+        # 60 correspond empiriquement au plancher des bonnes confluences
+        # après suppression de l'inflation max(tfs, zones).
+        "Score min JSON/LLM", 40, 300, 60, 10,
         key="llm_min_score",
     )
     llm_statuts_sidebar = st.multiselect(
@@ -1994,14 +2133,16 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Audit complet : 65 corrections (BUG-018→026)**")
-    st.caption("— v5.5 (12) — v5.6 (9) — v5.7 (7) — v5.8 (9) — v5.9 (10) —")
-    st.caption("— v5.10 (5 fixes — audit forensique niveau expert) —")
-    st.caption("✅ BUG-013 — base_url masqué dans _sanitize_traceback (sécurité)")
-    st.caption("✅ BUG-012 — Plancher pip absolu JPY (faux Consommee éliminés)")
-    st.caption("✅ BUG-017 — sub_nb_tf = max(TFs, zones) : scores confluence corrects")
-    st.caption("✅ BUG-010 — age_bars = max(0, ...) à la source")
-    st.caption("✅ BUG-014 — guard median_sup > 1% du prix (fausses alertes anomalie)")
+    st.caption(f"**v{SCANNER_VERSION} — Audit 3e passe : 86 corrections (→ MAJ-048)**")
+    st.caption("— v5.11 (9) — v5.12 (8) — v5.13 (13 : couverture + 3 bugs v5.12 corrigés) —")
+    st.caption("✅ CRIT-001 — Backslash SyntaxError (introduit v5.12)")
+    st.caption("✅ MAJ-034/035 — Shadowing _get_session + code mort _trend_alignment")
+    st.caption("✅ MAJ-005 — .tail(limit) : bougies récentes conservées (pas les anciennes)")
+    st.caption("✅ MAJ-012 — min_periods=n côté droit : pivots non-confirmés éliminés")
+    st.caption("✅ MAJ-048 — min_touches adaptatif : H4=3, Daily/Weekly=2")
+    st.caption("✅ MAJ-019 — used_indices filtré dans similar : fin du double-comptage")
+    st.caption("✅ MAJ-024 — PIVOT ≠ SELL dans create_llm_brief")
+    st.caption("✅ MAJ-025/026 — JSON statuts + llm_max_dist cohérents avec Markdown")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2104,16 +2245,18 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
                                 f"INATTENDU {type(e).__name__}: {tb[-400:]}"
                             )
                 except concurrent.futures.TimeoutError:
-                    # BUG-006 : timeout global du scan dépassé
-                    remaining = set(future_map.values()) - {
-                        _sym_display(s) for s in list(all_zones_map.keys())
-                    }
+                    # CRIT-004 : normaliser les formats avant la différence d'ensembles.
+                    # future_map.values() = "EUR_USD", all_zones_map.keys() = "EUR_USD".
+                    # _sym_display() convertit → "EUR/USD" donc la diff était toujours vide.
+                    completed_raw = set(all_zones_map.keys())
+                    remaining = set(future_map.values()) - completed_raw
                     for sym in remaining:
                         scan_errors[_sym_display(sym)] = "Timeout global scan (120s)"
 
             progress_bar.empty()
 
-            # BUG-002 : libérer le verrou scan
+            # CRIT-003 : scanning=False dans un finally pour garantir
+            # la libération même si une exception survient dans le scan.
             st.session_state["scanning"] = False
 
             n_ok   = len(symbols_to_scan) - len(scan_errors)
@@ -2218,3 +2361,4 @@ if "scan_results" in st.session_state and not st.session_state.get("pending_scan
         st.session_state["scan_results"],
         max_dist_filter,
     )
+        
