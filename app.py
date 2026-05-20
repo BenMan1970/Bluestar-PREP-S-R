@@ -1,4 +1,5 @@
 import asyncio
+import time
 import nest_asyncio
 import hashlib
 import json
@@ -24,6 +25,28 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Patch asyncio to allow nested event loops (required for Streamlit compatibility)
 nest_asyncio.apply()
+
+# ==============================================================================
+# [ LAYER 0b: ASYNC DATA CACHE ]
+# ==============================================================================
+# Cache candles par bucket temporel de 10 min.
+# Clé : (symbol, tf, bucket) — le bucket change toutes les 600s,
+# ce qui invalide automatiquement les entrées sans TTL check explicite.
+# Avantage : 0 verrou, 0 thread, compatible asyncio single-threaded.
+_OANDA_CACHE: Dict[tuple, Optional[pd.DataFrame]] = {}
+_CACHE_TTL_SECS = 600  # 10 minutes
+
+def _cache_bucket() -> int:
+    """Retourne le bucket temporel courant (change toutes les 600s)."""
+    return int(time.time()) // _CACHE_TTL_SECS
+
+def _cache_purge_old() -> None:
+    """Supprime les entrées de plus de 2 buckets (~20 min) pour éviter les fuites mémoire."""
+    current = _cache_bucket()
+    stale = [k for k in _OANDA_CACHE if k[2] < current - 1]
+    for k in stale:
+        del _OANDA_CACHE[k]
+
 
 SCANNER_VERSION = "7.0-INSTITUTIONAL"
 
@@ -53,26 +76,43 @@ class InstrumentProfile:
     pivot_prominence_atr: float# Rejection significance
     dev_threshold_pct: float   # Price anomaly threshold
     skip_ratio_check: bool     # Skip median vs price sanity check
+    # Wick thresholds : proportion minimale de mèche sur la range de la bougie
+    # pour valider un swing. Varie selon la volatilité de l'actif ET le TF.
+    # Intraday (H4 et inférieur) : mèches plus courtes acceptées
+    # HTF (Daily, Weekly) : on exige une mèche plus marquée = signal plus fort
+    wick_threshold_intraday: float = 0.20  # H4 / M15
+    wick_threshold_htf: float      = 0.30  # Daily / Weekly
+    # Seuil de confluence inter-TF en % du prix.
+    # Deux zones de TFs différents sont en confluence si leur écart <= ce seuil.
+    # Indices volatils : seuil plus large. Forex : seuil serré.
+    confluence_threshold_pct: float = 1.0
 
 _PROFILES = {
-    "EUR_USD": InstrumentProfile("EUR_USD", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False),
-    "GBP_USD": InstrumentProfile("GBP_USD", "FOREX", 0.0001, 1.3, 0.85, 0.65, 1.5, False),
-    "USD_JPY": InstrumentProfile("USD_JPY", "FOREX", 0.01, 0.9, 0.5, 0.5, 1.5, False),
-    "XAU_USD": InstrumentProfile("XAU_USD", "METAL", 0.01, 2.0, 1.2, 1.0, 3.0, True),
-    "US30_USD": InstrumentProfile("US30_USD", "INDEX", 1.0, 1.5, 0.9, 0.7, 2.5, True),
-    "NAS100_USD": InstrumentProfile("NAS100_USD", "INDEX", 1.0, 1.5, 1.0, 0.8, 2.5, True),
-    "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1, 1.3, 0.8, 0.65, 2.0, True),
-    "DE30_EUR": InstrumentProfile("DE30_EUR", "INDEX", 0.1, 1.3, 0.8, 0.65, 2.0, True),
+    # ── FOREX Majors ── wick_intraday=0.20 / wick_htf=0.30 (baseline retail validé)
+    "EUR_USD":    InstrumentProfile("EUR_USD",    "FOREX", 0.0001, 1.2,  0.8,  0.6,  1.5, False, wick_threshold_intraday=0.20, wick_threshold_htf=0.30, confluence_threshold_pct=1.0),
+    "GBP_USD":    InstrumentProfile("GBP_USD",    "FOREX", 0.0001, 1.3,  0.85, 0.65, 1.5, False, wick_threshold_intraday=0.20, wick_threshold_htf=0.30, confluence_threshold_pct=1.0),
+    "USD_JPY":    InstrumentProfile("USD_JPY",    "FOREX", 0.01,   0.9,  0.5,  0.5,  1.5, False, wick_threshold_intraday=0.20, wick_threshold_htf=0.30, confluence_threshold_pct=1.0),
+    # ── Métal ── Gold : price action wick-heavy → seuil abaissé pour capturer plus de swings
+    "XAU_USD":    InstrumentProfile("XAU_USD",    "METAL", 0.01,   2.0,  1.2,  1.0,  3.0, True,  wick_threshold_intraday=0.18, wick_threshold_htf=0.28, confluence_threshold_pct=1.5),
+    # ── Indices ── corps larges, mèches proportionnellement réduites → seuil relevé
+    "US30_USD":   InstrumentProfile("US30_USD",   "INDEX", 1.0,    1.5,  0.9,  0.7,  2.5, True,  wick_threshold_intraday=0.22, wick_threshold_htf=0.32, confluence_threshold_pct=1.5),
+    "NAS100_USD": InstrumentProfile("NAS100_USD", "INDEX", 1.0,    1.5,  1.0,  0.8,  2.5, True,  wick_threshold_intraday=0.22, wick_threshold_htf=0.32, confluence_threshold_pct=1.5),
+    "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    1.3,  0.8,  0.65, 2.0, True,  wick_threshold_intraday=0.22, wick_threshold_htf=0.32, confluence_threshold_pct=1.2),
+    "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    1.3,  0.8,  0.65, 2.0, True,  wick_threshold_intraday=0.22, wick_threshold_htf=0.32, confluence_threshold_pct=1.2),
 }
-_DEFAULT_PROFILE = InstrumentProfile("DEFAULT", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
+_DEFAULT_PROFILE = InstrumentProfile("DEFAULT", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False,
+                                     wick_threshold_intraday=0.20, wick_threshold_htf=0.30)
 
 def get_profile(symbol: str) -> InstrumentProfile:
-    if symbol in _PROFILES: return _PROFILES[symbol]
+    if symbol in _PROFILES:
+        return _PROFILES[symbol]
     base = symbol.split("_")[0]
     if base in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF"):
-        return InstrumentProfile(symbol, "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
+        return InstrumentProfile(symbol, "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False,
+                                 wick_threshold_intraday=0.20, wick_threshold_htf=0.30)
     if base == "JPY" or symbol.endswith("_JPY"):
-        return InstrumentProfile(symbol, "FOREX", 0.01, 0.9, 0.5, 0.5, 1.5, False)
+        return InstrumentProfile(symbol, "FOREX", 0.01, 0.9, 0.5, 0.5, 1.5, False,
+                                 wick_threshold_intraday=0.20, wick_threshold_htf=0.30)
     return _DEFAULT_PROFILE
 
 # ==============================================================================
@@ -103,6 +143,12 @@ class AsyncOandaClient:
         return False
 
     async def fetch_candles(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, symbol: str, tf: str, limit: int = 500) -> Tuple[str, str, Optional[pd.DataFrame]]:
+        # Cache hit : évite une requête OANDA si les données sont < 10 min
+        _ck = (symbol, tf, _cache_bucket())
+        if _ck in _OANDA_CACHE:
+            logging.debug(f"Cache HIT: {symbol}/{tf}")
+            return symbol, tf, _OANDA_CACHE[_ck]
+
         gran = _GRANULARITY_MAP.get(tf)
         url = f"{self.env_url}/v3/instruments/{symbol}/candles"
         params = {"count": limit + 1, "granularity": gran, "price": "M"}
@@ -121,7 +167,10 @@ class AsyncOandaClient:
                         } for c in data.get("candles", []) if c.get("complete")
                     ]
                     df = pd.DataFrame(candles).tail(limit).set_index("date")
-                    return symbol, tf, df if not df.empty else None
+                    result_df = df if not df.empty else None
+                    _OANDA_CACHE[_ck] = result_df
+                    _cache_purge_old()
+                    return symbol, tf, result_df
             except Exception:
                 return symbol, tf, None
 
@@ -185,7 +234,11 @@ def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: f
     upper_wick_pct = (pd.Series(highs) - body_top) / candle_range
     lower_wick_pct = (body_bottom - pd.Series(lows)) / candle_range
 
-    _WICK_THRESHOLD = 0.20 if timeframe.lower() in ("h4", "m15") else 0.30
+    # Seuil de mèche issu du profil instrument — zéro nombre magique
+    _WICK_THRESHOLD = (
+        profile.wick_threshold_intraday if timeframe.lower() in ("h4", "m15")
+        else profile.wick_threshold_htf
+    )
 
     sh_mask = (
         (pd.Series(highs) > roll_high_left) & (pd.Series(highs) > roll_high_right) &
@@ -207,19 +260,33 @@ def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: f
 
     return pd.Series(highs[idx_highs], index=idx_highs), pd.Series(lows[idx_lows], index=idx_lows)
 
-def agglomerative_1d_clustering(prices: List[float], bandwidth: float) -> List[List[float]]:
-    """Deterministic 1D KDE-like Agglomerative Clustering."""
-    if not prices: return []
-    sorted_p = sorted(prices)
-    clusters = []
-    curr_cluster = [sorted_p[0]]
-    
-    for i in range(1, len(sorted_p)):
-        if sorted_p[i] - sorted_p[i-1] <= bandwidth:
-            curr_cluster.append(sorted_p[i])
+def agglomerative_1d_clustering(
+    price_weight_pairs: List[tuple],
+    bandwidth: float
+) -> List[List[tuple]]:
+    """Deterministic 1D Agglomerative Clustering sur (price, weight) pairs.
+
+    Trie par prix puis regroupe les paires dont l'écart consécutif <= bandwidth.
+    Transporte les poids pour permettre un centroïde pondéré par récence.
+
+    Args:
+        price_weight_pairs: liste de (price: float, weight: float)
+        bandwidth: seuil d'agglomération en prix (ATR * cluster_radius)
+    Returns:
+        Liste de groupes, chaque groupe étant une liste de (price, weight)
+    """
+    if not price_weight_pairs:
+        return []
+    sorted_pw = sorted(price_weight_pairs, key=lambda x: x[0])
+    clusters: List[List[tuple]] = []
+    curr_cluster = [sorted_pw[0]]
+
+    for i in range(1, len(sorted_pw)):
+        if sorted_pw[i][0] - sorted_pw[i - 1][0] <= bandwidth:
+            curr_cluster.append(sorted_pw[i])
         else:
             clusters.append(curr_cluster)
-            curr_cluster = [sorted_p[i]]
+            curr_cluster = [sorted_pw[i]]
     clusters.append(curr_cluster)
     return clusters
 
@@ -279,24 +346,36 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, at
         pivot_highs = pd.Series(df["high"].values[r_idx], index=r_idx) if len(r_idx) else pd.Series(dtype=float)
         pivot_lows = pd.Series(df["low"].values[s_idx], index=s_idx) if len(s_idx) else pd.Series(dtype=float)
 
-    all_pivots = [(float(p), int(i)) for i, p in pivot_highs.items()] + [(float(p), int(i)) for i, p in pivot_lows.items()]
+    # Recency weight : un pivot récent influence davantage le centroïde.
+    # weight = (index + 1e-6) / n_total → ~0 vieux, ~1 récent
+    all_pivots = (
+        [(float(p), int(i), (int(i) + 1e-6) / n_total) for i, p in pivot_highs.items()] +
+        [(float(p), int(i), (int(i) + 1e-6) / n_total) for i, p in pivot_lows.items()]
+    )
     if not all_pivots: return pd.DataFrame(), pd.DataFrame()
 
     # Deterministic Agglomerative Clustering
     bandwidth = atr_val * profile.cluster_radius_atr
-    prices_only = [p[0] for p in all_pivots]
-    clusters_raw = agglomerative_1d_clustering(prices_only, bandwidth)
+    price_weight_pairs = [(p, w) for p, _, w in all_pivots]
+    clusters_raw = agglomerative_1d_clustering(price_weight_pairs, bandwidth)
 
     strong = []
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
 
-    for grp_prices in clusters_raw:
-        if len(grp_prices) < min_touches: continue
+    for grp_pw in clusters_raw:
+        if len(grp_pw) < min_touches:
+            continue
         
-        # Map prices back to original indices to find the latest touch (age)
-        grp_indices = [idx for p, idx in all_pivots if p in grp_prices]
-        lvl = np.mean(grp_prices)
-        if lvl <= 0: continue
+        grp_prices_arr = np.array([p for p, _ in grp_pw])
+        grp_weights_arr = np.array([w for _, w in grp_pw])
+
+        # Centroïde pondéré par recency : les niveaux récents priment
+        lvl = float(np.average(grp_prices_arr, weights=grp_weights_arr))
+        if lvl <= 0:
+            continue
+
+        grp_price_set = set(grp_prices_arr.tolist())
+        grp_indices = [idx for p, idx, _ in all_pivots if p in grp_price_set]
 
         last_idx = max(grp_indices)
         age = max(0, n_total - 1 - last_idx)
@@ -304,7 +383,7 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, at
         status = classify_zone_status(lvl, ztype, df, last_idx, atr_val)
 
         strong.append({
-            "level": float(lvl), "strength": len(grp_prices), "age_bars": age, "status": status
+            "level": float(lvl), "strength": len(grp_pw), "age_bars": age, "status": status
         })
 
     if not strong: return pd.DataFrame(), pd.DataFrame()
@@ -341,34 +420,44 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
     if not zones_dict or not current_price: return []
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
     
-    all_zones = []
+    # ── Collecte vectorisée des zones (remplace iterrows) ──────────────────────
+    frames = []
     for tf, (sup, res) in zones_dict.items():
         for df_z, ztype in [(sup, "Support"), (res, "Resistance")]:
-            for _, z in df_z.iterrows():
-                is_piv = z.get("is_pivot", False)
-                if z.get("status") == "Consommee": continue
-                all_zones.append({
-                    "tf": tf, "level": z["level"], "strength": z["strength"],
-                    "age_bars": z.get("age_bars", 0), "status": z.get("status", "Testee"),
-                    "type": "Pivot" if is_piv else ztype, "is_pivot": is_piv
-                })
+            if df_z.empty:
+                continue
+            tmp = df_z[df_z["status"] != "Consommee"].copy()
+            if tmp.empty:
+                continue
+            tmp = tmp.assign(
+                tf=tf,
+                type=tmp["is_pivot"].map({True: "Pivot", False: ztype})
+            )
+            frames.append(tmp[["tf", "level", "strength", "age_bars", "status", "type", "is_pivot"]])
 
-    if not all_zones: return []
+    if not frames:
+        return []
+    z_df = pd.concat(frames, ignore_index=True).sort_values("level").reset_index(drop=True)
     z_df = pd.DataFrame(all_zones).sort_values("level").reset_index(drop=True)
     used = set()
     confluences = []
 
-    # OANDA Confluence threshold mapped natively or fallback 1.0%
-    threshold = {"US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, "DE30_EUR": 1.2, "XAU_USD": 1.5}.get(symbol, 1.0)
+    # Seuil de confluence issu du profil instrument — plus de dict hardcodé
+    profile = get_profile(symbol)
+    threshold = profile.confluence_threshold_pct
 
-    for i, z in z_df.iterrows():
-        if i in used or z["level"] <= 0:
-            used.add(i)
+    # itertuples : 5-10x plus rapide que iterrows (accès par attribut, pas dict)
+    for z in z_df.itertuples():
+        if z.Index in used or z.level <= 0:
+            used.add(z.Index)
             continue
             
-        similar = z_df[(np.abs(z_df["level"] - z["level"]) / z["level"] * 100 <= threshold) & (~z_df.index.isin(used))]
-        if len(similar) > 0: # Includes self
-            group_idx = [i] + similar[similar.index != i].index.tolist()
+        similar = z_df[
+            (np.abs(z_df["level"] - z.level) / z.level * 100 <= threshold) &
+            (~z_df.index.isin(used))
+        ]
+        if len(similar) > 0:  # includes self
+            group_idx = [z.Index] + similar[similar.index != z.Index].index.tolist()
             group = z_df.loc[group_idx]
             tfs = group["tf"].unique()
             
@@ -378,7 +467,12 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
                 sub_nb_tf = len(tfs)
                 sub_dist = abs(current_price - sub_avg) / current_price * 100
                 
-                score = sum(compute_structural_score(r["strength"], sub_nb_tf, r["tf"], r["age_bars"], bars_map.get(r["tf"], 500)) for _, r in group.iterrows())
+                # Score vectorisé numpy — remplace for _, r in group.iterrows()
+                _tf_w   = group["tf"].map(TF_WEIGHT).fillna(1.0).values
+                _totals = group["tf"].map(lambda t: bars_map.get(t, 500)).values.astype(float)
+                _age_r  = np.clip(group["age_bars"].values / np.maximum(_totals, 1), 0, 1)
+                _age_f  = np.exp(-1.5 * _age_r)
+                score   = round(float((group["strength"].values * _tf_w * sub_nb_tf * _age_f).sum()), 1)
                 status = max(group["status"].tolist(), key=lambda s: STATUS_PRIORITY.get(s, 1))
                 
                 is_pivot = sub_dist <= 0.50
@@ -398,7 +492,7 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
                     "Alerte": "🔥 ZONE CHAUDE" if sub_dist < 0.5 else ("⚠️ Proche" if sub_dist < 1.5 else "")
                 })
             else:
-                used.add(i)
+                used.add(z.Index)
 
     return confluences
 
@@ -842,3 +936,4 @@ if st.button("🚀 RUN INSTITUTIONAL QUANT SCAN", type="primary", use_container_
             
 if "scan_results" in st.session_state:
     _display_results(st.session_state["scan_results"], max_dist_filter)
+    
