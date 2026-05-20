@@ -2121,8 +2121,6 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
                 "max_dist":    max_dist_filter,
             }
 
-            _display_results(st.session_state["scan_results"], max_dist_filter)
-
 elif not symbols_to_scan and not st.session_state.get("scanning", False):
     st.info("Sélectionnez des actifs à scanner dans la barre latérale.")
 elif not st.session_state.get("pending_scan", False) and not st.session_state.get("scanning", False):
