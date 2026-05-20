@@ -2346,7 +2346,8 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
                 "max_dist":    max_dist_filter,
             }
 
-            _display_results(st.session_state["scan_results"], max_dist_filter)
+            # CORRECTION : Suppression de l'appel redondant à _display_results
+            # L'affichage sera effectué par le bloc final en dessous.
 
 elif not symbols_to_scan and not st.session_state.get("scanning", False):
     st.info("Sélectionnez des actifs à scanner dans la barre latérale.")
@@ -2356,9 +2357,9 @@ elif not st.session_state.get("pending_scan", False) and not st.session_state.ge
         "puis cliquez sur **LANCER LE SCAN COMPLET**."
     )
 
+# Affichage unique des résultats (exécuté après le scan ou au rechargement)
 if "scan_results" in st.session_state and not st.session_state.get("pending_scan", False):
     _display_results(
         st.session_state["scan_results"],
         max_dist_filter,
     )
-        
