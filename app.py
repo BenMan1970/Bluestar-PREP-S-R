@@ -215,24 +215,34 @@ def compute_institutional_trend(closes: pd.Series, lookback: int = 20) -> str:
     return "NEUTRE"
 
 def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: float, timeframe: str) -> Tuple[pd.Series, pd.Series]:
-    """Strictly ATR-based swing detection."""
-    prominence = atr_val * profile.pivot_prominence_atr
+    """Strictly ATR-based swing detection.
+
+    Toutes les Series partagent le même RangeIndex 0…n-1 (créées depuis .values
+    UNE SEULE FOIS). Évite le bug "Can only compare identically-labeled Series"
+    causé par pd.Series(arr[::-1]) qui brise l'alignement d'index.
+    """
+    prominence = atr_val * profile.pivot_prominence_atr if atr_val and atr_val > 0 else 0.001
     n = 3
-    highs, lows = df["high"].values, df["low"].values
-    closes, opens = df["close"].values, df["open"].values
 
-    roll_high_left = pd.Series(highs).shift(1).rolling(n, min_periods=n).max()
-    roll_high_right = pd.Series(highs[::-1]).shift(1).rolling(n, min_periods=n).max()[::-1]
-    roll_low_left = pd.Series(lows).shift(1).rolling(n, min_periods=n).min()
-    roll_low_right = pd.Series(lows[::-1]).shift(1).rolling(n, min_periods=n).min()[::-1]
+    # Series créées UNE FOIS — index 0…n-1 partagé, jamais recréé
+    highs  = pd.Series(df["high"].values)
+    lows   = pd.Series(df["low"].values)
+    closes = pd.Series(df["close"].values)
+    opens  = pd.Series(df["open"].values)
 
-    next_close = pd.Series(closes).shift(-1).fillna(pd.Series(closes))
-    candle_range = pd.Series(highs - lows).clip(lower=1e-10)
-    body_top = pd.Series(np.maximum(opens, closes))
-    body_bottom = pd.Series(np.minimum(opens, closes))
-    
-    upper_wick_pct = (pd.Series(highs) - body_top) / candle_range
-    lower_wick_pct = (body_bottom - pd.Series(lows)) / candle_range
+    # [::-1] sur une Series héritée préserve l'index — le second [::-1] remet 0…n-1
+    roll_high_left  = highs.shift(1).rolling(n, min_periods=n).max()
+    roll_high_right = highs[::-1].shift(1).rolling(n, min_periods=n).max()[::-1]
+    roll_low_left   = lows.shift(1).rolling(n, min_periods=n).min()
+    roll_low_right  = lows[::-1].shift(1).rolling(n, min_periods=n).min()[::-1]
+
+    next_close   = closes.shift(-1).fillna(closes)
+    candle_range = (highs - lows).clip(lower=1e-10)
+    body_top     = pd.Series(np.maximum(opens.values, closes.values))
+    body_bottom  = pd.Series(np.minimum(opens.values, closes.values))
+
+    upper_wick_pct = (highs - body_top)   / candle_range
+    lower_wick_pct = (body_bottom - lows) / candle_range
 
     # Seuil de mèche issu du profil instrument — zéro nombre magique
     _WICK_THRESHOLD = (
@@ -241,24 +251,26 @@ def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: f
     )
 
     sh_mask = (
-        (pd.Series(highs) > roll_high_left) & (pd.Series(highs) > roll_high_right) &
-        (next_close < pd.Series(highs)) & (upper_wick_pct >= _WICK_THRESHOLD)
+        (highs > roll_high_left) & (highs > roll_high_right) &
+        (next_close < highs) & (upper_wick_pct >= _WICK_THRESHOLD)
     )
     sl_mask = (
-        (pd.Series(lows) < roll_low_left) & (pd.Series(lows) < roll_low_right) &
-        (next_close > pd.Series(lows)) & (lower_wick_pct >= _WICK_THRESHOLD)
+        (lows < roll_low_left) & (lows < roll_low_right) &
+        (next_close > lows) & (lower_wick_pct >= _WICK_THRESHOLD)
     )
 
-    roll_low_around = pd.Series(lows).rolling(2 * n + 1, center=True, min_periods=1).min()
-    roll_high_around = pd.Series(highs).rolling(2 * n + 1, center=True, min_periods=1).max()
-    
-    sh_mask = sh_mask & ((pd.Series(highs) - roll_low_around) >= prominence)
-    sl_mask = sl_mask & ((roll_high_around - pd.Series(lows)) >= prominence)
+    roll_low_around  = lows.rolling(2 * n + 1, center=True, min_periods=1).min()
+    roll_high_around = highs.rolling(2 * n + 1, center=True, min_periods=1).max()
+    sh_mask = sh_mask & ((highs - roll_low_around)  >= prominence)
+    sl_mask = sl_mask & ((roll_high_around - lows)   >= prominence)
 
     idx_highs = sh_mask[sh_mask].index.tolist()
-    idx_lows = sl_mask[sl_mask].index.tolist()
+    idx_lows  = sl_mask[sl_mask].index.tolist()
 
-    return pd.Series(highs[idx_highs], index=idx_highs), pd.Series(lows[idx_lows], index=idx_lows)
+    return (
+        pd.Series(highs.values[idx_highs], index=idx_highs) if idx_highs else pd.Series(dtype=float),
+        pd.Series(lows.values[idx_lows],   index=idx_lows)  if idx_lows  else pd.Series(dtype=float),
+    )
 
 def agglomerative_1d_clustering(
     price_weight_pairs: List[tuple],
