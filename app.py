@@ -1,19 +1,15 @@
+"""Moteur quant + pipeline OANDA (sans Streamlit)."""
 import asyncio
+import json
+import logging
 import re
 import threading
 import time
-try:
-    import nest_asyncio
-    _NEST_ASYNCIO_AVAILABLE = True
-except ImportError:
-    _NEST_ASYNCIO_AVAILABLE = False
-import json
-import logging
-import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from io import BytesIO
-from typing import Optional, Tuple, List, Dict
+from typing import Dict, List, Optional, Tuple
 
 try:
     from zoneinfo import ZoneInfo
@@ -21,20 +17,17 @@ try:
 except ImportError:
     _NY_TZ = None
 
+_ICT_TIMEZONE_AVAILABLE = _NY_TZ is not None
+
 import aiohttp
 import numpy as np
 import pandas as pd
-import streamlit as st
-from fpdf import FPDF
 from scipy.signal import find_peaks
 
 # ==============================================================================
 # [ LAYER 0: GLOBAL CONFIG & LOGGING ]
 # ==============================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-if _NEST_ASYNCIO_AVAILABLE:
-    nest_asyncio.apply()
 
 # ==============================================================================
 # [ LAYER 0b: THREAD-SAFE DATA CACHE ]
@@ -101,7 +94,58 @@ def _cache_set(symbol: str, tf: str, df: Optional[pd.DataFrame]) -> None:
         _cache_purge_stale_locked()
 
 
-SCANNER_VERSION = "8.0-AUDITED"
+def clear_oanda_cache() -> None:
+    """Vide le cache global (tests / reset manuel)."""
+    with _CACHE_LOCK:
+        _OANDA_CACHE.clear()
+
+
+SCANNER_VERSION = "8.5-SNAPSHOT"
+# AUD-015 : rejeter les cotations live plus vieilles que ce seuil (secondes)
+_MAX_LIVE_PRICE_AGE_SEC = 30
+# AUD-021 : parallélisme CPU post-I/O (analyse par symbole)
+_SCAN_CPU_MAX_WORKERS = 8
+
+OANDA_ENV_PRACTICE = "practice"
+OANDA_ENV_LIVE = "live"
+OANDA_API_URLS: Dict[str, str] = {
+    OANDA_ENV_PRACTICE: "https://api-fxpractice.oanda.com",
+    OANDA_ENV_LIVE: "https://api-fxtrade.oanda.com",
+}
+
+
+def resolve_oanda_env(env_raw: Optional[str]) -> str:
+    """AUD-013 : environnement explicite — pas d'auto-détection practice/live."""
+    if env_raw is None or not str(env_raw).strip():
+        return OANDA_ENV_PRACTICE
+    key = str(env_raw).strip().lower()
+    if key in OANDA_API_URLS:
+        return key
+    aliases = {
+        "demo": OANDA_ENV_PRACTICE,
+        "paper": OANDA_ENV_PRACTICE,
+        "fxpractice": OANDA_ENV_PRACTICE,
+        "production": OANDA_ENV_LIVE,
+        "trade": OANDA_ENV_LIVE,
+        "fxtrade": OANDA_ENV_LIVE,
+        "real": OANDA_ENV_LIVE,
+    }
+    if key in aliases:
+        return aliases[key]
+    if key.startswith("https://"):
+        return key.rstrip("/")
+    raise ValueError(
+        f"OANDA_ENV invalide : {env_raw!r}. Valeurs : practice, live "
+        f"(ou secret URL complète https://...)"
+    )
+
+
+def oanda_base_url(env_key: str) -> str:
+    if env_key in OANDA_API_URLS:
+        return OANDA_API_URLS[env_key]
+    if env_key.startswith("https://"):
+        return env_key.rstrip("/")
+    raise ValueError(f"URL OANDA inconnue pour env={env_key!r}")
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -161,6 +205,59 @@ def get_profile(symbol: str) -> InstrumentProfile:
         return InstrumentProfile(symbol, "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
     return _DEFAULT_PROFILE
 
+
+def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
+    """FIX BUG-006 : seuils par profil + cas explicites."""
+    if current_price is None or current_price <= 0:
+        return "Prix indisponible ou non valide"
+    profile = get_profile(symbol)
+    messages = []
+    if not profile.skip_ratio_check and len(support_levels) >= 3:
+        median_sup = float(np.median(support_levels))
+        if median_sup > 0 and median_sup > 0.01 * current_price:
+            ratio = current_price / median_sup
+            if ratio > 3.0:
+                messages.append(
+                    f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
+                    f"({median_sup:.2f}) - donnees a verifier"
+                )
+    if last_candle_close and last_candle_close > 0:
+        dev = abs(current_price - last_candle_close) / last_candle_close * 100
+        if dev > profile.max_live_vs_close_pct:
+            messages.append(
+                f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
+                f"du dernier close ({last_candle_close:.2f}) — seuil profil {profile.max_live_vs_close_pct}%"
+            )
+    return " | ".join(messages) if messages else None
+
+
+def get_price_context(current_price, supports, resistances, max_dist_pct: float = 5.0):
+    if not current_price or current_price <= 0:
+        return "Prix indisponible"
+    parts = []
+    if supports is not None and not supports.empty:
+        sup_nearby = supports[
+            (supports["level"] < current_price)
+            & (abs(supports["level"] - current_price) / current_price * 100 <= max_dist_pct)
+        ]
+        if not sup_nearby.empty:
+            nearest_sup = sup_nearby.nlargest(1, "level").iloc[0]
+            dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
+            tag = "SUR support" if dist_s < 0.5 else "S proche"
+            parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
+    if resistances is not None and not resistances.empty:
+        res_nearby = resistances[
+            (resistances["level"] > current_price)
+            & (abs(resistances["level"] - current_price) / current_price * 100 <= max_dist_pct)
+        ]
+        if not res_nearby.empty:
+            nearest_res = res_nearby.nsmallest(1, "level").iloc[0]
+            dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
+            tag = "SUR resistance" if dist_r < 0.5 else "R proche"
+            parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
+    return "  |  ".join(parts) if parts else "Zone intermediaire"
+
+
 # ==============================================================================
 # [ LAYER 2: ASYNC DATA PIPELINE (OANDA) ]
 # ==============================================================================
@@ -168,40 +265,143 @@ class OandaAuthError(Exception):
     """Levée quand l'authentification OANDA échoue."""
 
 
+class OandaClientNotInitializedError(Exception):
+    """AUD-014 : client utilisé avant initialize() (env_url absent)."""
+
+
+class OandaHttpError(Exception):
+    """AUD-003 : erreur HTTP OANDA typée (status + contexte)."""
+
+    def __init__(self, status: int, context: str, symbol: str = "", tf: str = ""):
+        self.status = status
+        self.context = context
+        self.symbol = symbol
+        self.tf = tf
+        super().__init__(f"OANDA HTTP {status} [{context}] {symbol}/{tf}".strip("/"))
+
+
+class IctTimezoneError(Exception):
+    """AUD-018 : tzdata / zoneinfo requis pour les sessions ICT."""
+
+
+@dataclass(frozen=True)
+class LivePriceQuote:
+    """AUD-015 : mid marché (bids/asks) + âge de la cotation."""
+    mid: float
+    bid: float
+    ask: float
+    quote_time_utc: datetime
+    age_seconds: float
+
+
+def _parse_oanda_live_quote(price_obj: dict, *, now_utc: Optional[datetime] = None) -> Optional[LivePriceQuote]:
+    """Extrait bid/ask/mid et l'âge depuis la réponse pricing OANDA v3."""
+    if not price_obj:
+        return None
+    bids = price_obj.get("bids") or []
+    asks = price_obj.get("asks") or []
+    if bids and asks:
+        bid = float(bids[0]["price"])
+        ask = float(asks[0]["price"])
+    elif price_obj.get("closeoutBid") and price_obj.get("closeoutAsk"):
+        bid = float(price_obj["closeoutBid"])
+        ask = float(price_obj["closeoutAsk"])
+    else:
+        return None
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    time_raw = price_obj.get("time")
+    if not time_raw:
+        return None
+    quote_dt = pd.to_datetime(time_raw, utc=True).to_pydatetime()
+    if quote_dt.tzinfo is None:
+        quote_dt = quote_dt.replace(tzinfo=timezone.utc)
+    now = now_utc or datetime.now(timezone.utc)
+    age = max(0.0, (now - quote_dt).total_seconds())
+    return LivePriceQuote(
+        mid=(bid + ask) / 2.0,
+        bid=bid,
+        ask=ask,
+        quote_time_utc=quote_dt,
+        age_seconds=age,
+    )
+
+
+def require_ict_timezone() -> None:
+    """AUD-018 : pas de fallback UTC-5 (DST incorrect)."""
+    if not _ICT_TIMEZONE_AVAILABLE:
+        raise IctTimezoneError(
+            "Sessions ICT indisponibles : installez tzdata "
+            "(pip install tzdata) pour America/New_York."
+        )
+
+
+def _get_ict_session(dt_utc: datetime) -> str:
+    """AUD-018 / BUG-017 : America/New_York obligatoire (tzdata)."""
+    require_ict_timezone()
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    ny = dt_utc.astimezone(_NY_TZ)
+    h = ny.hour
+    if 18 <= h or h < 3:
+        return "ASIAN"
+    if 3 <= h < 8:
+        return "LONDON"
+    if 8 <= h < 12:
+        return "OVERLAP_LDN_NY"
+    return "NEW_YORK"
+
+
 class AsyncOandaClient:
-    def __init__(self, token: str, account_id: str):
+    def __init__(self, token: str, account_id: str, oanda_env: str = OANDA_ENV_PRACTICE):
         self.headers = {"Authorization": f"Bearer {token}"}
         self.account_id = account_id
+        self.oanda_env = resolve_oanda_env(oanda_env)
         self.env_url: Optional[str] = None
+        self.env_label: str = self.oanda_env
+        # AUD-002 : singleflight — une requête HTTP en vol par (symbol, tf)
+        self._inflight_candles: Dict[Tuple[str, str], asyncio.Task] = {}
+        self._inflight_lock: Optional[asyncio.Lock] = None
+
+    def _inflight_async_lock(self) -> asyncio.Lock:
+        if self._inflight_lock is None:
+            self._inflight_lock = asyncio.Lock()
+        return self._inflight_lock
 
     async def initialize(self, session: aiohttp.ClientSession) -> bool:
-        for url in ["https://api-fxpractice.oanda.com", "https://api-fxtrade.oanda.com"]:
-            try:
-                async with session.get(
-                    f"{url}/v3/accounts/{self.account_id}/summary",
-                    headers=self.headers,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as r:
-                    if r.status == 200:
-                        self.env_url = url
-                        return True
-            except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
-                continue
+        """AUD-013 : une seule URL configurée (practice ou live), pas de fallback silencieux."""
+        url = oanda_base_url(self.oanda_env)
+        try:
+            async with session.get(
+                f"{url}/v3/accounts/{self.account_id}/summary",
+                headers=self.headers,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as r:
+                if r.status == 200:
+                    self.env_url = url
+                    self.env_label = (
+                        OANDA_ENV_PRACTICE if OANDA_ENV_PRACTICE in url else OANDA_ENV_LIVE
+                    )
+                    return True
+                logging.error(
+                    "OANDA auth HTTP %s — env=%s url=%s", r.status, self.oanda_env, url
+                )
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+            logging.error("OANDA auth erreur réseau (%s) env=%s", exc, self.oanda_env)
         return False
 
-    async def fetch_candles(
+    async def _fetch_candles_uncached(
         self,
         session: aiohttp.ClientSession,
         sem: asyncio.Semaphore,
         symbol: str,
         tf: str,
-        limit: int = 500,
+        limit: int,
     ) -> Tuple[str, str, Optional[pd.DataFrame]]:
-        # Cache hit avec TTL relatif par TF (FIX BUG-005)
-        cached = _cache_get(symbol, tf)
-        if cached is not None:
-            logging.debug("Cache HIT: %s/%s", symbol, tf)
-            return symbol, tf, cached
+        if not self.env_url:
+            raise OandaClientNotInitializedError(
+                "fetch_candles appelé sans env_url — exécutez initialize() d'abord."
+            )
 
         gran = _GRANULARITY_MAP.get(tf)
         url = f"{self.env_url}/v3/instruments/{symbol}/candles"
@@ -216,6 +416,12 @@ class AsyncOandaClient:
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as r:
                     if r.status != 200:
+                        logging.warning(
+                            "Candles HTTP %s pour %s/%s (env=%s)",
+                            r.status, symbol, tf, self.env_label,
+                        )
+                        if r.status in (401, 403, 429):
+                            raise OandaHttpError(r.status, "candles", symbol, tf)
                         return symbol, tf, None
                     data = await r.json()
                     candles = [
@@ -231,7 +437,7 @@ class AsyncOandaClient:
                         if c.get("complete")
                     ]
                     if not candles:
-                        _cache_set(symbol, tf, None)
+                        logging.warning("Aucune bougie complete pour %s/%s", symbol, tf)
                         return symbol, tf, None
                     df = pd.DataFrame(candles).tail(limit).set_index("date")
                     result_df = df if not df.empty else None
@@ -240,12 +446,46 @@ class AsyncOandaClient:
             except (aiohttp.ClientError, OSError, asyncio.TimeoutError, KeyError, ValueError):
                 return symbol, tf, None
 
+    async def fetch_candles(
+        self,
+        session: aiohttp.ClientSession,
+        sem: asyncio.Semaphore,
+        symbol: str,
+        tf: str,
+        limit: int = 500,
+    ) -> Tuple[str, str, Optional[pd.DataFrame]]:
+        cached = _cache_get(symbol, tf)
+        if cached is not None:
+            logging.debug("Cache HIT: %s/%s", symbol, tf)
+            return symbol, tf, cached
+
+        key = (symbol, tf)
+        async with self._inflight_async_lock():
+            task = self._inflight_candles.get(key)
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._fetch_candles_uncached(session, sem, symbol, tf, limit)
+                )
+                self._inflight_candles[key] = task
+
+        try:
+            return await task
+        finally:
+            async with self._inflight_async_lock():
+                if self._inflight_candles.get(key) is task and task.done():
+                    del self._inflight_candles[key]
+
     async def fetch_price(
         self,
         session: aiohttp.ClientSession,
         sem: asyncio.Semaphore,
         symbol: str,
-    ) -> Tuple[str, Optional[float]]:
+    ) -> Tuple[str, Optional[LivePriceQuote]]:
+        """AUD-015 : mid bids/asks + horodatage ; rejet si trop vieux en aval."""
+        if not self.env_url:
+            raise OandaClientNotInitializedError(
+                "fetch_price appelé sans env_url — exécutez initialize() d'abord."
+            )
         url = f"{self.env_url}/v3/accounts/{self.account_id}/pricing"
         async with sem:
             try:
@@ -256,12 +496,14 @@ class AsyncOandaClient:
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as r:
                     if r.status != 200:
+                        if r.status in (401, 403, 429):
+                            raise OandaHttpError(r.status, "pricing", symbol)
                         return symbol, None
                     data = await r.json()
                     if "prices" in data and data["prices"]:
-                        bid = float(data["prices"][0]["closeoutBid"])
-                        ask = float(data["prices"][0]["closeoutAsk"])
-                        return symbol, (bid + ask) / 2
+                        quote = _parse_oanda_live_quote(data["prices"][0])
+                        if quote is not None:
+                            return symbol, quote
             except (aiohttp.ClientError, OSError, asyncio.TimeoutError, KeyError, ValueError):
                 pass
         return symbol, None
@@ -422,19 +664,60 @@ def agglomerative_1d_clustering(
     price_weight_pairs: List[tuple],
     bandwidth: float,
 ) -> List[List[tuple]]:
+    """AUD-007 : complete-link 1D — le nouveau point doit être à ≤ bandwidth de TOUS les membres.
+
+    Évite l'effet chaîne single-link (A proche de B, B proche de C, A loin de C).
+    """
     if not price_weight_pairs or bandwidth <= 0:
         return [[pw] for pw in price_weight_pairs] if price_weight_pairs else []
     sorted_pw = sorted(price_weight_pairs, key=lambda x: x[0])
-    clusters: List[List[tuple]] = []
-    curr_cluster = [sorted_pw[0]]
-    for i in range(1, len(sorted_pw)):
-        if sorted_pw[i][0] - sorted_pw[i - 1][0] <= bandwidth:
-            curr_cluster.append(sorted_pw[i])
+    clusters: List[List[tuple]] = [[sorted_pw[0]]]
+    for item in sorted_pw[1:]:
+        price = item[0]
+        cluster = clusters[-1]
+        if all(abs(price - member[0]) <= bandwidth for member in cluster):
+            cluster.append(item)
         else:
-            clusters.append(curr_cluster)
-            curr_cluster = [sorted_pw[i]]
-    clusters.append(curr_cluster)
+            clusters.append([item])
     return clusters
+
+
+def _level_proximity_pct(level_a: float, level_b: float) -> float:
+    if level_a <= 0 or level_b <= 0:
+        return float("inf")
+    return abs(level_a - level_b) / level_a * 100.0
+
+
+def _union_find_confluence_components(
+    levels: np.ndarray,
+    threshold_pct: float,
+) -> List[List[int]]:
+    """AUD-008 : composantes connexes par proximité % — déterministe, ordre indépendant."""
+    n = len(levels)
+    if n == 0:
+        return []
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _level_proximity_pct(float(levels[i]), float(levels[j])) <= threshold_pct:
+                union(i, j)
+
+    buckets: Dict[int, List[int]] = {}
+    for idx in range(n):
+        buckets.setdefault(find(idx), []).append(idx)
+    return [sorted(v) for v in buckets.values()]
 
 
 def classify_zone_status(
@@ -519,8 +802,9 @@ def find_strong_sr_zones(
     n_total = len(df)
 
     pivot_highs, pivot_lows = detect_swing_pivots(df, profile, atr_val, timeframe)
+    used_peaks_fallback = len(pivot_highs) + len(pivot_lows) < 3
 
-    if len(pivot_highs) + len(pivot_lows) < 3:
+    if used_peaks_fallback:
         dist = {"h4": 5, "daily": 8, "weekly": 10}.get(timeframe, 5)
         pk = {"distance": dist, "prominence": atr_val * profile.pivot_prominence_atr}
         r_idx, _ = find_peaks(df["high"].values, **pk)
@@ -606,7 +890,14 @@ def find_strong_sr_zones(
                 merged.append(z)
 
     df_zones = pd.DataFrame(merged).sort_values("level").reset_index(drop=True)
-    df_zones["is_pivot"] = (np.abs(df_zones["level"] - current_price) / current_price * 100) <= 0.50
+    # AUD-010 : is_pivot = pivot structurel swing ; near_price = proximité au prix live
+    df_zones["is_pivot"] = not used_peaks_fallback
+    if current_price and current_price > 0:
+        df_zones["near_price"] = (
+            np.abs(df_zones["level"] - current_price) / current_price * 100
+        ) <= 0.50
+    else:
+        df_zones["near_price"] = False
     return (
         df_zones[df_zones["level"] < current_price].copy(),
         df_zones[df_zones["level"] >= current_price].copy(),
@@ -620,12 +911,7 @@ def detect_confluences(
     bars_map: dict,
     confluence_threshold: Optional[float] = None,
 ) -> list:
-    """FIX BUG-009 : dédup par TF dans chaque groupe pour éviter le double-comptage.
-
-    Si find_strong_sr_zones a laissé deux zones d'un même TF dans le même
-    voisinage (cas de bord du merge), on garde uniquement la plus proche du
-    centroïde du groupe lors du calcul du score.
-    """
+    """AUD-008 + BUG-009 : union-find sur proximité %, dédup par TF dans chaque composante."""
     if not zones_dict or not current_price:
         return []
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 2, "Consommee": 3}
@@ -642,80 +928,71 @@ def detect_confluences(
                 tf=tf,
                 type=tmp["is_pivot"].map({True: "Pivot", False: ztype}),
             )
-            frames.append(tmp[["tf", "level", "strength", "age_bars", "status", "type", "is_pivot"]])
+            cols = ["tf", "level", "strength", "age_bars", "status", "type", "is_pivot"]
+            if "near_price" in tmp.columns:
+                cols.append("near_price")
+            frames.append(tmp[cols])
 
     if not frames:
         return []
     z_df = pd.concat(frames, ignore_index=True).sort_values("level").reset_index(drop=True)
-    used = set()
-    confluences = []
+    z_df = z_df[z_df["level"] > 0]
+    if z_df.empty:
+        return []
 
     profile = get_profile(symbol.replace("/", "_"))
     threshold = confluence_threshold if confluence_threshold is not None else profile.confluence_threshold_pct
 
-    for z in z_df.itertuples():
-        if z.Index in used or z.level <= 0:
-            used.add(z.Index)
-            continue
+    components = _union_find_confluence_components(z_df["level"].values, threshold)
+    confluences = []
 
-        similar = z_df[
-            (np.abs(z_df["level"] - z.level) / z.level * 100 <= threshold)
-            & (~z_df.index.isin(used))
-        ]
-        if len(similar) == 0:
-            continue
-
-        group_idx = similar.index.tolist()
-        group_full = z_df.loc[group_idx]
+    for member_idxs in components:
+        group_full = z_df.loc[member_idxs]
         tfs = group_full["tf"].unique()
+        if len(tfs) < 2:
+            continue
 
-        if len(tfs) >= 2:
-            used.update(group_full.index)
-            sub_avg = group_full["level"].mean()
+        sub_avg = float(group_full["level"].mean())
+        group_full = group_full.assign(_dist_to_center=(group_full["level"] - sub_avg).abs())
+        keep_idx = group_full.groupby("tf")["_dist_to_center"].idxmin().values
+        group = group_full.loc[keep_idx].drop(columns=["_dist_to_center"])
 
-            # FIX BUG-009 : dédup par TF — garder la zone la plus proche du centroïde
-            group_full = group_full.assign(_dist_to_center=(group_full["level"] - sub_avg).abs())
-            keep_idx = group_full.groupby("tf")["_dist_to_center"].idxmin().values
-            group = group_full.loc[keep_idx].drop(columns=["_dist_to_center"])
+        sub_nb_tf = int(group["tf"].nunique())
+        sub_dist = abs(current_price - sub_avg) / current_price * 100
 
-            sub_nb_tf = group["tf"].nunique()
-            sub_dist = abs(current_price - sub_avg) / current_price * 100
+        _tf_w = group["tf"].map(TF_WEIGHT).fillna(1.0).values
+        _totals = group["tf"].map(lambda t: bars_map.get(t, 500)).values.astype(float)
+        _age_r = np.clip(group["age_bars"].values / np.maximum(_totals, 1), 0, 1)
+        _lams = group["tf"].map(_TF_LAMBDA).fillna(1.5).values
+        _age_f = np.exp(-_lams * _age_r)
+        score = round(
+            float((group["strength"].values * _tf_w * sub_nb_tf * _age_f).sum()),
+            1,
+        )
+        status = max(group["status"].tolist(), key=lambda s: STATUS_PRIORITY.get(s, 1))
 
-            _tf_w = group["tf"].map(TF_WEIGHT).fillna(1.0).values
-            _totals = group["tf"].map(lambda t: bars_map.get(t, 500)).values.astype(float)
-            _age_r = np.clip(group["age_bars"].values / np.maximum(_totals, 1), 0, 1)
-            _lams = group["tf"].map(_TF_LAMBDA).fillna(1.5).values
-            _age_f = np.exp(-_lams * _age_r)
-            score = round(
-                float((group["strength"].values * _tf_w * sub_nb_tf * _age_f).sum()),
-                1,
-            )
-            status = max(group["status"].tolist(), key=lambda s: STATUS_PRIORITY.get(s, 1))
-
-            is_pivot = sub_dist <= 0.50
-            if is_pivot:
-                ctype, sig = "Pivot", "↔ PIVOT ZONE"
-            else:
-                n_sup = (group["level"] < current_price).sum()
-                n_res = (group["level"] >= current_price).sum()
-                ctype = "Support" if n_sup >= n_res else "Resistance"
-                sig = "🟢 BUY ZONE" if ctype == "Support" else "🔴 SELL ZONE"
-
-            confluences.append({
-                "Actif": symbol,
-                "Signal": sig,
-                "Niveau": round(sub_avg, 5),
-                "Type": ctype,
-                "Timeframes": " + ".join(sorted(tfs)),
-                "Nb TF": int(sub_nb_tf),
-                "Force Totale": int(group["strength"].sum()),
-                "Score": round(score, 1),
-                "Statut": status,
-                "Distance %": round(sub_dist, 3),
-                "Alerte": "🔥 ZONE CHAUDE" if sub_dist < 0.5 else ("⚠️ Proche" if sub_dist < 1.5 else ""),
-            })
+        has_structural = bool(group["is_pivot"].any()) if "is_pivot" in group.columns else False
+        if has_structural:
+            ctype, sig = "Pivot", "↔ PIVOT ZONE"
         else:
-            used.add(z.Index)
+            n_sup = (group["level"] < current_price).sum()
+            n_res = (group["level"] >= current_price).sum()
+            ctype = "Support" if n_sup >= n_res else "Resistance"
+            sig = "🟢 BUY ZONE" if ctype == "Support" else "🔴 SELL ZONE"
+
+        confluences.append({
+            "Actif": symbol,
+            "Signal": sig,
+            "Niveau": round(sub_avg, 5),
+            "Type": ctype,
+            "Timeframes": " + ".join(sorted(tfs)),
+            "Nb TF": sub_nb_tf,
+            "Force Totale": int(group["strength"].sum()),
+            "Score": score,
+            "Statut": status,
+            "Distance %": round(sub_dist, 3),
+            "Alerte": "🔥 ZONE CHAUDE" if sub_dist < 0.5 else ("⚠️ Proche" if sub_dist < 1.5 else ""),
+        })
 
     return confluences
 
@@ -735,6 +1012,140 @@ class ScanResult:
     price_context: str = ""
     missing_tfs: List[str] = field(default_factory=list)  # FIX BUG-004
     price_is_fallback: bool = False  # FIX cohérence prix live vs close
+    snapshot_at: Optional[float] = None  # AUD-004 : epoch UTC post-bougies + re-fetch prix
+    price_quote_age_sec: Optional[float] = None  # AUD-015
+    price_is_stale: bool = False  # AUD-015 : cotation live rejetée (âge > seuil)
+
+
+def _resolve_symbol_price(
+    sym_data: Dict[str, Optional[pd.DataFrame]],
+    quote: Optional[LivePriceQuote],
+) -> Tuple[Optional[float], bool, bool, Optional[float], Optional[str]]:
+    """Retourne (cp, fallback, stale, age_sec, message_anomalie_partiel)."""
+    age = quote.age_seconds if quote else None
+    if quote is not None and quote.age_seconds <= _MAX_LIVE_PRICE_AGE_SEC:
+        return quote.mid, False, False, age, None
+
+    stale = quote is not None and quote.age_seconds > _MAX_LIVE_PRICE_AGE_SEC
+    partial = None
+    if stale:
+        partial = (
+            f"Prix live expire ({quote.age_seconds:.0f}s > {_MAX_LIVE_PRICE_AGE_SEC}s)"
+        )
+
+    for tf_k in ("daily", "h4", "weekly"):
+        df = sym_data.get(tf_k)
+        if df is not None and not df.empty:
+            close_px = float(df["close"].iloc[-1])
+            fb_msg = partial or "Prix live indisponible"
+            return close_px, True, stale, age, fb_msg
+
+    return None, True, stale, age, partial or "Prix indisponible ou non valide"
+
+
+def _analyze_symbol(
+    sym: str,
+    sym_data: Dict[str, Optional[pd.DataFrame]],
+    quote: Optional[LivePriceQuote],
+    snapshot_at: float,
+    min_touches_ui: int,
+) -> ScanResult:
+    """AUD-021 : moteur quant synchrone par symbole (offload ThreadPool)."""
+    try:
+        profile = get_profile(sym)
+        cp, price_is_fallback, price_is_stale, quote_age, price_msg = _resolve_symbol_price(
+            sym_data, quote
+        )
+        sym_d = sym.replace("_", "/")
+
+        rows = {"H4": None, "Daily": None, "Weekly": None}
+        zones_d: Dict[str, tuple] = {}
+        trends: Dict[str, str] = {}
+        bars_map: Dict[str, int] = {}
+        price_ctx = ""
+        missing_tfs: List[str] = []
+
+        for tf_k, tf_name in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
+            df = sym_data.get(tf_k)
+            if df is None or df.empty:
+                missing_tfs.append(tf_name)
+                continue
+
+            if not cp:
+                cp = float(df["close"].iloc[-1])
+                price_is_fallback = True
+
+            bars_map[tf_name] = len(df)
+            _lb, _th = {
+                "H4": (30, 2.0),
+                "Daily": (20, 2.0),
+                "Weekly": (10, 2.0),
+            }.get(tf_name, (20, 2.0))
+            trends[tf_name] = compute_institutional_trend(df["close"], lookback=_lb, threshold=_th)
+            atr_val = compute_atr(df)
+
+            if atr_val is None:
+                logging.warning("ATR non calculable pour %s/%s — zones ignorées.", sym, tf_name)
+                continue
+
+            min_t = max(3, min_touches_ui) if tf_k == "h4" else max(2, min_touches_ui)
+            sup, res = find_strong_sr_zones(df, cp, sym, atr_val, tf_k, min_t)
+            zones_d[tf_name] = (sup, res)
+
+            if tf_k == "daily":
+                price_ctx = get_price_context(cp, sup, res)
+
+            tf_r = (
+                [_make_row(z, "PIVOT" if z.get("is_pivot") else "Support", cp, atr_val, sym_d, tf_name, len(df), profile)
+                 for _, z in sup.iterrows()]
+                + [_make_row(z, "PIVOT" if z.get("is_pivot") else "Resistance", cp, atr_val, sym_d, tf_name, len(df), profile)
+                   for _, z in res.iterrows()]
+            )
+
+            seen = set()
+            uniq = []
+            for r in tf_r:
+                key = (r["Niveau"], r["Type"])
+                if key not in seen:
+                    seen.add(key)
+                    uniq.append(r)
+            if uniq:
+                rows[tf_name] = uniq
+
+        _sup_levels: List[float] = []
+        for _tf_n, (_s, _r) in zones_d.items():
+            if _s is not None and not _s.empty and "level" in _s.columns:
+                _sup_levels.extend(_s["level"].tolist())
+        _daily_df = sym_data.get("daily")
+        _last_close = (
+            float(_daily_df["close"].iloc[-1])
+            if (_daily_df is not None and not _daily_df.empty)
+            else None
+        )
+        _anomaly = flag_data_anomaly(sym, cp, _sup_levels, last_candle_close=_last_close)
+
+        if price_is_fallback and cp is not None:
+            pf_msg = f"Prix live indisponible — utilisation du dernier close ({cp:.5f})"
+            _anomaly = f"{_anomaly} | {pf_msg}" if _anomaly else pf_msg
+        elif price_msg:
+            extra = (
+                f"{price_msg} — fallback close ({cp:.5f})"
+                if price_is_fallback and cp
+                else price_msg
+            )
+            _anomaly = f"{_anomaly} | {extra}" if _anomaly else extra
+
+        return ScanResult(
+            sym, rows, zones_d, cp, trends, bars_map,
+            price_context=price_ctx, anomaly=_anomaly,
+            missing_tfs=missing_tfs, price_is_fallback=price_is_fallback,
+            snapshot_at=snapshot_at,
+            price_quote_age_sec=quote_age,
+            price_is_stale=price_is_stale,
+        )
+    except Exception as e:
+        logging.exception("Scan error for %s", sym)
+        return ScanResult(sym, {}, {}, None, {}, {}, scan_error=f"{type(e).__name__}: {e}")
 
 
 def _make_row(z: dict, ztype: str, cp: float, atr_val: float, sym_d: str,
@@ -764,1204 +1175,60 @@ async def run_institutional_scan(
     token: str,
     account_id: str,
     min_touches_ui: int,
-) -> List[ScanResult]:
-    client = AsyncOandaClient(token, account_id)
+    oanda_env: str = OANDA_ENV_PRACTICE,
+    scan_run_id: Optional[str] = None,
+) -> Tuple[List[ScanResult], Dict[str, str]]:
+    client = AsyncOandaClient(token, account_id, oanda_env=oanda_env)
     async with aiohttp.ClientSession() as session:
         if not await client.initialize(session):
-            raise OandaAuthError("Impossible de s'authentifier sur OANDA. Vérifiez vos secrets API.")
+            raise OandaAuthError(
+                f"Authentification OANDA échouée (env={client.oanda_env}). "
+                "Vérifiez OANDA_ACCESS_TOKEN, OANDA_ACCOUNT_ID et OANDA_ENV (practice|live)."
+            )
 
         sem = asyncio.Semaphore(15)
 
-        price_tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
-        prices_res = await asyncio.gather(*price_tasks)
-        live_prices = {sym: p for sym, p in prices_res}
-
+        # AUD-004 : bougies d'abord, puis prix live (évite cp vieilli vs analyse)
         candle_tasks = []
         for sym in symbols:
-            for tf in _GRANULARITY_MAP.keys():
+            for tf in _GRANULARITY_MAP:
                 candle_tasks.append(client.fetch_candles(session, sem, sym, tf))
         candles_res = await asyncio.gather(*candle_tasks)
         data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]] = {}
         for sym, tf, df in candles_res:
             data_cube.setdefault(sym, {})[tf] = df
 
-    results: List[ScanResult] = []
-    for sym in symbols:
-        try:
-            profile = get_profile(sym)
-            cp_live = live_prices.get(sym)
-            cp = cp_live
-            price_is_fallback = False
-            sym_d = sym.replace("_", "/")
-
-            rows = {"H4": None, "Daily": None, "Weekly": None}
-            zones_d: Dict[str, tuple] = {}
-            trends: Dict[str, str] = {}
-            bars_map: Dict[str, int] = {}
-            price_ctx = ""
-            missing_tfs: List[str] = []
-
-            for tf_k, tf_name in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
-                df = data_cube.get(sym, {}).get(tf_k)
-                if df is None or df.empty:
-                    missing_tfs.append(tf_name)
-                    continue
-
-                # FIX BUG-004 partiel : on signale le fallback prix live → close
-                if not cp:
-                    cp = float(df["close"].iloc[-1])
-                    price_is_fallback = True
-
-                bars_map[tf_name] = len(df)
-                # FIX BUG-010 : seuils t-stat recalibrés (|t| > 2.0 ≈ 95% conf.)
-                _lb, _th = {
-                    "H4": (30, 2.0),
-                    "Daily": (20, 2.0),
-                    "Weekly": (10, 2.0),
-                }.get(tf_name, (20, 2.0))
-                trends[tf_name] = compute_institutional_trend(df["close"], lookback=_lb, threshold=_th)
-                atr_val = compute_atr(df)
-
-                if atr_val is None:
-                    logging.warning("ATR non calculable pour %s/%s — zones ignorées.", sym, tf_name)
-                    continue
-
-                min_t = max(3, min_touches_ui) if tf_k == "h4" else max(2, min_touches_ui)
-                sup, res = find_strong_sr_zones(df, cp, sym, atr_val, tf_k, min_t)
-                zones_d[tf_name] = (sup, res)
-
-                if tf_k == "daily":
-                    parts = []
-                    if not sup.empty:
-                        s_near = sup[(sup["level"] < cp) & (abs(sup["level"] - cp) / cp * 100 <= 5.0)]
-                        if not s_near.empty:
-                            n_s = s_near.nlargest(1, "level").iloc[0]
-                            d_s = abs(cp - n_s["level"]) / cp * 100
-                            parts.append(f"{'SUR support' if d_s < 0.5 else 'S proche'}: {n_s['level']:.5f} (-{d_s:.2f}%)")
-                    if not res.empty:
-                        r_near = res[(res["level"] > cp) & (abs(res["level"] - cp) / cp * 100 <= 5.0)]
-                        if not r_near.empty:
-                            n_r = r_near.nsmallest(1, "level").iloc[0]
-                            d_r = abs(cp - n_r["level"]) / cp * 100
-                            parts.append(f"{'SUR resistance' if d_r < 0.5 else 'R proche'}: {n_r['level']:.5f} (+{d_r:.2f}%)")
-                    price_ctx = "  |  ".join(parts) if parts else "Zone intermediaire"
-
-                tf_r = (
-                    [_make_row(z, "PIVOT" if z.get("is_pivot") else "Support", cp, atr_val, sym_d, tf_name, len(df), profile)
-                     for _, z in sup.iterrows()]
-                    + [_make_row(z, "PIVOT" if z.get("is_pivot") else "Resistance", cp, atr_val, sym_d, tf_name, len(df), profile)
-                       for _, z in res.iterrows()]
-                )
-
-                seen = set()
-                uniq = []
-                for r in tf_r:
-                    key = (r["Niveau"], r["Type"])
-                    if key not in seen:
-                        seen.add(key)
-                        uniq.append(r)
-                if uniq:
-                    rows[tf_name] = uniq
-
-            _sup_levels: List[float] = []
-            for _tf_n, (_s, _r) in zones_d.items():
-                if _s is not None and not _s.empty and "level" in _s.columns:
-                    _sup_levels.extend(_s["level"].tolist())
-            _daily_df = data_cube.get(sym, {}).get("daily")
-            _last_close = (
-                float(_daily_df["close"].iloc[-1]) if (_daily_df is not None and not _daily_df.empty) else None
-            )
-            _anomaly = flag_data_anomaly(sym, cp, _sup_levels, last_candle_close=_last_close)
-
-            # FIX BUG-006 : signaler aussi le fallback price live → last close
-            if price_is_fallback and cp is not None:
-                pf_msg = f"Prix live indisponible — utilisation du dernier close ({cp:.5f})"
-                _anomaly = f"{_anomaly} | {pf_msg}" if _anomaly else pf_msg
-
-            results.append(ScanResult(
-                sym, rows, zones_d, cp, trends, bars_map,
-                price_context=price_ctx, anomaly=_anomaly,
-                missing_tfs=missing_tfs, price_is_fallback=price_is_fallback,
-            ))
-        except Exception as e:
-            logging.exception("Scan error for %s", sym)
-            results.append(ScanResult(sym, {}, {}, None, {}, {}, scan_error=f"{type(e).__name__}: {e}"))
-
-    return results
-
-# ==============================================================================
-# [ LAYER 5: EXPORTERS & UTILS ]
-# ==============================================================================
-_ACCENT_MAP = str.maketrans('àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ', 'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN')
-_EMOJI_MAP = [('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔️', '[PIVOT]'), ('↔', '[PIVOT]'),
-              ('⚠️', '[PROCHE]'), ('⚠', '[PROCHE]'), ('📈', ''), ('📉', ''), ('✅', '[OK]'),
-              ('❌', '[X]'), ('⚡', '[!]'), ('📡', ''), ('📅', ''), ('↩️', '[RR]'),
-              ('↑', '[HAUSSE]'), ('↓', '[BAISSE]'), ('→', '[NEUTRE]')]
-
-
-def _safe_pdf_str(text: str) -> str:
-    text = str(text).translate(_ACCENT_MAP)
-    for e, r in _EMOJI_MAP:
-        text = text.replace(e, r)
-    return text
-
-
-def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
-    """FIX SEC-001 : sanitization stricte par regex de chaque secret entier."""
-    if not tb:
-        return tb
-    for val in sensitive_values:
-        if not val or not isinstance(val, str) or len(val) < 4:
-            continue
-        # Replace exact occurrences (escape special chars)
-        pattern = re.escape(val)
-        tb = re.sub(pattern, "***REDACTED***", tb)
-    return tb
-
-
-_INTERNAL_COLS = ["_dist_num", "_in_pdf"]
-
-
-def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    return df.drop(columns=_INTERNAL_COLS, errors="ignore")
-
-
-def _sym_display(sym: str) -> str:
-    return sym.replace("_", "/")
-
-
-def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
-    """FIX BUG-006 : seuils par profil + cas explicites."""
-    if current_price is None or current_price <= 0:
-        return "Prix indisponible ou non valide"
-    profile = get_profile(symbol)
-    messages = []
-    if not profile.skip_ratio_check and len(support_levels) >= 3:
-        median_sup = float(np.median(support_levels))
-        if median_sup > 0 and median_sup > 0.01 * current_price:
-            ratio = current_price / median_sup
-            if ratio > 3.0:
-                messages.append(
-                    f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
-                    f"({median_sup:.2f}) - donnees a verifier"
-                )
-    if last_candle_close and last_candle_close > 0:
-        dev = abs(current_price - last_candle_close) / last_candle_close * 100
-        if dev > profile.max_live_vs_close_pct:
-            messages.append(
-                f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
-                f"du dernier close ({last_candle_close:.2f}) — seuil profil {profile.max_live_vs_close_pct}%"
-            )
-    return " | ".join(messages) if messages else None
-
-
-def get_price_context(current_price, supports, resistances, max_dist_pct: float = 5.0):
-    if not current_price or current_price <= 0:
-        return "Prix indisponible"
-    parts = []
-    if supports is not None and not supports.empty:
-        sup_nearby = supports[
-            (supports["level"] < current_price)
-            & (abs(supports["level"] - current_price) / current_price * 100 <= max_dist_pct)
-        ]
-        if not sup_nearby.empty:
-            nearest_sup = sup_nearby.nlargest(1, "level").iloc[0]
-            dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
-            tag = "SUR support" if dist_s < 0.5 else "S proche"
-            parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
-    if resistances is not None and not resistances.empty:
-        res_nearby = resistances[
-            (resistances["level"] > current_price)
-            & (abs(resistances["level"] - current_price) / current_price * 100 <= max_dist_pct)
-        ]
-        if not res_nearby.empty:
-            nearest_res = res_nearby.nsmallest(1, "level").iloc[0]
-            dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
-            tag = "SUR resistance" if dist_r < 0.5 else "R proche"
-            parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
-    return "  |  ".join(parts) if parts else "Zone intermediaire"
-
-
-def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> dict:
-    result: dict = {"nearest_support": None, "nearest_resistance": None}
-    if not ctx_str or ctx_str == "Zone intermediaire" or not current_price:
-        return result
-    pat = re.compile(r"(SUR support|S proche|SUR resistance|R proche):\s*([\d.]+)\s*\(([+-][\d.]+)%\)")
-    for m in pat.finditer(ctx_str):
-        tag, level_str, dist_str = m.group(1), m.group(2), m.group(3)
-        try:
-            lvl = float(level_str)
-            dist = float(dist_str)
-        except ValueError:
-            continue
-        entry = {"level": lvl, "distance_pct": dist, "on_level": abs(dist) < 0.5}
-        if tag in ("SUR support", "S proche"):
-            result["nearest_support"] = entry
-        else:
-            result["nearest_resistance"] = entry
-    return result
-
-
-def strip_emojis_df(df):
-    clean = df.copy()
-    for col in clean.select_dtypes(include='object').columns:
-        clean[col] = clean[col].astype(str).apply(_safe_pdf_str)
-    return clean
-
-
-class PDF(FPDF):
-    def header(self):
-        self.set_font('Helvetica', 'B', 15)
-        self.cell(0, 10,
-                  _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'),
-                  border=0, align='C', new_x='LMARGIN', new_y='NEXT')
-        self.set_font('Helvetica', '', 8)
-        self.cell(0, 6,
-                  _safe_pdf_str(
-                      f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
-                      f"v{SCANNER_VERSION}  |  "
-                      "Score = (Force x Poids_TF x NbTF) x Facteur_Age | "
-                      "Statut Vierge / Testee / Role Reverse / Consommee"
-                  ),
-                  border=0, align='C', new_x='LMARGIN', new_y='NEXT')
-        self.ln(4)
-
-    def footer(self):
-        self.set_y(-15)
-        self.set_font('Helvetica', 'I', 8)
-        self.cell(0, 10, f'Page {self.page_no()}', border=0, align='C')
-
-    def chapter_title(self, title):
-        self.set_font('Helvetica', 'B', 12)
-        self.cell(0, 10, _safe_pdf_str(title), border=0, align='L', new_x='LMARGIN', new_y='NEXT')
-        self.ln(4)
-
-    def chapter_anomalies(self, anomalies: dict):
-        if not anomalies:
-            return
-        self.set_font('Helvetica', 'B', 10)
-        self.cell(0, 7, _safe_pdf_str('ALERTES ANOMALIES PRIX'),
-                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')
-        self.ln(2)
-        self.set_font('Helvetica', '', 8)
-        for sym, msg in anomalies.items():
-            line = _safe_pdf_str(f"[!] {sym} : {msg}")
-            self.multi_cell(0, 5, line[:180])
-        self.ln(4)
-
-    def chapter_summary(self, summaries):
-        self.set_font('Helvetica', 'B', 10)
-        self.cell(0, 7,
-                  _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'),
-                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')
-        self.ln(2)
-        for s in summaries:
-            sym = _safe_pdf_str(s.get('symbol', ''))
-            t_h4 = _safe_pdf_str(s.get('trend_h4', 'N/A'))
-            t_d = _safe_pdf_str(s.get('trend_daily', 'N/A'))
-            t_w = _safe_pdf_str(s.get('trend_weekly', 'N/A'))
-            ctx = _safe_pdf_str(s.get('price_context', ''))
-            self.set_font('Helvetica', 'B', 8)
-            self.cell(0, 5,
-                      _safe_pdf_str(f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}"),
-                      border=0, new_x='LMARGIN', new_y='NEXT')
-            if ctx:
-                self.set_font('Helvetica', 'I', 7)
-                self.cell(0, 4, f"  Position : {ctx[:120]}", border=0, new_x='LMARGIN', new_y='NEXT')
-            top = s.get('top_zones', [])
-            self.set_font('Helvetica', '', 7)
-            if top:
-                for z in top:
-                    sig = str(z.get('Signal', ''))
-                    niv = str(z.get('Niveau', ''))
-                    dist = str(z.get('Distance %', ''))
-                    sc = str(z.get('Score', ''))
-                    tfs = str(z.get('Timeframes', ''))
-                    ale = str(z.get('Alerte', ''))
-                    txt = _safe_pdf_str(
-                        f"  {sig}  Niv:{niv}  Dist:{dist}  Score:{sc}  TF:{tfs}  {ale}"
-                    )
-                    self.cell(0, 4, txt[:130], border=0, new_x='LMARGIN', new_y='NEXT')
-            else:
-                self.cell(0, 4, "  Aucune confluence pour cet actif.",
-                          border=0, new_x='LMARGIN', new_y='NEXT')
-            self.ln(1)
-
-    def chapter_body(self, df):
-        if df.empty:
-            self.set_font('Helvetica', '', 10)
-            self.set_x(self.l_margin)
-            usable_w = self.w - self.l_margin - self.r_margin
-            self.multi_cell(usable_w, 10, "Aucune donnee a afficher.")
-            self.ln()
-            return
-        if 'Timeframes' in df.columns:
-            col_widths = {
-                'Actif': 20, 'Signal': 26, 'Niveau': 22, 'Type': 22,
-                'Timeframes': 50, 'Nb TF': 12, 'Force Totale': 20,
-                'Score': 18, 'Statut': 22, 'Distance %': 18, 'Alerte': 55,
-            }
-        else:
-            col_widths = {
-                'Actif': 24, 'Prix Actuel': 24, 'Type': 20,
-                'Niveau': 24, 'Force': 20,
-                'Score (1TF)': 18, 'Statut': 22, 'Dist. %': 16, 'Dist. ATR': 16,
-            }
-        font_size = 7
-        cols = [c for c in col_widths if c in df.columns]
-        total_w = sum(col_widths[c] for c in cols)
-        usable_w = self.w - self.l_margin - self.r_margin
-        x_start = self.l_margin + max(0, (usable_w - total_w) / 2)
-
-        self.set_font('Helvetica', 'B', font_size)
-        self.set_x(x_start)
-        for col_name in cols:
-            self.cell(col_widths[col_name], 6, _safe_pdf_str(col_name),
-                      border=1, align='C', new_x='RIGHT', new_y='TOP')
-        self.ln()
-
-        self.set_font('Helvetica', '', font_size)
-        for _, row in df.iterrows():
-            self.set_x(x_start)
-            for col_name in cols:
-                w = col_widths[col_name]
-                val = _safe_pdf_str(str(row[col_name]))
-                max_chars = int(w / 1.25)
-                if len(val) > max_chars:
-                    val = val[:max_chars - 1] + '.'
-                self.cell(w, 5, val, border=1, align='C', new_x='RIGHT', new_y='TOP')
-            self.ln()
-
-
-def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
-    """FIX BUG-013 : utilise pdf_max_dist_pct par profil via la colonne Actif."""
-    if df.empty:
-        return df
-    if "_in_pdf" in df.columns:
-        return _clean_df(df[df["_in_pdf"]].copy()).reset_index(drop=True)
-    # Fallback : seuil par symbole
-    if "Actif" in df.columns and "_dist_num" in df.columns:
-        def _threshold_for(actif: str) -> float:
-            return get_profile(actif.replace("/", "_")).pdf_max_dist_pct
-        thresholds = df["Actif"].apply(_threshold_for)
-        mask = df["_dist_num"] <= thresholds
-        return _clean_df(df[mask].copy()).reset_index(drop=True)
-    if "Dist. %" in df.columns:
-        def _to_f(s):
-            try:
-                return float(str(s).replace("%", ""))
-            except (ValueError, TypeError):
-                return 999.0
-        df = df[df["Dist. %"].apply(_to_f) <= 8.0].copy()
-    return _clean_df(df).reset_index(drop=True)
-
-
-def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomalies=None):
-    summaries = summaries or []
-    anomalies = anomalies or {}
-    pdf = PDF('L', 'mm', 'A4')
-    pdf.set_margins(5, 10, 5)
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    if anomalies:
-        pdf.chapter_anomalies(anomalies)
-    if summaries:
-        pdf.chapter_summary(summaries)
-        pdf.add_page()
-    if confluences_df is not None and not confluences_df.empty:
-        pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
-        clean_conf = strip_emojis_df(_clean_df(confluences_df.copy()))
-        if "Score" in clean_conf.columns:
-            clean_conf = clean_conf.sort_values("Score", ascending=False)
-        pdf.chapter_body(clean_conf)
-        pdf.ln(10)
-    title_map = {
-        'H4': 'Analyse 4 Heures (H4)',
-        'Daily': 'Analyse Journaliere (Daily)',
-        'Weekly': 'Analyse Hebdomadaire (Weekly)',
-    }
-    for tf_key, df in results_dict.items():
-        if df is None or (hasattr(df, 'empty') and df.empty):
-            continue
-        pdf.chapter_title(title_map.get(tf_key, tf_key))
-        clean_df = strip_emojis_df(_clean_df(df.copy()))
-        if "Score (1TF)" in clean_df.columns:
-            clean_df = clean_df.sort_values("Score (1TF)", ascending=False)
-        pdf.chapter_body(clean_df)
-        pdf.ln(10)
-    return bytes(pdf.output())
-
-
-def create_csv_report(results_dict, confluences_df=None):
-    all_dfs = []
-    if confluences_df is not None and not confluences_df.empty:
-        c = _clean_df(confluences_df).copy()
-        c["Section"] = "CONFLUENCES"
-        all_dfs.append(c)
-    for tf, df in results_dict.items():
-        if df is not None and not df.empty:
-            d = _clean_df(df).copy()
-            d["Timeframe"] = tf
-            d["Section"] = "TF_ROWS"
-            all_dfs.append(d)
-    if not all_dfs:
-        return b""
-    buf = BytesIO()
-    pd.concat(all_dfs, ignore_index=True).to_csv(buf, index=False, encoding="utf-8-sig")
-    return buf.getvalue()
-
-
-def create_llm_brief(summaries, confluences_df,
-                     max_dist=2.0, min_score=100.0,
-                     allowed_statuts=("Vierge", "Testee", "Role Reverse")):
-    TREND_ARROW = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
-    STATUS_LABEL = {"Vierge": "V", "Testee": "T", "Role Reverse": "RR", "Consommee": "C"}
-    ALERT_LABEL = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠"}
-    now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    lines = [
-        "# BRIEF S/R — Scanner Bluestar",
-        f"_Généré le {now}_",
-        "",
-        "## INSTRUCTIONS POUR LLM",
-        "Ce brief contient les zones Support/Résistance les plus fiables détectées",
-        "par un scanner multi-timeframes (H4 + Daily + Weekly) sur 33 actifs Forex/Indices/Métaux.",
-        "",
-        "**Légende :**",
-        "- `BUY` / `SELL` : direction de la zone",
-        "- `Sc` : Score pondéré (Force × Poids_TF × NbTF × Facteur_Age). >300=institutionnel, 100-300=fort",
-        "- `V` = Vierge | `T` = Testée | `RR` = Role Reverse (zone cassée retestée) | `C` = Consommée (éviter)",
-        "- `Dist%` : distance du prix actuel à la zone",
-        "- `TFs` : timeframes en confluence (H4/D/W)",
-        "- `⚡` = zone chaude (<0.5% du prix) | `⚠` = proche (<1.5%)",
-        "",
-        f"**Filtres actifs** : Dist < {max_dist}% | Score ≥ {min_score} | Statuts : {', '.join(allowed_statuts)}",
-        "",
-        "---",
-        "",
-    ]
-    if confluences_df is None or confluences_df.empty:
-        lines.append("_Aucune confluence disponible._")
-        return "\n".join(lines).encode("utf-8")
-
-    actif_zones: Dict[str, list] = {}
-    for _, row in confluences_df.iterrows():
-        try:
-            dist_val = float(str(row.get("Distance %", "999")).replace("%", ""))
-        except (ValueError, TypeError, AttributeError):
-            dist_val = 999.0
-        try:
-            score_val = float(row.get("Score", 0))
-        except (TypeError, ValueError):
-            score_val = 0.0
-        statut = str(row.get("Statut", ""))
-        if dist_val > max_dist or score_val < min_score or statut not in allowed_statuts:
-            continue
-        actif = str(row.get("Actif", ""))
-        actif_zones.setdefault(actif, []).append({
-            "signal": str(row.get("Signal", "")),
-            "niveau": str(row.get("Niveau", "")),
-            "score": score_val,
-            "statut": statut,
-            "dist": dist_val,
-            "tfs": str(row.get("Timeframes", "")),
-            "nb_tf": int(row.get("Nb TF", 0)),
-            "alerte": str(row.get("Alerte", "")),
-        })
-
-    actif_max_score = {actif: max(z["score"] for z in zones) for actif, zones in actif_zones.items()}
-    sorted_actifs = sorted(actif_max_score, key=lambda a: actif_max_score[a], reverse=True)
-    summary_map = {s["symbol"]: s for s in summaries}
-
-    total_zones = 0
-    for actif in sorted_actifs:
-        zones = sorted(actif_zones[actif], key=lambda z: z["score"], reverse=True)
-        s = summary_map.get(actif, {})
-        t_h4 = TREND_ARROW.get(s.get("trend_h4", "NEUTRE"), "→")
-        t_d = TREND_ARROW.get(s.get("trend_daily", "NEUTRE"), "→")
-        t_w = TREND_ARROW.get(s.get("trend_weekly", "NEUTRE"), "→")
-        ctx = s.get("price_context", "")
-        lines.append(f"### {actif} | H4:{t_h4} D:{t_d} W:{t_w}")
-        if ctx:
-            lines.append(f"> {ctx}")
-        for z in zones:
-            sig = z["signal"]
-            if "PIVOT" in sig:
-                signal_short = "PIVOT"
-            elif "BUY" in sig:
-                signal_short = "BUY  "
-            elif "SELL" in sig:
-                signal_short = "SELL "
-            else:
-                signal_short = "ZONE "
-            st_short = STATUS_LABEL.get(z["statut"], z["statut"])
-            al_short = ALERT_LABEL.get(z["alerte"], "")
-            tf_short = z["tfs"].replace("Daily", "D").replace("Weekly", "W").replace(" + ", "+")
-            line = (
-                f"- {signal_short} `{z['niveau']}` | "
-                f"Sc:{z['score']:.0f} | {st_short} | "
-                f"{z['dist']:.2f}% | {tf_short} {al_short}"
-            )
-            lines.append(line)
-            total_zones += 1
-        lines.append("")
-
-    lines += [
-        "---",
-        f"_Total zones retenues : {total_zones} sur {len(sorted_actifs)} actifs_",
-        "",
-        "## PROMPT SUGGÉRÉ POUR LLM",
-        "```",
-        "Tu es un analyste technique expert en trading Forex/Indices.",
-        "Voici un brief S/R multi-timeframes généré automatiquement.",
-        "Pour chaque actif pertinent :",
-        "1. Identifie les setups les plus immédiats (zones chaudes en priorité)",
-        "2. Vérifie la cohérence tendance vs direction de zone (ex: BUY en tendance haussière)",
-        "3. Priorise les zones Vierge (V) sur 3 TF avec Score > 200",
-        "4. Les zones Role Reverse (RR) = pullback sur niveau cassé, setup souvent court terme",
-        "5. Propose un plan de trade structuré : entrée, SL (au-delà de la zone), TP (prochain niveau)",
-        "```",
-    ]
-    return "\n".join(lines).encode("utf-8")
-
-
-def _get_ict_session(dt_utc: datetime) -> str:
-    """FIX BUG-017 : timezone-aware. Conversion UTC → America/New_York."""
-    if _NY_TZ is not None:
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        ny = dt_utc.astimezone(_NY_TZ)
-        h = ny.hour
-    else:
-        # Fallback : approximation UTC-5 (sans DST)
-        h = (dt_utc.hour - 5) % 24
-    if 18 <= h or h < 3:
-        return "ASIAN"
-    if 3 <= h < 8:
-        return "LONDON"
-    if 8 <= h < 12:
-        return "OVERLAP_LDN_NY"
-    return "NEW_YORK"
-
-
-def create_json_export(summaries, confluences_df,
-                       max_dist=5.0, min_score=60.0,
-                       allowed_statuts=("Vierge", "Testee", "Role Reverse")):
-    now_utc = datetime.now(timezone.utc)
-    output = {
-        "generated_at": now_utc.isoformat(),
-        "scanner_version": SCANNER_VERSION,
-        "session": _get_ict_session(now_utc),  # FIX BUG-017
-        "filters": {"max_dist_pct": max_dist, "min_score": min_score,
-                    "allowed_statuts": list(allowed_statuts)},
-        "assets": [],
-    }
-    summary_map = {s["symbol"]: s for s in summaries}
-
-    def _normalize_signal(raw: str) -> str:
-        r = raw.replace("🟢", "").replace("🔴", "").replace("↔️", "").replace("↔", "")
-        r = r.replace("ZONE", "").strip()
-        if "PIVOT" in r:
-            return "PIVOT"
-        if "BUY" in r:
-            return "BUY"
-        if "SELL" in r:
-            return "SELL"
-        return r.strip()
-
-    def _normalize_alert(raw: str) -> str:
-        r = raw.replace("🔥", "").replace("⚠️", "").replace("⚠", "").strip()
-        if "CHAUD" in r.upper() or "HOT" in r.upper():
-            return "HOT"
-        if "PROCHE" in r.upper() or "CLOSE" in r.upper():
-            return "CLOSE"
-        return ""
-
-    def _parse_timeframes(tf_str: str) -> list:
-        _order = {"Weekly": 0, "Daily": 1, "H4": 2}
-        parts = [p.strip() for p in tf_str.replace("+", ",").split(",") if p.strip()]
-        return sorted(parts, key=lambda t: _order.get(t, 99))
-
-    actif_groups: dict = {}
-    if confluences_df is not None and not confluences_df.empty:
-        for _, row in confluences_df.iterrows():
-            try:
-                dist_val = float(str(row.get("Distance %", 999)).replace("%", ""))
-            except (ValueError, TypeError, AttributeError):
-                dist_val = 999.0
-            try:
-                score_val = float(row.get("Score", 0))
-                if not pd.notna(score_val):
-                    score_val = 0.0
-            except (TypeError, ValueError):
-                score_val = 0.0
-            if dist_val > max_dist or score_val < min_score:
-                continue
-            signal_norm = _normalize_signal(str(row.get("Signal", "")))
-            if signal_norm not in ("BUY", "SELL", "PIVOT"):
-                continue
-            statut = str(row.get("Statut", ""))
-            if statut not in allowed_statuts:
-                continue
-            actif = str(row.get("Actif", ""))
-            try:
-                level_float = round(float(row.get("Niveau", "")), 5)
-            except (TypeError, ValueError):
-                continue
-            tf_str = str(row.get("Timeframes", ""))
-            tfs_parsed = _parse_timeframes(tf_str)
-            actif_groups.setdefault(actif, []).append({
-                "signal": signal_norm,
-                "type": str(row.get("Type", "")),
-                "level": level_float,
-                "score": round(score_val, 1),
-                "status": statut,
-                "distance_pct": round(dist_val, 3),
-                "alert": _normalize_alert(str(row.get("Alerte", ""))),
-                "timeframes": tfs_parsed,
-                "nb_tf": int(row.get("Nb TF", len(tfs_parsed))),
-            })
-
-    all_actifs = set(summary_map.keys()) | set(actif_groups.keys())
-    sorted_actifs = sorted(
-        all_actifs,
-        key=lambda a: max((z["score"] for z in actif_groups.get(a, [])), default=0.0),
-        reverse=True,
-    )
-
-    def _trend_alignment(h4: str, daily: str, weekly: str) -> tuple:
-        bias_map = {"HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL"}
-        b_h4 = bias_map.get(h4, "NEUTRAL")
-        b_d = bias_map.get(daily, "NEUTRAL")
-        b_w = bias_map.get(weekly, "NEUTRAL")
-        if b_d == b_w and b_d != "NEUTRAL":
-            dominant = b_d
-        elif b_d == "NEUTRAL" and b_w != "NEUTRAL":
-            dominant = b_w
-        elif b_w == "NEUTRAL" and b_d != "NEUTRAL":
-            dominant = b_d
-        else:
-            dominant = "NEUTRAL"
-        if dominant != "NEUTRAL":
-            if b_h4 == dominant:
-                alignment = "ALIGNED"
-            elif b_h4 == "NEUTRAL":
-                alignment = "PULLBACK"
-            else:
-                alignment = "CONFLICTED"
-        elif b_h4 != "NEUTRAL":
-            alignment = "BUILDING"
-        else:
-            alignment = "MIXED"
-        return alignment, dominant
-
-    for actif in sorted_actifs:
-        s = summary_map.get(actif, {})
-        zones = sorted(actif_groups.get(actif, []), key=lambda z: z["score"], reverse=True)
-        cp_val = s.get("current_price")
-        ctx_str = s.get("price_context", "")
-        t_h4 = s.get("trend_h4", "NEUTRE")
-        t_d = s.get("trend_daily", "NEUTRE")
-        t_w = s.get("trend_weekly", "NEUTRE")
-        alignment, dominant = _trend_alignment(t_h4, t_d, t_w)
-        obstacles = _parse_price_context_obstacles(ctx_str, cp_val or 0)
-        output["assets"].append({
-            "symbol": actif,
-            "current_price": round(cp_val, 5) if cp_val else None,
-            "price_is_fallback": bool(s.get("price_is_fallback", False)),
-            "missing_timeframes": list(s.get("missing_tfs", [])),
-            "trends": {"h4": t_h4, "daily": t_d, "weekly": t_w},
-            "trend_alignment": alignment,
-            "dominant_bias": dominant,
-            "price_context": ctx_str,
-            "nearest_support": obstacles["nearest_support"],
-            "nearest_resistance": obstacles["nearest_resistance"],
-            "nb_zones": len(zones),
-            "zones": zones,
-        })
-    return json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
-
-
-def _display_results(sr: dict, max_dist_filter: float):
-    df_h4 = sr.get("df_h4", pd.DataFrame())
-    df_daily = sr.get("df_daily", pd.DataFrame())
-    df_wk = sr.get("df_weekly", pd.DataFrame())
-    conf_full = sr.get("conf_full", pd.DataFrame())
-    rep_dict = sr.get("report_dict", {})
-    summaries = sr.get("summaries", [])
-    anomalies = sr.get("anomalies", {})
-    errors = sr.get("scan_errors", {})
-    missing_tfs_map = sr.get("missing_tfs_map", {})
-
-    if not conf_full.empty:
-        tmp = _clean_df(conf_full).copy()
-        tmp["_dist_num"] = pd.to_numeric(
-            tmp["Distance %"].astype(str).str.replace("%", "", regex=False),
-            errors="coerce",
-        ).fillna(999.0)
-        conf_filt = (tmp[tmp["_dist_num"] <= max_dist_filter]
-                     .drop(columns=["_dist_num"], errors="ignore")
-                     .reset_index(drop=True))
-    else:
-        conf_filt = pd.DataFrame()
-
-    tf_cfg = {
-        "Actif": st.column_config.TextColumn("Actif", width="small"),
-        "Prix Actuel": st.column_config.TextColumn("Prix Actuel", width="small"),
-        "Type": st.column_config.TextColumn("Type", width="small"),
-        "Niveau": st.column_config.TextColumn("Niveau", width="small"),
-        "Force": st.column_config.TextColumn("Force", width="medium"),
-        "Score (1TF)": st.column_config.NumberColumn("Score (1TF) ▼", width="small"),
-        "Statut": st.column_config.TextColumn("Statut", width="small"),
-        "Dist. %": st.column_config.TextColumn("Dist. %", width="small"),
-        "Dist. ATR": st.column_config.TextColumn("Dist. ATR", width="small"),
-    }
-
-    if errors:
-        with st.expander(f"❌ {len(errors)} actif(s) en erreur — cliquer pour voir"):
-            for sym, err in errors.items():
-                st.error(f"**{sym}** : {err}")
-
-    if anomalies:
-        with st.expander(f"⚠️ {len(anomalies)} anomalie(s) de prix — cliquer pour voir"):
-            for sym, msg in anomalies.items():
-                st.warning(f"**{sym}** : {msg}")
-
-    # FIX BUG-004 : alerter sur TFs manquants
-    if missing_tfs_map:
-        with st.expander(f"📡 {len(missing_tfs_map)} actif(s) avec TFs manquants — cliquer pour voir"):
-            for sym, tfs in missing_tfs_map.items():
-                st.info(f"**{sym}** : TFs absents → {', '.join(tfs)}")
-
-    if not conf_filt.empty:
-        st.divider()
-        st.subheader("🔥 ZONES DE CONFLUENCE MULTI-TIMEFRAMES")
-        st.caption(
-            "Score confluence = Force × Nb TF × Poids_TF × Facteur_Age  |  "
-            "Score (1TF) dans les tableaux ci-dessous = mono-timeframe brut"
-        )
-        disp = conf_filt.sort_values("Score", ascending=False).reset_index(drop=True)
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Total zones", len(disp))
-        c2.metric("🔥 Zones chaudes", len(disp[disp["Alerte"] == "🔥 ZONE CHAUDE"]))
-        c3.metric("⚠️ Zones proches", len(disp[disp["Alerte"] == "⚠️ Proche"]))
-        c4.metric("🟢 BUY Zones", len(disp[disp["Signal"] == "🟢 BUY ZONE"]))
-        c5.metric("🔴 SELL Zones", len(disp[disp["Signal"] == "🔴 SELL ZONE"]))
-        c6.metric("↔ PIVOT Zones", len(disp[disp["Signal"] == "↔ PIVOT ZONE"]))
-        conf_cfg = {
-            **{k: st.column_config.TextColumn(k, width="small")
-               for k in ["Actif", "Signal", "Niveau", "Type",
-                         "Timeframes", "Statut", "Distance %", "Alerte"]},
-            "Nb TF": st.column_config.NumberColumn("Nb TF", width="small"),
-            "Force Totale": st.column_config.NumberColumn("Force Totale", width="small"),
-            "Score": st.column_config.NumberColumn("Score ▼", width="small"),
+        snapshot_at = time.time()
+        price_tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
+        prices_res = await asyncio.gather(*price_tasks)
+        live_quotes: Dict[str, Optional[LivePriceQuote]] = dict(prices_res)
+
+    # AUD-021 : analyse CPU parallèle par symbole (post-I/O)
+    workers = min(_SCAN_CPU_MAX_WORKERS, max(1, len(symbols)))
+    result_by_sym: Dict[str, ScanResult] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                _analyze_symbol,
+                sym,
+                data_cube.get(sym, {}),
+                live_quotes.get(sym),
+                snapshot_at,
+                min_touches_ui,
+            ): sym
+            for sym in symbols
         }
-        st.dataframe(disp, column_config=conf_cfg, hide_index=True,
-                     width='stretch', height=min(len(disp) * 35 + 38, 750))
-    else:
-        st.info("Aucune confluence dans la plage sélectionnée. Augmentez le filtre ou le seuil.")
+        for fut in as_completed(futures):
+            res = fut.result()
+            result_by_sym[res.symbol] = res
 
-    st.subheader("📋 Exportation du Rapport")
-    with st.expander("Cliquez ici pour télécharger les résultats"):
-        col1, col2 = st.columns(2)
-        with col1:
-            pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
-            st.download_button(
-                "📄 Rapport PDF (complet)", data=pdf_bytes,
-                file_name=f"rapport_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf", width='stretch',
-            )
-        with col2:
-            csv_bytes = create_csv_report(rep_dict, conf_full)
-            st.download_button(
-                "📊 Données brutes CSV", data=csv_bytes,
-                file_name=f"donnees_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv", width='stretch',
-            )
+    results = [result_by_sym[sym] for sym in symbols if sym in result_by_sym]
 
-        st.divider()
-        st.markdown("**🤖 Exports optimisés LLM**")
-        st.caption("Paramètres LLM configurables dans la barre latérale (section 3).")
-        llm_max_dist = st.session_state.get("llm_max_dist", 2.0)
-        llm_min_score = st.session_state.get("llm_min_score", 100)
-        llm_statuts_raw = st.session_state.get("llm_statuts", ["Vierge", "Testee", "Role Reverse"])
-        llm_statuts = tuple(llm_statuts_raw) if llm_statuts_raw else ("Vierge", "Testee", "Role Reverse")
-        st.caption(
-            f"🔧 Filtres actifs : Dist < **{llm_max_dist}%** | "
-            f"Score ≥ **{llm_min_score}** | {', '.join(llm_statuts)}"
-        )
-        col3, col4 = st.columns(2)
-        with col3:
-            md_bytes = create_llm_brief(
-                summaries, conf_full,
-                max_dist=llm_max_dist, min_score=llm_min_score,
-                allowed_statuts=llm_statuts,
-            )
-            st.download_button(
-                "🤖 Brief LLM (Markdown filtré)", data=md_bytes,
-                file_name=f"brief_llm_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
-                mime="text/markdown", width='stretch',
-            )
-        with col4:
-            json_bytes = create_json_export(
-                summaries, conf_full,
-                max_dist=llm_max_dist, min_score=float(llm_min_score),
-                allowed_statuts=tuple(llm_statuts),
-            )
-            st.download_button(
-                "🔧 Export JSON structuré", data=json_bytes,
-                file_name=f"sr_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-                mime="application/json", width='stretch',
-            )
-
-        st.divider()
-        st.markdown("**👁️ Aperçu du Brief LLM**")
-        st.caption(f"Filtres : Dist < {llm_max_dist}% | Score ≥ {llm_min_score} | {', '.join(llm_statuts)}")
-        try:
-            brief_preview = md_bytes.decode("utf-8")
-            n_zones = sum(1 for line in brief_preview.split("\n")
-                          if line.strip().startswith("- BUY")
-                          or line.strip().startswith("- SELL")
-                          or line.strip().startswith("- PIVOT"))
-            n_actifs = brief_preview.count("### ")
-            st.info(
-                f"**{n_actifs} actifs** avec **{n_zones} zones** dans le brief LLM "
-                f"(≈ {n_zones * 15 + n_actifs * 10:,} tokens estimés)"
-            )
-            st.text_area("Brief LLM (copiable directement)", value=brief_preview,
-                         height=400, label_visibility="collapsed")
-        except (UnicodeDecodeError, AttributeError, TypeError):
-            st.warning("Aperçu non disponible.")
-
-    def _filter_and_sort(df, max_pct):
-        if df.empty or "Dist. %" not in df.columns:
-            return df
-        def to_float(s):
-            try:
-                return float(str(s).replace("%", ""))
-            except (ValueError, TypeError):
-                return 999.0
-        mask = df["Dist. %"].apply(to_float) <= max_pct
-        out = _clean_df(df[mask])
-        sort_col = "Score (1TF)" if "Score (1TF)" in out.columns else "Score"
-        if sort_col in out.columns:
-            out = out.sort_values(sort_col, ascending=False)
-        return out.reset_index(drop=True)
-
-    st.divider()
-    st.subheader("📅 Analyse 4 Heures (H4)")
-    fd = _filter_and_sort(df_h4, max_dist_filter)
-    st.dataframe(fd, column_config=tf_cfg, hide_index=True,
-                 width='stretch', height=min(len(fd) * 35 + 38, 600))
-
-    st.subheader("📅 Analyse Journalière (Daily)")
-    fd = _filter_and_sort(df_daily, max_dist_filter)
-    st.dataframe(fd, column_config=tf_cfg, hide_index=True,
-                 width='stretch', height=min(len(fd) * 35 + 38, 600))
-
-    st.subheader("📅 Analyse Hebdomadaire (Weekly)")
-    fd = _filter_and_sort(df_wk, max_dist_filter)
-    st.dataframe(fd, column_config=tf_cfg, hide_index=True,
-                 width='stretch', height=min(len(fd) * 35 + 38, 600))
-
-
-# ==============================================================================
-# CONSTANTES UI (préservation visuelle stricte)
-# ==============================================================================
-CONFLUENCE_THRESHOLD_MAP = {
-    "US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, "DE30_EUR": 1.2,
-    "XAU_USD": 1.5,
-}
-
-st.set_page_config(page_title="Scanner Bluestar S/R", page_icon="📡", layout="wide")
-
-st.markdown("""
-    <style>
-    [data-testid="stDataFrame"] > div { overflow-x: visible !important; overflow-y: visible !important; }
-    [data-testid="stDataFrame"] iframe { width: 100% !important; height: auto !important; }
-    ::-webkit-scrollbar { width: 0px !important; height: 0px !important; }
-    div[data-testid="stButton"] > button[kind="primary"] {
-        background-color: #D32F2F;
-        color: white;
-        border: 1px solid #B71C1C;
-        transition: all 0.2s;
+    scan_meta = {
+        "scan_run_id": scan_run_id or uuid.uuid4().hex,
+        "oanda_env": client.oanda_env,
+        "oanda_env_url": client.env_url or "",
+        "oanda_env_label": client.env_label,
+        "cpu_workers": str(workers),
     }
-    div[data-testid="stButton"] > button[kind="primary"]:hover {
-        background-color: #B71C1C;
-        border-color: #D32F2F;
-        box-shadow: 0 4px 12px rgba(211, 47, 47, 0.4);
-    }
-    div[data-testid="stButton"] > button[kind="primary"]:active {
-        background-color: #D32F2F;
-        transform: scale(0.98);
-    }
-    div[data-testid="stButton"] > button { font-weight: 600; }
-    </style>
-""", unsafe_allow_html=True)
-
-st.title("📡 Scanner Bluestar Supports et Résistances")
-st.markdown(
-    "Zones S/R avec **swing HH/LL confirmé**, **score pondéré TF+âge**, "
-    "**statut Vierge/Testée/Consommée/Role Reverse**, **plage prix valides**."
-)
-st.markdown("<br>", unsafe_allow_html=True)
-
-scan_button = st.button(
-    "🚀 LANCER LE SCAN COMPLET",
-    type="primary",
-    use_container_width=True,
-    disabled=st.session_state.get("scanning", False),
-)
-
-# ══════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.header("1. Connexion OANDA")
-    try:
-        access_token = st.secrets["OANDA_ACCESS_TOKEN"]
-        account_id = st.secrets["OANDA_ACCOUNT_ID"]
-        if not access_token or not str(access_token).strip():
-            raise ValueError("OANDA_ACCESS_TOKEN est vide")
-        if not account_id or not str(account_id).strip():
-            raise ValueError("OANDA_ACCOUNT_ID est vide")
-        st.success("Secrets chargés ✓")
-    except (KeyError, ValueError) as e:
-        access_token, account_id = None, None
-        st.error(f"Secrets OANDA invalides : {e}")
-    except (FileNotFoundError, AttributeError) as e:
-        access_token, account_id = None, None
-        st.error(f"Erreur lecture secrets : {type(e).__name__}")
-
-    st.header("2. Sélection des Actifs")
-    select_all = st.checkbox(f"Scanner tous les actifs ({len(ALL_SYMBOLS)})", value=True)
-    if select_all:
-        symbols_to_scan = ALL_SYMBOLS
-    else:
-        default_sel = ["XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY",
-                       "AUD_USD", "EUR_JPY", "GBP_JPY"]
-        symbols_to_scan = st.multiselect(
-            "Actifs spécifiques :", options=ALL_SYMBOLS, default=default_sel,
-        )
-
-    st.header("3. Paramètres Export LLM")
-    st.caption("Ces paramètres survivent aux re-renders contrairement aux sliders dans l'expander.")
-    llm_max_dist_sidebar = st.slider("Dist. max (%) brief LLM", 0.5, 5.0, 2.0, 0.5, key="llm_max_dist")
-    llm_min_score_sidebar = st.slider("Score min JSON/LLM", 40, 300, 60, 10, key="llm_min_score")
-    llm_statuts_sidebar = st.multiselect(
-        "Statuts autorisés (brief LLM)",
-        options=["Vierge", "Testee", "Role Reverse", "Consommee"],
-        default=["Vierge", "Testee", "Role Reverse"],
-        key="llm_statuts",
-    )
-
-    st.divider()
-    st.header("4. Paramètres de Détection")
-    min_touches = st.slider("Force minimale H4 (touches)", 2, 10, 3, 1)
-    st.caption("H4 utilise ce seuil | Daily/Weekly utilisent max(2, valeur)")
-    confluence_threshold = st.slider("Seuil confluence Forex (%)", 0.3, 2.0, 1.0, 0.1)
-    _overridden = [s.replace("_USD", "").replace("_EUR", "") for s in CONFLUENCE_THRESHOLD_MAP]
-    st.caption(
-        f"⚠️ Seuil ignoré pour : {', '.join(_overridden)} "
-        f"(valeurs fixes : {list(CONFLUENCE_THRESHOLD_MAP.values())})"
-    )
-    max_dist_filter = st.slider(
-        "Afficher zones < (%) - filtre visuel uniquement", 1.0, 15.0, 3.0, 0.5,
-    )
-
-    st.divider()
-    st.caption("**Score confluence = (Force × Poids_TF × NbTF) × Facteur_Age**")
-    st.caption("🔴 > 300 : Zone institutionnelle majeure")
-    st.caption("🟠 100-300 : Zone structurelle forte")
-    st.caption("🟡 30-100 : Zone technique valide")
-    st.caption("⚪ < 30  : Zone secondaire")
-
-    st.divider()
-    st.caption("**Statuts :**")
-    st.caption("✅ Vierge = jamais testée (la plus fiable)")
-    st.caption("🔵 Testée = respectée, toujours valide")
-    st.caption("↩️ Role Reverse = niveau cassé retesté")
-    st.caption("❌ Consommée = cassée sans retour")
-
-    st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Corrections audit forensique (18 bugs + 4 correctifs AUD)**")
-    st.caption("✅ BUG-001 — Asymétrie swing detection (fenêtre droite corrigée)")
-    st.caption("✅ BUG-002 — fillna supprimé : pivots fantômes sur dernière bougie éliminés")
-    st.caption("✅ BUG-003 — ATR fallback scale-aware (plus de 0.001 magique)")
-    st.caption("✅ BUG-004 — TFs manquants signalés à l'utilisateur")
-    st.caption("✅ BUG-005 — Cache TTL relatif par TF (60s/300s/600s)")
-    st.caption("✅ BUG-006 — Anomalies prix : seuils par profil instrument")
-    st.caption("✅ BUG-007 — Classification statut directionnelle")
-    st.caption("✅ BUG-009 — Dédup par TF dans confluences (fin double-comptage)")
-    st.caption("✅ BUG-010 — Trend : t-stat sur résidus de régression")
-    st.caption("✅ BUG-011 — threading.Lock immune aux event loops Streamlit")
-    st.caption("✅ BUG-013 — pdf_max_dist_pct par profil")
-    st.caption("✅ BUG-014 — _make_row extrait en fonction pure")
-    st.caption("✅ BUG-016 — Condition redondante next_close supprimée")
-    st.caption("✅ BUG-017 — Sessions ICT timezone-aware (NY)")
-    st.caption("✅ CONC-001 — Cache borné + purge à la lecture")
-    st.caption("✅ SEC-001 — Sanitization regex stricte")
-    st.caption("✅ AUD-001 — Cache : copie défensive (df.copy) — fin corruption multi-scan")
-    st.caption("✅ AUD-003 — Cache négatif supprimé : None jamais stocké, retry possible")
-    st.caption("✅ AUD-005/006 — Type zone structurel (majorité highs/lows), indices directs sans re-lookup flottant")
-    st.caption("✅ AUD-009 — Hiérarchie statuts corrigée : Vierge < Testee < Role Reverse < Consommee")
-
-
-# ==============================================================================
-# LOGIQUE PRINCIPALE
-# ==============================================================================
-if scan_button and symbols_to_scan and not st.session_state.get("scanning", False):
-    st.session_state.pop("scan_results", None)
-    st.session_state["scanning"] = True
-    st.session_state["pending_scan"] = True
-    st.rerun()
-
-if st.session_state.get("pending_scan", False) and symbols_to_scan:
-    st.session_state.pop("pending_scan", None)
-
-    if not access_token or not account_id:
-        st.session_state["scanning"] = False
-        st.warning("Configurez vos secrets OANDA avant de lancer le scan.")
-    else:
-        progress_bar = st.progress(0, text="Initialisation du scan async…")
-        results_h4, results_daily, results_weekly = [], [], []
-        all_zones_map = {}
-        prices_map = {}
-        trends_map = {}
-        anomalies_map = {}
-        scan_errors = {}
-        bars_map_global = {}
-        missing_tfs_map: Dict[str, List[str]] = {}
-        price_fallback_map: Dict[str, bool] = {}
-
-        try:
-            with st.spinner("Pipeline async I/O en cours…"):
-                raw_results = asyncio.run(
-                    run_institutional_scan(symbols_to_scan, access_token, account_id, min_touches)
-                )
-
-            total = len(raw_results)
-            for idx, result in enumerate(raw_results):
-                sym_label = result.symbol.replace("_", "/")
-                progress_bar.progress(
-                    (idx + 1) / max(total, 1),
-                    text=f"Post-traitement… ({idx + 1}/{total}) {sym_label}",
-                )
-                if result.scan_error:
-                    scan_errors[_sym_display(result.symbol)] = result.scan_error
-                    continue
-                all_zones_map[result.symbol] = result.zones
-                prices_map[result.symbol] = result.price
-                trends_map[result.symbol] = result.trends
-                bars_map_global[result.symbol] = result.bars_map
-                price_fallback_map[result.symbol] = result.price_is_fallback
-                if result.anomaly:
-                    anomalies_map[_sym_display(result.symbol)] = result.anomaly
-                if result.missing_tfs:
-                    missing_tfs_map[_sym_display(result.symbol)] = result.missing_tfs
-                for tf_cap, tf_rows in result.rows.items():
-                    if tf_rows:
-                        if tf_cap == "H4":
-                            results_h4.extend(tf_rows)
-                        elif tf_cap == "Daily":
-                            results_daily.extend(tf_rows)
-                        elif tf_cap == "Weekly":
-                            results_weekly.extend(tf_rows)
-
-        except OandaAuthError as e:
-            st.error(str(e))
-            st.session_state["scanning"] = False
-            st.stop()
-        except Exception as e:
-            tb = traceback.format_exc()
-            tb = _sanitize_traceback(tb, [access_token, account_id])
-            logging.exception("Scan failure")
-            st.error(f"Erreur inattendue : {type(e).__name__} — {tb[-400:]}")
-            st.session_state["scanning"] = False
-            st.stop()
-
-        progress_bar.empty()
-        st.session_state["scanning"] = False
-
-        n_ok = len(symbols_to_scan) - len(scan_errors)
-        n_fail = len(scan_errors)
-        if n_fail == 0:
-            st.success(f"✅ Scan terminé — {n_ok} actifs analysés avec succès.")
-        else:
-            st.warning(f"⚠️ Scan terminé — {n_ok} actifs OK, {n_fail} en erreur.")
-        if anomalies_map:
-            st.warning(f"⚠️ {len(anomalies_map)} anomalie(s) de prix détectée(s).")
-        if missing_tfs_map:
-            st.info(f"📡 {len(missing_tfs_map)} actif(s) avec des TFs manquants.")
-
-        st.info("🔍 Analyse des confluences multi-timeframes…")
-        all_confluences = []
-        for sym in symbols_to_scan:
-            if _sym_display(sym) in scan_errors:
-                continue
-            cp = prices_map.get(sym)
-            zones_clean = {
-                k: v for k, v in all_zones_map.get(sym, {}).items()
-                if not k.startswith("_")
-            }
-            sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, confluence_threshold)
-            confs = detect_confluences(
-                _sym_display(sym), zones_clean, cp,
-                bars_map_global.get(sym, {}),
-                confluence_threshold=sym_threshold,
-            )
-            all_confluences.extend(confs)
-
-        conf_full = pd.DataFrame(all_confluences)
-        if not conf_full.empty:
-            conf_full = _clean_df(conf_full)
-
-        summaries = []
-        for sym in symbols_to_scan:
-            sym_d = _sym_display(sym)
-            trends = trends_map.get(sym, {})
-            cp = prices_map.get(sym)
-            top_zones = []
-            if not conf_full.empty and "Actif" in conf_full.columns and sym_d in conf_full["Actif"].values:
-                ac = conf_full[conf_full["Actif"] == sym_d].copy()
-                top_zones = ac.sort_values("Score", ascending=False).head(3).to_dict("records")
-            price_ctx = ""
-            d_zones = all_zones_map.get(sym, {})
-            if "Daily" in d_zones and cp:
-                sup_d, res_d = d_zones["Daily"]
-                price_ctx = get_price_context(cp, sup_d, res_d)
-            summaries.append({
-                "symbol": sym_d,
-                "trend_h4": trends.get("H4", "NEUTRE"),
-                "trend_daily": trends.get("Daily", "NEUTRE"),
-                "trend_weekly": trends.get("Weekly", "NEUTRE"),
-                "price_context": price_ctx,
-                "top_zones": top_zones,
-                "current_price": cp,
-                "missing_tfs": missing_tfs_map.get(sym_d, []),
-                "price_is_fallback": price_fallback_map.get(sym, False),
-            })
-
-        df_h4 = pd.DataFrame(results_h4)
-        df_daily = pd.DataFrame(results_daily)
-        df_wk = pd.DataFrame(results_weekly)
-        rep_dict = {
-            "H4": _apply_pdf_filter(df_h4),
-            "Daily": _apply_pdf_filter(df_daily),
-            "Weekly": _apply_pdf_filter(df_wk),
-        }
-
-        st.session_state["scan_results"] = {
-            "df_h4": df_h4, "df_daily": df_daily, "df_weekly": df_wk,
-            "conf_full": conf_full, "report_dict": rep_dict,
-            "summaries": summaries, "anomalies": anomalies_map,
-            "scan_errors": scan_errors, "max_dist": max_dist_filter,
-            "missing_tfs_map": missing_tfs_map,
-        }
-
-elif not symbols_to_scan and not st.session_state.get("scanning", False):
-    st.info("Sélectionnez des actifs à scanner dans la barre latérale.")
-elif not st.session_state.get("pending_scan", False) and not st.session_state.get("scanning", False):
-    st.info("Configurez les paramètres dans la barre latérale, puis cliquez sur **LANCER LE SCAN COMPLET**.")
-
-if "scan_results" in st.session_state and not st.session_state.get("pending_scan", False):
-    _display_results(st.session_state["scan_results"], max_dist_filter)
+    return results, scan_meta
