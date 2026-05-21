@@ -88,16 +88,20 @@ def _cache_get(symbol: str, tf: str) -> Optional[pd.DataFrame]:
         if not _cache_is_fresh(fetched_at, tf):
             del _OANDA_CACHE[(symbol, tf)]
             return None
-        return df
+        # AUD-001 : copie défensive — toute mutation aval ne corrompt pas le cache global
+        return df.copy(deep=True) if df is not None else None
 
 
 def _cache_set(symbol: str, tf: str, df: Optional[pd.DataFrame]) -> None:
+    # AUD-003 : ne pas cacher None — évite le cache négatif qui bloque les retries
+    if df is None:
+        return
     with _CACHE_LOCK:
         _OANDA_CACHE[(symbol, tf)] = (time.time(), df)
         _cache_purge_stale_locked()
 
 
-SCANNER_VERSION = "7.9-AUDITED"
+SCANNER_VERSION = "8.0-AUDITED"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -533,34 +537,41 @@ def find_strong_sr_zones(
         )
 
     all_pivots = (
-        [(float(p), int(i), (int(i) + 1e-6) / n_total) for i, p in pivot_highs.items()]
-        + [(float(p), int(i), (int(i) + 1e-6) / n_total) for i, p in pivot_lows.items()]
+        [(float(p), int(i), (int(i) + 1e-6) / n_total, "high") for i, p in pivot_highs.items()]
+        + [(float(p), int(i), (int(i) + 1e-6) / n_total, "low") for i, p in pivot_lows.items()]
     )
     if not all_pivots:
         return pd.DataFrame(), pd.DataFrame()
 
     bandwidth = atr_val * profile.cluster_radius_atr
-    price_weight_pairs = [(p, w) for p, _, w in all_pivots]
+    # AUD-006 : on transmet (price, weight, idx, ptype) — agglomerative_1d_clustering n'accède
+    # qu'à x[0] pour la comparaison, les champs supplémentaires sont passés sans modification.
+    price_weight_pairs = [(p, w, idx, pt) for p, idx, w, pt in all_pivots]
     clusters_raw = agglomerative_1d_clustering(price_weight_pairs, bandwidth)
 
     strong = []
-    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
+    # AUD-009 : Role Reverse > Testee (priorité métier), Consommee en dernier
+    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 2, "Consommee": 3}
 
     for grp_pw in clusters_raw:
         if len(grp_pw) < min_touches:
             continue
-        grp_prices_arr = np.array([p for p, _ in grp_pw])
-        grp_weights_arr = np.array([w for _, w in grp_pw])
+        # AUD-006 : indices extraits directement depuis le cluster — plus de re-lookup flottant
+        grp_prices_arr = np.array([item[0] for item in grp_pw])
+        grp_weights_arr = np.array([item[1] for item in grp_pw])
+        grp_indices = [item[2] for item in grp_pw]
+        grp_ptypes = [item[3] for item in grp_pw]
         if grp_weights_arr.sum() <= 0:
             continue
         lvl = float(np.average(grp_prices_arr, weights=grp_weights_arr))
         if lvl <= 0:
             continue
-        grp_price_set = set(grp_prices_arr.tolist())
-        grp_indices = [idx for p, idx, _ in all_pivots if p in grp_price_set]
         last_idx = max(grp_indices)
         age = max(0, n_total - 1 - last_idx)
-        ztype = "Support" if lvl < current_price else "Resistance"
+        # AUD-005 : type structurel par majorité pivot highs/lows, indépendant du prix live
+        n_highs = grp_ptypes.count("high")
+        n_lows = grp_ptypes.count("low")
+        ztype = "Resistance" if n_highs >= n_lows else "Support"
         status = classify_zone_status(lvl, ztype, df, last_idx, atr_val)
         strong.append({
             "level": float(lvl), "strength": len(grp_pw),
@@ -617,7 +628,7 @@ def detect_confluences(
     """
     if not zones_dict or not current_price:
         return []
-    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
+    STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 2, "Consommee": 3}
 
     frames = []
     for tf, (sup, res) in zones_dict.items():
@@ -1772,7 +1783,7 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Corrections audit forensique (18 bugs)**")
+    st.caption(f"**v{SCANNER_VERSION} — Corrections audit forensique (18 bugs + 4 correctifs AUD)**")
     st.caption("✅ BUG-001 — Asymétrie swing detection (fenêtre droite corrigée)")
     st.caption("✅ BUG-002 — fillna supprimé : pivots fantômes sur dernière bougie éliminés")
     st.caption("✅ BUG-003 — ATR fallback scale-aware (plus de 0.001 magique)")
@@ -1789,6 +1800,10 @@ with st.sidebar:
     st.caption("✅ BUG-017 — Sessions ICT timezone-aware (NY)")
     st.caption("✅ CONC-001 — Cache borné + purge à la lecture")
     st.caption("✅ SEC-001 — Sanitization regex stricte")
+    st.caption("✅ AUD-001 — Cache : copie défensive (df.copy) — fin corruption multi-scan")
+    st.caption("✅ AUD-003 — Cache négatif supprimé : None jamais stocké, retry possible")
+    st.caption("✅ AUD-005/006 — Type zone structurel (majorité highs/lows), indices directs sans re-lookup flottant")
+    st.caption("✅ AUD-009 — Hiérarchie statuts corrigée : Vierge < Testee < Role Reverse < Consommee")
 
 
 # ==============================================================================
