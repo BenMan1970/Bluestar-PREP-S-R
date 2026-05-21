@@ -1785,4 +1785,4 @@ if "scan_results" in st.session_state and not st.session_state.get("pending_scan
         st.session_state["scan_results"],
         max_dist_filter,
     )
-  
+
