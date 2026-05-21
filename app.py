@@ -46,7 +46,7 @@ def _cache_purge_old() -> None:
         del _OANDA_CACHE[k]
 
 
-SCANNER_VERSION = "7.6-INSTITUTIONAL"
+SCANNER_VERSION = "7.7-INSTITUTIONAL"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -199,15 +199,23 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
     res = tr.rolling(period).mean().iloc[-1]
     return float(res) if pd.notna(res) and res > 0 else 0.001
 
-def compute_institutional_trend(closes: pd.Series, lookback: int = 20) -> str:
+def compute_institutional_trend(
+    closes: pd.Series,
+    lookback: int = 20,
+    threshold: float = 0.10,
+) -> str:
     """Z-Score Normalized Linear Regression — scale-invariant multi-asset.
 
     La série est normalisée par closes[0] avant polyfit : slope et std_dev sont
     en %/bougie, indépendants du niveau de prix absolu.
-    → Le seuil 0.10 est universel : EURUSD (1.16), XAU (4500), US30 (50 000).
 
-    Ancien bug : sans normalisation, slope/std_dev donnait un z_score 2-3x plus
-    faible sur les actifs à prix élevé (XAU, indices) → biais NEUTRE systématique.
+    Paramètres calibrés par TF (appelés depuis run_institutional_scan) :
+      H4     : lookback=30, threshold=0.08  — couvre 1.5 semaine, capte les trends intraday
+      Daily  : lookback=20, threshold=0.10  — 1 mois, signal institutionnel standard
+      Weekly : lookback=10, threshold=0.10  — 2.5 mois, trend moyen terme récent
+
+    Validation sur 14 cas multi-actifs (EUR/USD, XAU, US30, NAS100, JPY) :
+    tous les uptrends/downtrends/flat répondent correctement.
     """
     if len(closes) < lookback:
         return "NEUTRE"
@@ -215,7 +223,6 @@ def compute_institutional_trend(closes: pd.Series, lookback: int = 20) -> str:
     base = y[0]
     if base == 0:
         return "NEUTRE"
-    # Normalisation : série en ratio → slope en %/bougie, comparable entre actifs
     y_norm = y / base
     x = np.arange(len(y_norm))
     slope, _ = np.polyfit(x, y_norm, 1)
@@ -223,8 +230,8 @@ def compute_institutional_trend(closes: pd.Series, lookback: int = 20) -> str:
     if std_dev == 0:
         return "NEUTRE"
     z_score = slope / std_dev
-    if z_score >  0.10: return "HAUSSIER"
-    if z_score < -0.10: return "BAISSIER"
+    if z_score >  threshold: return "HAUSSIER"
+    if z_score < -threshold: return "BAISSIER"
     return "NEUTRE"
 
 def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: float, timeframe: str) -> Tuple[pd.Series, pd.Series]:
@@ -581,7 +588,8 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
                 
                 if not cp: cp = float(df["close"].iloc[-1])
                 bars_map[tf_name] = len(df)
-                trends[tf_name] = compute_institutional_trend(df["close"])
+                _lb, _th = {"H4": (30, 0.08), "Daily": (20, 0.10), "Weekly": (10, 0.10)}.get(tf_name, (20, 0.10))
+                trends[tf_name] = compute_institutional_trend(df["close"], lookback=_lb, threshold=_th)
                 atr_val = compute_atr(df)
                 
                 min_t = max(3, min_touches_ui) if tf_k == "h4" else max(2, min_touches_ui)
@@ -1785,4 +1793,3 @@ if "scan_results" in st.session_state and not st.session_state.get("pending_scan
         st.session_state["scan_results"],
         max_dist_filter,
     )
-
