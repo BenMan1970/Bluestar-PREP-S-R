@@ -1,15 +1,13 @@
 import asyncio
 import time
 import nest_asyncio
-import hashlib
 import json
 import logging
 import traceback
-from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict
 
 import aiohttp
 import numpy as np
@@ -138,7 +136,7 @@ class AsyncOandaClient:
                     if r.status == 200:
                         self.env_url = url
                         return True
-            except Exception:
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
                 continue
         return False
 
@@ -171,7 +169,7 @@ class AsyncOandaClient:
                     _OANDA_CACHE[_ck] = result_df
                     _cache_purge_old()
                     return symbol, tf, result_df
-            except Exception:
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError, KeyError, ValueError):
                 return symbol, tf, None
 
     async def fetch_price(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, symbol: str) -> Tuple[str, Optional[float]]:
@@ -185,7 +183,7 @@ class AsyncOandaClient:
                         bid = float(data["prices"][0]["closeoutBid"])
                         ask = float(data["prices"][0]["closeoutAsk"])
                         return symbol, (bid + ask) / 2
-            except Exception:
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError, KeyError, ValueError):
                 pass
         return symbol, None
 
@@ -202,16 +200,31 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
     return float(res) if pd.notna(res) and res > 0 else 0.001
 
 def compute_institutional_trend(closes: pd.Series, lookback: int = 20) -> str:
-    """Z-Score Normalized Linear Regression (Institutional Standard)."""
-    if len(closes) < lookback: return "NEUTRE"
+    """Z-Score Normalized Linear Regression — scale-invariant multi-asset.
+
+    La série est normalisée par closes[0] avant polyfit : slope et std_dev sont
+    en %/bougie, indépendants du niveau de prix absolu.
+    → Le seuil 0.10 est universel : EURUSD (1.16), XAU (4500), US30 (50 000).
+
+    Ancien bug : sans normalisation, slope/std_dev donnait un z_score 2-3x plus
+    faible sur les actifs à prix élevé (XAU, indices) → biais NEUTRE systématique.
+    """
+    if len(closes) < lookback:
+        return "NEUTRE"
     y = closes.tail(lookback).values
-    x = np.arange(len(y))
-    slope, _ = np.polyfit(x, y, 1)
-    std_dev = np.std(y)
-    if std_dev == 0: return "NEUTRE"
+    base = y[0]
+    if base == 0:
+        return "NEUTRE"
+    # Normalisation : série en ratio → slope en %/bougie, comparable entre actifs
+    y_norm = y / base
+    x = np.arange(len(y_norm))
+    slope, _ = np.polyfit(x, y_norm, 1)
+    std_dev = np.std(y_norm)
+    if std_dev == 0:
+        return "NEUTRE"
     z_score = slope / std_dev
-    if z_score > 0.15: return "HAUSSIER"
-    if z_score < -0.15: return "BAISSIER"
+    if z_score >  0.10: return "HAUSSIER"
+    if z_score < -0.10: return "BAISSIER"
     return "NEUTRE"
 
 def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: float, timeframe: str) -> Tuple[pd.Series, pd.Series]:
@@ -633,324 +646,6 @@ def _safe_pdf_str(text: str) -> str:
     for e, r in _EMOJI_MAP: text = text.replace(e, r)
     return text
 
-def strip_emojis_df(df):
-    cln = df.copy()
-    for col in cln.select_dtypes(include='object').columns: cln[col] = cln[col].apply(_safe_pdf_str)
-    return cln
-
-def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    return df.drop(columns=["_dist_num", "_in_pdf"], errors="ignore")
-
-class PDF(FPDF):
-    def header(self):
-        self.set_font('Helvetica', 'B', 15)
-        self.cell(0, 10, _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'), border=0, align='C', new_x='LMARGIN', new_y='NEXT')
-        self.set_font('Helvetica', '', 8)
-        self.cell(0, 6, _safe_pdf_str(f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  v{SCANNER_VERSION}  |  Score = (Force x Poids_TF x NbTF) x Facteur_Age | Statut Vierge / Testee / Role Reverse / Consommee"), border=0, align='C', new_x='LMARGIN', new_y='NEXT')
-        self.ln(4)
-    def footer(self):
-        self.set_y(-15)
-        self.set_font('Helvetica', 'I', 8)
-        self.cell(0, 10, f'Page {self.page_no()}', border=0, align='C')
-    def chapter_title(self, title):
-        self.set_font('Helvetica', 'B', 12)
-        self.cell(0, 10, _safe_pdf_str(title), border=0, align='L', new_x='LMARGIN', new_y='NEXT')
-        self.ln(4)
-    def chapter_summary(self, summaries):
-        self.set_font('Helvetica', 'B', 10)
-        self.cell(0, 7, _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'), border=0, align='L', new_x='LMARGIN', new_y='NEXT')
-        self.ln(2)
-        for s in summaries:
-            sym, t_h4, t_d, t_w, ctx = _safe_pdf_str(s.get('symbol','')), _safe_pdf_str(s.get('trend_h4','N/A')), _safe_pdf_str(s.get('trend_daily','N/A')), _safe_pdf_str(s.get('trend_weekly','N/A')), _safe_pdf_str(s.get('price_context',''))
-            self.set_font('Helvetica', 'B', 8)
-            self.cell(0, 5, _safe_pdf_str(f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}"), border=0, new_x='LMARGIN', new_y='NEXT')
-            if ctx:
-                self.set_font('Helvetica', 'I', 7)
-                self.cell(0, 4, f"  Position : {ctx[:120]}", border=0, new_x='LMARGIN', new_y='NEXT')
-            top = s.get('top_zones', [])
-            self.set_font('Helvetica', '', 7)
-            if top:
-                for z in top:
-                    txt = _safe_pdf_str(f"  {z.get('Signal','')}  Niv:{z.get('Niveau','')}  Dist:{z.get('Distance %','')}  Score:{z.get('Score','')}  TF:{z.get('Timeframes','')}  {z.get('Alerte','')}")
-                    self.cell(0, 4, txt[:130], border=0, new_x='LMARGIN', new_y='NEXT')
-            else:
-                self.cell(0, 4, "  Aucune confluence pour cet actif.", border=0, new_x='LMARGIN', new_y='NEXT')
-            self.ln(1)
-    def chapter_body(self, df):
-        if df.empty:
-            self.set_font('Helvetica', '', 10)
-            self.set_x(self.l_margin)
-            self.multi_cell(self.w - self.l_margin - self.r_margin, 10, "Aucune donnee a afficher.")
-            self.ln()
-            return
-        col_w = {'Actif': 20, 'Signal': 26, 'Niveau': 22, 'Type': 22, 'Timeframes': 50, 'Nb TF': 12, 'Force Totale': 20, 'Score': 18, 'Statut': 22, 'Distance %': 18, 'Alerte': 55} if 'Timeframes' in df.columns else {'Actif': 24, 'Prix Actuel': 24, 'Type': 20, 'Niveau': 24, 'Force': 20, 'Score (1TF)': 18, 'Statut': 22, 'Dist. %': 16, 'Dist. ATR': 16}
-        cols = [c for c in col_w if c in df.columns]
-        x_start = self.l_margin + max(0, ((self.w - self.l_margin - self.r_margin) - sum(col_w[c] for c in cols)) / 2)
-        self.set_font('Helvetica', 'B', 7)
-        self.set_x(x_start)
-        for c in cols: self.cell(col_w[c], 6, _safe_pdf_str(c), border=1, align='C', new_x='RIGHT', new_y='TOP')
-        self.ln()
-        self.set_font('Helvetica', '', 7)
-        for _, row in df.iterrows():
-            self.set_x(x_start)
-            for c in cols:
-                val = _safe_pdf_str(str(row[c]))
-                mx = int(col_w[c] / 1.25)
-                self.cell(col_w[c], 5, val[:mx-1]+'.' if len(val)>mx else val, border=1, align='C', new_x='RIGHT', new_y='TOP')
-            self.ln()
-
-def create_pdf_report(rep_dict, conf_df, summaries):
-    pdf = PDF('L', 'mm', 'A4')
-    pdf.set_margins(5, 10, 5)
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    if summaries:
-        pdf.chapter_summary(summaries)
-        pdf.add_page()
-    if conf_df is not None and not conf_df.empty:
-        pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
-        cln = strip_emojis_df(_clean_df(conf_df.copy()))
-        if "Score" in cln.columns: cln = cln.sort_values("Score", ascending=False)
-        pdf.chapter_body(cln)
-        pdf.ln(10)
-    tmap = {'H4': 'Analyse 4 Heures (H4)', 'Daily': 'Analyse Journaliere (Daily)', 'Weekly': 'Analyse Hebdomadaire (Weekly)'}
-    for tf, df in rep_dict.items():
-        if df is None or df.empty: continue
-        pdf.chapter_title(tmap.get(tf, tf))
-        cln = strip_emojis_df(_clean_df(df.copy()))
-        if "Score (1TF)" in cln.columns: cln = cln.sort_values("Score (1TF)", ascending=False)
-        pdf.chapter_body(cln)
-        pdf.ln(10)
-    return bytes(pdf.output())
-
-def create_csv_report(rep_dict, conf_df):
-    dfs = []
-    if conf_df is not None and not conf_df.empty:
-        c = _clean_df(conf_df).copy()
-        c["Section"] = "CONFLUENCES"
-        dfs.append(c)
-    for tf, df in rep_dict.items():
-        if df is not None and not df.empty:
-            d = _clean_df(df).copy()
-            d["Timeframe"] = tf
-            dfs.append(d)
-    if not dfs: return b""
-    buf = BytesIO()
-    pd.concat(dfs, ignore_index=True).to_csv(buf, index=False, encoding="utf-8-sig")
-    return buf.getvalue()
-
-def create_json_export(summaries, conf_df, max_dist=5.0, min_score=60.0, allowed_statuts=("Vierge", "Testee", "Role Reverse")):
-    out = {"generated_at": datetime.now().isoformat(), "scanner_version": SCANNER_VERSION, "filters": {"max_dist_pct": max_dist, "min_score": min_score}, "assets": []}
-    smap = {s["symbol"]: s for s in summaries}
-    
-    agrp = {}
-    if conf_df is not None and not conf_df.empty:
-        for _, r in conf_df.iterrows():
-            try: dist = float(str(r.get("Distance %", 999)).replace("%", ""))
-            except: dist = 999.0
-            try: score = float(r.get("Score", 0))
-            except: score = 0.0
-            
-            sig = str(r.get("Signal", "")).replace("🟢","").replace("🔴","").replace("↔️","").replace("↔","").replace("ZONE","").strip()
-            if "PIVOT" in sig: sig = "PIVOT"
-            elif "BUY" in sig: sig = "BUY"
-            elif "SELL" in sig: sig = "SELL"
-            
-            stat = str(r.get("Statut", ""))
-            if dist > max_dist or score < min_score or sig not in ("BUY","SELL","PIVOT") or stat not in allowed_statuts: continue
-            
-            sym = str(r.get("Actif", ""))
-            if sym not in agrp: agrp[sym] = []
-            
-            try: lvl = round(float(r.get("Niveau", 0)), 5)
-            except: continue
-            
-            tfs = sorted([p.strip() for p in str(r.get("Timeframes", "")).replace("+",",").split(",") if p.strip()], key=lambda t: {"Weekly":0,"Daily":1,"H4":2}.get(t,99))
-            alrt = str(r.get("Alerte", "")).replace("🔥","").replace("⚠️","").replace("⚠","").strip()
-            alrt = "HOT" if "CHAUD" in alrt.upper() or "HOT" in alrt.upper() else ("CLOSE" if "PROCHE" in alrt.upper() or "CLOSE" in alrt.upper() else "")
-            
-            agrp[sym].append({"signal": sig, "type": str(r.get("Type", "")), "level": lvl, "score": round(score, 1), "status": stat, "distance_pct": round(dist, 3), "alert": alrt, "timeframes": tfs, "nb_tf": int(r.get("Nb TF", len(tfs)))})
-
-    all_syms = set(smap.keys()).union(agrp.keys())
-    for sym in sorted(all_syms, key=lambda a: max((z["score"] for z in agrp.get(a, [])), default=0.0), reverse=True):
-        s = smap.get(sym, {})
-        cp = s.get("current_price")
-        
-        bmap = {"HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL"}
-        bh4, bd, bw = bmap.get(s.get("trend_h4","NEUTRE"),"NEUTRAL"), bmap.get(s.get("trend_daily","NEUTRE"),"NEUTRAL"), bmap.get(s.get("trend_weekly","NEUTRE"),"NEUTRAL")
-        
-        if bd == bw and bd != "NEUTRAL": dom, align = bd, "ALIGNED" if bh4 == bd else "CONFLICTED"
-        elif bd == "NEUTRAL" and bw != "NEUTRAL": dom, align = bw, "ALIGNED" if bh4 == bw else "CONFLICTED"
-        elif bw == "NEUTRAL" and bd != "NEUTRAL": dom, align = bd, "ALIGNED" if bh4 == bd else "CONFLICTED"
-        else: dom, align = "NEUTRAL", "MIXED"
-        
-        out["assets"].append({"symbol": sym, "current_price": round(cp, 5) if cp else None, "trends": {"h4": s.get("trend_h4","NEUTRE"), "daily": s.get("trend_daily","NEUTRE"), "weekly": s.get("trend_weekly","NEUTRE")}, "trend_alignment": align, "dominant_bias": dom, "price_context": s.get("price_context", ""), "nb_zones": len(agrp.get(sym, [])), "zones": sorted(agrp.get(sym, []), key=lambda z: z["score"], reverse=True)})
-    
-    return json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8")
-
-def create_llm_brief(summaries, conf_df, max_dist=2.0, min_score=100.0, allowed_statuts=("Vierge", "Testee", "Role Reverse")):
-    lines = [f"# BRIEF INSTITUTIONNEL S/R — v{SCANNER_VERSION}", f"_Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}_", "", "## LEGEND", "- Sc > 300: Institutional / 100-300: Strong / < 100: Standard", ""]
-    if conf_df is None or conf_df.empty: return "\n".join(lines).encode("utf-8")
-    
-    agrp = {}
-    for _, r in conf_df.iterrows():
-        try: dist = float(str(r.get("Distance %", 999)).replace("%", ""))
-        except: dist = 999.0
-        try: score = float(r.get("Score", 0))
-        except: score = 0.0
-        stat = str(r.get("Statut", ""))
-        
-        if dist <= max_dist and score >= min_score and stat in allowed_statuts:
-            sym = str(r.get("Actif", ""))
-            if sym not in agrp: agrp[sym] = []
-            agrp[sym].append({"sig": str(r.get("Signal","")), "lvl": str(r.get("Niveau","")), "sc": score, "st": stat, "d": dist, "tf": str(r.get("Timeframes","")).replace("Daily","D").replace("Weekly","W").replace(" + ","+"), "al": str(r.get("Alerte",""))})
-
-    smap = {s["symbol"]: s for s in summaries}
-    tarr = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
-    stlb = {"Vierge": "V", "Testee": "T", "Role Reverse": "RR", "Consommee": "C"}
-    allb = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠"}
-
-    for sym in sorted(agrp.keys(), key=lambda a: max(z["sc"] for z in agrp[a]), reverse=True):
-        s = smap.get(sym, {})
-        ctx = s.get("price_context", "")
-        lines.append(f"### {sym} | H4:{tarr.get(s.get('trend_h4','NEUTRE'),'→')} D:{tarr.get(s.get('trend_daily','NEUTRE'),'→')} W:{tarr.get(s.get('trend_weekly','NEUTRE'),'→')}")
-        if ctx: lines.append(f"> {ctx}")
-        for z in sorted(agrp[sym], key=lambda x: x["sc"], reverse=True):
-            sg = "BUY  " if "BUY" in z["sig"] else ("SELL " if "SELL" in z["sig"] else "PIVOT")
-            lines.append(f"- {sg} `{z['lvl']}` | Sc:{z['sc']:.0f} | {stlb.get(z['st'], z['st'])} | {z['d']:.2f}% | {z['tf']} {allb.get(z['al'], '')}")
-        lines.append("")
-    return "\n".join(lines).encode("utf-8")
-
-# ==============================================================================
-
-# ==============================================================================
-# HELPER FUNCTIONS (portées depuis v6.0)
-# ==============================================================================
-
-def _safe_pdf_str(text: str) -> str:
-    if not isinstance(text, str):
-        text = str(text)
-    text = text.translate(_ACCENT_MAP)
-    for emoji, replacement in _EMOJI_MAP:
-        text = text.replace(emoji, replacement)
-    return text
-
-def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
-    for val in sensitive_values:
-        if val and isinstance(val, str) and len(val) > 4:
-            tb = tb.replace(val, f"***{val[-4:]}")
-    return tb
-
-_INTERNAL_COLS = ["_dist_num", "_in_pdf"]
-
-def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    return df.drop(columns=_INTERNAL_COLS, errors="ignore")
-
-def _sym_display(sym: str) -> str:
-    return sym.replace("_", "/")
-
-
-# ══════════════════════════════════════════════════════════════════
-
-def determine_oanda_environment(access_token: str, account_id: str) -> Optional[str]:
-    headers = {"Authorization": f"Bearer {access_token}"}
-    for url in [
-        "https://api-fxpractice.oanda.com",
-        "https://api-fxtrade.oanda.com",
-    ]:
-        try:
-            with _api_semaphore:
-                r = _get_session().get(
-                    f"{url}/v3/accounts/{account_id}/summary",
-                    headers=headers,
-                    timeout=(3, 5),
-                )
-            if r.status_code == 200:
-                return url
-        except (requests.RequestException, ValueError):
-            continue
-    return None
-
-
-def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
-    if current_price is None or current_price <= 0:
-        return None
-    profile = get_profile(symbol)
-    messages = []
-    if not profile.skip_ratio_check and len(support_levels) >= 3:
-        median_sup = np.median(support_levels)
-        if median_sup > 0 and median_sup > 0.01 * current_price:
-            ratio = current_price / median_sup
-            if ratio > 3.0:
-                messages.append(
-                    f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
-                    f"({median_sup:.2f}) - donnees a verifier"
-                )
-    if last_candle_close and last_candle_close > 0:
-        dev = abs(current_price - last_candle_close) / last_candle_close * 100
-        if dev > 25.0:
-            messages.append(
-                f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
-                f"du dernier close ({last_candle_close:.2f})"
-            )
-    return " | ".join(messages) if messages else None
-
-
-def get_price_context(current_price, supports, resistances, max_dist_pct: float = 5.0):
-    if not current_price or current_price <= 0:
-        return "Prix indisponible"
-    parts = []
-    if not supports.empty:
-        sup_nearby = supports[
-            (supports["level"] < current_price) &
-            (abs(supports["level"] - current_price) / current_price * 100 <= max_dist_pct)
-        ]
-        if not sup_nearby.empty:
-            nearest_sup = sup_nearby.nlargest(1, "level").iloc[0]
-            dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
-            tag    = "SUR support" if dist_s < 0.5 else "S proche"
-            parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
-    if not resistances.empty:
-        res_nearby = resistances[
-            (resistances["level"] > current_price) &
-            (abs(resistances["level"] - current_price) / current_price * 100 <= max_dist_pct)
-        ]
-        if not res_nearby.empty:
-            nearest_res = res_nearby.nsmallest(1, "level").iloc[0]
-            dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
-            tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
-            parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
-    return "  |  ".join(parts) if parts else "Zone intermediaire"
-
-
-def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> dict:
-    result: dict = {"nearest_support": None, "nearest_resistance": None}
-    if not ctx_str or ctx_str == "Zone intermediaire" or not current_price:
-        return result
-    import re
-    pat = re.compile(
-        r"(SUR support|S proche|SUR resistance|R proche):\s*([\d.]+)\s*\(([+-][\d.]+)%\)"
-    )
-    for m in pat.finditer(ctx_str):
-        tag, level_str, dist_str = m.group(1), m.group(2), m.group(3)
-        try:
-            lvl  = float(level_str)
-            dist = float(dist_str)
-        except ValueError:
-            continue
-        entry = {
-            "level":        lvl,
-            "distance_pct": dist,
-            "on_level":     abs(dist) < 0.5,
-        }
-        if tag in ("SUR support", "S proche"):
-            result["nearest_support"] = entry
-        else:
-            result["nearest_resistance"] = entry
-    return result
-
-
-
 # ==============================================================================
 # EXPORT FUNCTIONS (portées depuis v6.0)
 # ==============================================================================
@@ -1208,7 +903,7 @@ def create_llm_brief(summaries, confluences_df,
     for _, row in confluences_df.iterrows():
         try:
             dist_val = float(str(row.get("Distance %", "999")).replace("%", ""))
-        except Exception:
+        except (ValueError, TypeError, AttributeError):
             dist_val = 999.0
         try:
             score_val = float(row.get("Score", 0))
@@ -1345,7 +1040,7 @@ def create_json_export(summaries, confluences_df,
             try:
                 dist_raw = row.get("Distance %", 999)
                 dist_val = float(str(dist_raw).replace("%", ""))
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 dist_val = 999.0
             try:
                 score_val = float(row.get("Score", 0))
@@ -1437,7 +1132,7 @@ def create_json_export(summaries, confluences_df,
 
     try:
         scan_dt = datetime.fromisoformat(output["generated_at"])
-    except Exception:
+    except (ValueError, KeyError):
         scan_dt = datetime.now()
     output["session"] = _get_ict_session(scan_dt)
 
@@ -1639,7 +1334,7 @@ def _display_results(sr: dict, max_dist_filter: float):
                 height=400,
                 label_visibility="collapsed",
             )
-        except Exception:
+        except (UnicodeDecodeError, AttributeError, TypeError):
             st.warning("Aperçu non disponible.")
 
     def _filter_and_sort(df, max_pct):
