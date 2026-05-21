@@ -46,7 +46,7 @@ def _cache_purge_old() -> None:
         del _OANDA_CACHE[k]
 
 
-SCANNER_VERSION = "7.0-INSTITUTIONAL"
+SCANNER_VERSION = "7.6-INSTITUTIONAL"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -1785,3 +1785,4 @@ if "scan_results" in st.session_state and not st.session_state.get("pending_scan
         st.session_state["scan_results"],
         max_dist_filter,
     )
+  
