@@ -1,6 +1,10 @@
 import asyncio
 import time
-import nest_asyncio
+try:
+    import nest_asyncio
+    _NEST_ASYNCIO_AVAILABLE = True
+except ImportError:
+    _NEST_ASYNCIO_AVAILABLE = False
 import json
 import logging
 import traceback
@@ -22,26 +26,27 @@ from scipy.signal import find_peaks
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Patch asyncio to allow nested event loops (required for Streamlit compatibility)
-nest_asyncio.apply()
+if _NEST_ASYNCIO_AVAILABLE:
+    nest_asyncio.apply()
 
 # ==============================================================================
 # [ LAYER 0b: ASYNC DATA CACHE ]
 # ==============================================================================
-# Cache candles par bucket temporel de 10 min.
-# Clé : (symbol, tf, bucket) — le bucket change toutes les 600s,
-# ce qui invalide automatiquement les entrées sans TTL check explicite.
-# Avantage : 0 verrou, 0 thread, compatible asyncio single-threaded.
-_OANDA_CACHE: Dict[tuple, Optional[pd.DataFrame]] = {}
+# Cache candles thread-safe avec asyncio.Lock et TTL de 10 minutes.
+# Clé : (symbol, tf) — la valeur est (bucket_au_moment_du_set, DataFrame).
+# Chaque accès en écriture purge automatiquement les entrées périmées.
 _CACHE_TTL_SECS = 600  # 10 minutes
+_CACHE_LOCK = asyncio.Lock()
+_OANDA_CACHE: Dict[tuple, tuple] = {}  # (symbol, tf) -> (bucket_int, Optional[pd.DataFrame])
 
 def _cache_bucket() -> int:
     """Retourne le bucket temporel courant (change toutes les 600s)."""
     return int(time.time()) // _CACHE_TTL_SECS
 
 def _cache_purge_old() -> None:
-    """Supprime les entrées de plus de 2 buckets (~20 min) pour éviter les fuites mémoire."""
+    """Purge les entrées dont le bucket est dépassé. Appelé sous _CACHE_LOCK."""
     current = _cache_bucket()
-    stale = [k for k in _OANDA_CACHE if k[2] < current - 1]
+    stale = [k for k, (bkt, _) in _OANDA_CACHE.items() if bkt < current]
     for k in stale:
         del _OANDA_CACHE[k]
 
@@ -118,21 +123,20 @@ def get_profile(symbol: str) -> InstrumentProfile:
 # ==============================================================================
 class OandaAuthError(Exception):
     """Levée quand l'authentification OANDA échoue. Catchée par la couche UI."""
-    pass
 
 
 class AsyncOandaClient:
     """Institutional Async Client handling rapid parallel data fetching with connection pooling."""
-    def __init__(self, token: str, account_id: str):
+    def __init__(self, token: str, account_id: str):  # pylint: disable=redefined-outer-name
         self.headers = {"Authorization": f"Bearer {token}"}
         self.account_id = account_id
         self.env_url = None
-        
+
     async def initialize(self, session: aiohttp.ClientSession) -> bool:
         """Determines Live vs Practice environment dynamically."""
         for url in ["https://api-fxpractice.oanda.com", "https://api-fxtrade.oanda.com"]:
             try:
-                async with session.get(f"{url}/v3/accounts/{self.account_id}/summary", headers=self.headers, timeout=5) as r:
+                async with session.get(f"{url}/v3/accounts/{self.account_id}/summary", headers=self.headers, timeout=aiohttp.ClientTimeout(total=5)) as r:
                     if r.status == 200:
                         self.env_url = url
                         return True
@@ -142,19 +146,23 @@ class AsyncOandaClient:
 
     async def fetch_candles(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, symbol: str, tf: str, limit: int = 500) -> Tuple[str, str, Optional[pd.DataFrame]]:
         # Cache hit : évite une requête OANDA si les données sont < 10 min
-        _ck = (symbol, tf, _cache_bucket())
-        if _ck in _OANDA_CACHE:
-            logging.debug(f"Cache HIT: {symbol}/{tf}")
-            return symbol, tf, _OANDA_CACHE[_ck]
+        _ck = (symbol, tf)
+        _cur_bkt = _cache_bucket()
+        async with _CACHE_LOCK:
+            _cached = _OANDA_CACHE.get(_ck)
+            if _cached is not None and _cached[0] == _cur_bkt:
+                logging.debug("Cache HIT: %s/%s", symbol, tf)
+                return symbol, tf, _cached[1]
 
         gran = _GRANULARITY_MAP.get(tf)
         url = f"{self.env_url}/v3/instruments/{symbol}/candles"
         params = {"count": limit + 1, "granularity": gran, "price": "M"}
-        
+
         async with sem:
             try:
-                async with session.get(url, headers=self.headers, params=params, timeout=10) as r:
-                    if r.status != 200: return symbol, tf, None
+                async with session.get(url, headers=self.headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status != 200:
+                        return symbol, tf, None
                     data = await r.json()
                     candles = [
                         {
@@ -166,8 +174,9 @@ class AsyncOandaClient:
                     ]
                     df = pd.DataFrame(candles).tail(limit).set_index("date")
                     result_df = df if not df.empty else None
-                    _OANDA_CACHE[_ck] = result_df
-                    _cache_purge_old()
+                    async with _CACHE_LOCK:
+                        _OANDA_CACHE[_ck] = (_cur_bkt, result_df)
+                        _cache_purge_old()
                     return symbol, tf, result_df
             except (aiohttp.ClientError, OSError, asyncio.TimeoutError, KeyError, ValueError):
                 return symbol, tf, None
@@ -176,8 +185,9 @@ class AsyncOandaClient:
         url = f"{self.env_url}/v3/accounts/{self.account_id}/pricing"
         async with sem:
             try:
-                async with session.get(url, headers=self.headers, params={"instruments": symbol}, timeout=5) as r:
-                    if r.status != 200: return symbol, None
+                async with session.get(url, headers=self.headers, params={"instruments": symbol}, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    if r.status != 200:
+                        return symbol, None
                     data = await r.json()
                     if "prices" in data and data["prices"]:
                         bid = float(data["prices"][0]["closeoutBid"])
@@ -230,8 +240,10 @@ def compute_institutional_trend(
     if std_dev == 0:
         return "NEUTRE"
     z_score = slope / std_dev
-    if z_score >  threshold: return "HAUSSIER"
-    if z_score < -threshold: return "BAISSIER"
+    if z_score > threshold:
+        return "HAUSSIER"
+    if z_score < -threshold:
+        return "BAISSIER"
     return "NEUTRE"
 
 def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: float, timeframe: str) -> Tuple[pd.Series, pd.Series]:
@@ -324,21 +336,24 @@ def agglomerative_1d_clustering(
 
 def classify_zone_status(level: float, zone_type: str, df: pd.DataFrame, formation_idx: int, atr_val: float) -> str:
     """Dynamic ATR tolerance for Status Classification."""
-    if formation_idx >= len(df) - 1: return "Vierge"
+    if formation_idx >= len(df) - 1:
+        return "Vierge"
     tolerance = atr_val * 0.25
 
     c_arr = df["close"].values[formation_idx + 1:]
     h_arr = df["high"].values[formation_idx + 1:]
     l_arr = df["low"].values[formation_idx + 1:]
-    if len(c_arr) == 0: return "Vierge"
+    if len(c_arr) == 0:
+        return "Vierge"
 
     near = (np.abs(c_arr - level) <= tolerance) | ((l_arr <= level + tolerance) & (h_arr >= level - tolerance))
     has_approach = bool(near.any())
 
     break_mask = (c_arr < level - tolerance) if zone_type == "Support" else (c_arr > level + tolerance)
     break_positions = np.where(break_mask)[0]
-    
-    if len(break_positions) == 0: return "Testee" if has_approach else "Vierge"
+
+    if len(break_positions) == 0:
+        return "Testee" if has_approach else "Vierge"
 
     break_idx = int(break_positions[0])
     retest_tol = tolerance * 2
@@ -346,13 +361,16 @@ def classify_zone_status(level: float, zone_type: str, df: pd.DataFrame, formati
     rh = h_arr[break_idx + 1:]
     rl = l_arr[break_idx + 1:]
 
-    if len(rc) == 0: return "Consommee"
+    if len(rc) == 0:
+        return "Consommee"
     retest_mask = (rl <= level + retest_tol) & (rh >= level - retest_tol)
-    if not retest_mask.any(): return "Consommee"
+    if not retest_mask.any():
+        return "Consommee"
 
     retest_idx = int(np.where(retest_mask)[0][0])
     rc_after = rc[retest_idx + 1:]
-    if len(rc_after) == 0: return "Role Reverse"
+    if len(rc_after) == 0:
+        return "Role Reverse"
 
     second_break = (rc_after > level + tolerance) if zone_type == "Support" else (rc_after < level - tolerance)
     return "Consommee" if second_break.any() else "Role Reverse"
@@ -363,7 +381,7 @@ def compute_structural_score(strength: int, nb_tf: int, tf_name: str, age_bars: 
     age_f = np.exp(-1.5 * age_r)
     return round((strength * tf_w * nb_tf) * age_f, 1)
 
-def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, atr_val: float, timeframe: str, min_touches: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, atr_val: float, timeframe: str, min_touches: int) -> Tuple[pd.DataFrame, pd.DataFrame]:  # pylint: disable=redefined-outer-name
     profile = get_profile(symbol)
     n_total = len(df)
 
@@ -384,7 +402,8 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, at
         [(float(p), int(i), (int(i) + 1e-6) / n_total) for i, p in pivot_highs.items()] +
         [(float(p), int(i), (int(i) + 1e-6) / n_total) for i, p in pivot_lows.items()]
     )
-    if not all_pivots: return pd.DataFrame(), pd.DataFrame()
+    if not all_pivots:
+        return pd.DataFrame(), pd.DataFrame()
 
     # Deterministic Agglomerative Clustering
     bandwidth = atr_val * profile.cluster_radius_atr
@@ -397,7 +416,7 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, at
     for grp_pw in clusters_raw:
         if len(grp_pw) < min_touches:
             continue
-        
+
         grp_prices_arr = np.array([p for p, _ in grp_pw])
         grp_weights_arr = np.array([w for _, w in grp_pw])
 
@@ -418,13 +437,14 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, at
             "level": float(lvl), "strength": len(grp_pw), "age_bars": age, "status": status
         })
 
-    if not strong: return pd.DataFrame(), pd.DataFrame()
+    if not strong:
+        return pd.DataFrame(), pd.DataFrame()
 
     # Post-merge cleanup
     strong.sort(key=lambda x: x["level"])
     merge_thresh = atr_val * profile.merge_threshold_atr
     merged = []
-    
+
     for z in strong:
         if not merged:
             merged.append(z)
@@ -449,9 +469,10 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, at
 
 def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars_map: dict, confluence_threshold: Optional[float] = None) -> list:
     """Vectorized-friendly Confluence Detection."""
-    if not zones_dict or not current_price: return []
+    if not zones_dict or not current_price:
+        return []
     STATUS_PRIORITY = {"Vierge": 0, "Testee": 1, "Role Reverse": 1, "Consommee": 2}
-    
+
     # ── Collecte vectorisée des zones (remplace iterrows) ──────────────────────
     frames = []
     for tf, (sup, res) in zones_dict.items():
@@ -482,7 +503,7 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
         if z.Index in used or z.level <= 0:
             used.add(z.Index)
             continue
-            
+
         similar = z_df[
             (np.abs(z_df["level"] - z.level) / z.level * 100 <= threshold) &
             (~z_df.index.isin(used))
@@ -491,13 +512,13 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
             group_idx = [z.Index] + similar[similar.index != z.Index].index.tolist()
             group = z_df.loc[group_idx]
             tfs = group["tf"].unique()
-            
+
             if len(tfs) >= 2:
                 used.update(group.index)
                 sub_avg = group["level"].mean()
                 sub_nb_tf = len(tfs)
                 sub_dist = abs(current_price - sub_avg) / current_price * 100
-                
+
                 # Score vectorisé numpy — remplace for _, r in group.iterrows()
                 _tf_w   = group["tf"].map(TF_WEIGHT).fillna(1.0).values
                 _totals = group["tf"].map(lambda t: bars_map.get(t, 500)).values.astype(float)
@@ -505,7 +526,7 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
                 _age_f  = np.exp(-1.5 * _age_r)
                 score   = round(float((group["strength"].values * _tf_w * sub_nb_tf * _age_f).sum()), 1)
                 status = max(group["status"].tolist(), key=lambda s: STATUS_PRIORITY.get(s, 1))
-                
+
                 is_pivot = sub_dist <= 0.50
                 if is_pivot:
                     ctype, sig = "Pivot", "↔ PIVOT ZONE"
@@ -550,7 +571,7 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
             raise OandaAuthError("Impossible de s'authentifier sur OANDA. Vérifiez vos secrets API.")
 
         sem = asyncio.Semaphore(15) # Rate limit protection
-        
+
         # 1. Fetch Prices
         price_tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
         prices_res = await asyncio.gather(*price_tasks)
@@ -561,11 +582,12 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
         for sym in symbols:
             for tf in _GRANULARITY_MAP.keys():
                 candle_tasks.append(client.fetch_candles(session, sem, sym, tf))
-        
+
         candles_res = await asyncio.gather(*candle_tasks)
         data_cube = {}
         for sym, tf, df in candles_res:
-            if sym not in data_cube: data_cube[sym] = {}
+            if sym not in data_cube:
+                data_cube[sym] = {}
             data_cube[sym][tf] = df
 
     # 3. Process Quant Engine Locally (CPU Bound, but fast enough natively)
@@ -575,27 +597,29 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
             profile = get_profile(sym)
             cp = live_prices.get(sym)
             sym_d = sym.replace("_", "/")
-            
+
             rows = {"H4": None, "Daily": None, "Weekly": None}
             zones_d = {}
             trends = {}
             bars_map = {}
             price_ctx = ""
-            
+
             for tf_k, tf_name in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
                 df = data_cube.get(sym, {}).get(tf_k)
-                if df is None or df.empty: continue
-                
-                if not cp: cp = float(df["close"].iloc[-1])
+                if df is None or df.empty:
+                    continue
+
+                if not cp:
+                    cp = float(df["close"].iloc[-1])
                 bars_map[tf_name] = len(df)
                 _lb, _th = {"H4": (30, 0.08), "Daily": (20, 0.10), "Weekly": (10, 0.10)}.get(tf_name, (20, 0.10))
                 trends[tf_name] = compute_institutional_trend(df["close"], lookback=_lb, threshold=_th)
                 atr_val = compute_atr(df)
-                
+
                 min_t = max(3, min_touches_ui) if tf_k == "h4" else max(2, min_touches_ui)
                 sup, res = find_strong_sr_zones(df, cp, sym, atr_val, tf_k, min_t)
                 zones_d[tf_name] = (sup, res)
-                
+
                 if tf_k == "daily":
                     # Quick context string builder
                     parts = []
@@ -616,7 +640,7 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
                 def mk_row(z, zt):
                     dist = abs(cp - z["level"])/cp*100 if cp else 0
                     dist_atr = f"{round(abs(cp - z['level'])/atr_val,1)}x" if atr_val>0 else "N/A"
-                    in_pdf = (dist <= (profile.merge_threshold_atr * 200)) or (dist <= 8.0)
+                    in_pdf = dist <= 8.0  # Filtre PDF : zones à moins de 8% du prix
                     return {
                         "Actif": sym_d, "Prix Actuel": f"{cp:.5f}" if cp else "N/A", "Type": zt,
                         "Niveau": f"{z['level']:.5f}", "Force": f"{z['strength']} touches",
@@ -624,22 +648,32 @@ async def run_institutional_scan(symbols: List[str], token: str, account_id: str
                         "Statut": z["status"], "Dist. %": f"{dist:.2f}%", "Dist. ATR": dist_atr,
                         "_dist_num": dist, "_in_pdf": in_pdf
                     }
-                
+
                 tf_r = [mk_row(z, "PIVOT" if z.get("is_pivot") else "Support") for _, z in sup.iterrows()] + \
                        [mk_row(z, "PIVOT" if z.get("is_pivot") else "Resistance") for _, z in res.iterrows()]
-                
+
                 seen = set()
                 uniq = []
                 for r in tf_r:
                     if (r["Niveau"], r["Type"]) not in seen:
                         seen.add((r["Niveau"], r["Type"]))
                         uniq.append(r)
-                if uniq: rows[tf_name] = uniq
+                if uniq:
+                    rows[tf_name] = uniq
 
-            results.append(ScanResult(sym, rows, zones_d, cp, trends, bars_map, price_context=price_ctx))
+            # P0-004 : brancher flag_data_anomaly dans le pipeline
+            _sup_levels = []
+            for _tf_n, (_s, _r) in zones_d.items():
+                if not _s.empty and "level" in _s.columns:
+                    _sup_levels.extend(_s["level"].tolist())
+            _daily_df = data_cube.get(sym, {}).get("daily")
+            _last_close = float(_daily_df["close"].iloc[-1]) if _daily_df is not None and not _daily_df.empty else None
+            _anomaly = flag_data_anomaly(sym, cp, _sup_levels, last_candle_close=_last_close)
+
+            results.append(ScanResult(sym, rows, zones_d, cp, trends, bars_map, price_context=price_ctx, anomaly=_anomaly))
         except Exception as e:
             results.append(ScanResult(sym, {}, {}, None, {}, {}, scan_error=str(e)))
-            
+
     return results
 
 # ==============================================================================
@@ -651,7 +685,8 @@ _EMOJI_MAP = [('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔�
 
 def _safe_pdf_str(text: str) -> str:
     text = str(text).translate(_ACCENT_MAP)
-    for e, r in _EMOJI_MAP: text = text.replace(e, r)
+    for e, r in _EMOJI_MAP:
+        text = text.replace(e, r)
     return text
 
 # ==============================================================================
@@ -1062,9 +1097,12 @@ def create_llm_brief(summaries, confluences_df,
 
         for z in zones:
             sig = z["signal"]
-            if "BUY"   in sig: signal_short = "BUY  "
-            elif "SELL" in sig: signal_short = "SELL "
-            else:               signal_short = "PIVOT"
+            if "BUY" in sig:
+                signal_short = "BUY  "
+            elif "SELL" in sig:
+                signal_short = "SELL "
+            else:
+                signal_short = "PIVOT"
             st_short     = STATUS_LABEL.get(z["statut"], z["statut"])
             al_short     = ALERT_LABEL.get(z["alerte"], "")
             tf_short = (z["tfs"]
@@ -1118,9 +1156,12 @@ def create_json_export(summaries, confluences_df,
     def _normalize_signal(raw: str) -> str:
         r = raw.replace("🟢", "").replace("🔴", "").replace("↔️", "").replace("↔", "")
         r = r.replace("ZONE", "").strip()
-        if "PIVOT" in r: return "PIVOT"
-        if "BUY"   in r: return "BUY"
-        if "SELL"  in r: return "SELL"
+        if "PIVOT" in r:
+            return "PIVOT"
+        if "BUY" in r:
+            return "BUY"
+        if "SELL" in r:
+            return "SELL"
         return r.strip()
 
     def _normalize_alert(raw: str) -> str:
@@ -1207,9 +1248,12 @@ def create_json_export(summaries, confluences_df,
 
     def _get_ict_session(dt) -> str:
         h = dt.hour
-        if 22 <= h or h < 7:   return "ASIAN"
-        if 7  <= h < 12:        return "LONDON"
-        if 12 <= h < 16:        return "OVERLAP_LDN_NY"
+        if 22 <= h or h < 7:
+            return "ASIAN"
+        if 7 <= h < 12:
+            return "LONDON"
+        if 12 <= h < 16:
+            return "OVERLAP_LDN_NY"
         return "NEW_YORK"
 
     def _trend_alignment(h4: str, daily: str, weekly: str) -> tuple:
@@ -1605,12 +1649,11 @@ with st.sidebar:
 
     st.divider()
     st.header("4. Paramètres de Détection")
-    zone_width = st.slider(
-        "Largeur zone Forex (% fallback si ATR indispo)", 0.1, 2.0, 0.5, 0.1,
-    )
+    # zone_width : supprimé (P0-006) — l'ATR calcule toujours la largeur réelle, pas de fallback % nécessaire
     min_touches = st.slider(
-        "Force minimale (touches)", 3, 10, 3, 1,
+        "Force minimale H4 (touches)", 2, 10, 3, 1,
     )
+    st.caption("H4 utilise ce seuil | Daily/Weekly utilisent max(2, valeur)")
     confluence_threshold = st.slider(
         "Seuil confluence Forex (%)", 0.3, 2.0, 1.0, 0.1,
     )
@@ -1708,9 +1751,12 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
 
                 for tf_cap, tf_rows in result.rows.items():
                     if tf_rows:
-                        if tf_cap == "H4":       results_h4.extend(tf_rows)
-                        elif tf_cap == "Daily":  results_daily.extend(tf_rows)
-                        elif tf_cap == "Weekly": results_weekly.extend(tf_rows)
+                        if tf_cap == "H4":
+                            results_h4.extend(tf_rows)
+                        elif tf_cap == "Daily":
+                            results_daily.extend(tf_rows)
+                        elif tf_cap == "Weekly":
+                            results_weekly.extend(tf_rows)
 
         except OandaAuthError as e:
             st.error(str(e))
@@ -1813,4 +1859,3 @@ if "scan_results" in st.session_state and not st.session_state.get("pending_scan
         st.session_state["scan_results"],
         max_dist_filter,
     )
-   
