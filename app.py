@@ -650,6 +650,101 @@ def _safe_pdf_str(text: str) -> str:
 # EXPORT FUNCTIONS (portées depuis v6.0)
 # ==============================================================================
 
+def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
+    for val in sensitive_values:
+        if val and isinstance(val, str) and len(val) > 4:
+            tb = tb.replace(val, f"***{val[-4:]}")
+    return tb
+
+_INTERNAL_COLS = ["_dist_num", "_in_pdf"]
+
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop(columns=_INTERNAL_COLS, errors="ignore")
+
+def _sym_display(sym: str) -> str:
+    return sym.replace("_", "/")
+
+def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
+    if current_price is None or current_price <= 0:
+        return None
+    profile = get_profile(symbol)
+    messages = []
+    if not profile.skip_ratio_check and len(support_levels) >= 3:
+        median_sup = np.median(support_levels)
+        if median_sup > 0 and median_sup > 0.01 * current_price:
+            ratio = current_price / median_sup
+            if ratio > 3.0:
+                messages.append(
+                    f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
+                    f"({median_sup:.2f}) - donnees a verifier"
+                )
+    if last_candle_close and last_candle_close > 0:
+        dev = abs(current_price - last_candle_close) / last_candle_close * 100
+        if dev > 25.0:
+            messages.append(
+                f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
+                f"du dernier close ({last_candle_close:.2f})"
+            )
+    return " | ".join(messages) if messages else None
+
+
+def get_price_context(current_price, supports, resistances, max_dist_pct: float = 5.0):
+    if not current_price or current_price <= 0:
+        return "Prix indisponible"
+    parts = []
+    if not supports.empty:
+        sup_nearby = supports[
+            (supports["level"] < current_price) &
+            (abs(supports["level"] - current_price) / current_price * 100 <= max_dist_pct)
+        ]
+        if not sup_nearby.empty:
+            nearest_sup = sup_nearby.nlargest(1, "level").iloc[0]
+            dist_s = abs(current_price - nearest_sup["level"]) / current_price * 100
+            tag    = "SUR support" if dist_s < 0.5 else "S proche"
+            parts.append(f"{tag}: {nearest_sup['level']:.5f} (-{dist_s:.2f}%)")
+    if not resistances.empty:
+        res_nearby = resistances[
+            (resistances["level"] > current_price) &
+            (abs(resistances["level"] - current_price) / current_price * 100 <= max_dist_pct)
+        ]
+        if not res_nearby.empty:
+            nearest_res = res_nearby.nsmallest(1, "level").iloc[0]
+            dist_r = abs(current_price - nearest_res["level"]) / current_price * 100
+            tag    = "SUR resistance" if dist_r < 0.5 else "R proche"
+            parts.append(f"{tag}: {nearest_res['level']:.5f} (+{dist_r:.2f}%)")
+    return "  |  ".join(parts) if parts else "Zone intermediaire"
+
+
+def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> dict:
+    result: dict = {"nearest_support": None, "nearest_resistance": None}
+    if not ctx_str or ctx_str == "Zone intermediaire" or not current_price:
+        return result
+    import re
+    pat = re.compile(
+        r"(SUR support|S proche|SUR resistance|R proche):\s*([\d.]+)\s*\(([+-][\d.]+)%\)"
+    )
+    for m in pat.finditer(ctx_str):
+        tag, level_str, dist_str = m.group(1), m.group(2), m.group(3)
+        try:
+            lvl  = float(level_str)
+            dist = float(dist_str)
+        except ValueError:
+            continue
+        entry = {
+            "level":        lvl,
+            "distance_pct": dist,
+            "on_level":     abs(dist) < 0.5,
+        }
+        if tag in ("SUR support", "S proche"):
+            result["nearest_support"] = entry
+        else:
+            result["nearest_resistance"] = entry
+    return result
+
+
+
+
+
 def strip_emojis_df(df):
     clean = df.copy()
     for col in clean.select_dtypes(include='object').columns:
