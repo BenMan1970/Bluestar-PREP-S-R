@@ -46,7 +46,7 @@ def _cache_purge_old() -> None:
         del _OANDA_CACHE[k]
 
 
-SCANNER_VERSION = "7.7-INSTITUTIONAL"
+SCANNER_VERSION = "7.8-INSTITUTIONAL"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -1213,23 +1213,43 @@ def create_json_export(summaries, confluences_df,
         return "NEW_YORK"
 
     def _trend_alignment(h4: str, daily: str, weekly: str) -> tuple:
+        """Alignement multi-TF à 5 états — plus précis que binaire ALIGNED/CONFLICTED.
+
+        États :
+          ALIGNED    : H4 confirme la direction D+W → setup haute probabilité
+          PULLBACK   : H4 NEUTRE sur fond directionnel D/W → correction en cours,
+                       attendre la reprise avant d'entrer
+          CONFLICTED : H4 va à l'opposé de D/W → divergence, risque élevé
+          BUILDING   : D+W neutres mais H4 directionnel → trend H4 qui cherche
+                       sa confirmation HTF, setup prématuré
+          MIXED      : aucune lecture claire, rester à l'écart
+        """
         bias_map = {"HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL"}
         b_h4 = bias_map.get(h4,     "NEUTRAL")
         b_d  = bias_map.get(daily,  "NEUTRAL")
         b_w  = bias_map.get(weekly, "NEUTRAL")
 
+        # Dominant : Daily + Weekly en priorité
         if b_d == b_w and b_d != "NEUTRAL":
-            dominant  = b_d
-            alignment = "ALIGNED" if b_h4 == dominant else "CONFLICTED"
+            dominant = b_d
         elif b_d == "NEUTRAL" and b_w != "NEUTRAL":
-            dominant  = b_w
-            alignment = "ALIGNED" if b_h4 == dominant else "CONFLICTED"
+            dominant = b_w
         elif b_w == "NEUTRAL" and b_d != "NEUTRAL":
-            dominant  = b_d
-            alignment = "ALIGNED" if b_h4 == dominant else "CONFLICTED"
+            dominant = b_d
         else:
-            dominant  = "NEUTRAL"
-            alignment = "MIXED"
+            dominant = "NEUTRAL"
+
+        if dominant != "NEUTRAL":
+            if b_h4 == dominant:
+                alignment = "ALIGNED"     # H4 confirme le trend HTF → setup idéal
+            elif b_h4 == "NEUTRAL":
+                alignment = "PULLBACK"    # H4 en consolidation sur tendance de fond
+            else:
+                alignment = "CONFLICTED"  # H4 va à l'opposé → divergence franche
+        elif b_h4 != "NEUTRAL":
+            alignment = "BUILDING"        # H4 seul directionnel → cherche confirmation HTF
+        else:
+            alignment = "MIXED"           # tout NEUTRE → pas de lecture
 
         return alignment, dominant
 
@@ -1793,3 +1813,4 @@ if "scan_results" in st.session_state and not st.session_state.get("pending_scan
         st.session_state["scan_results"],
         max_dist_filter,
     )
+   
