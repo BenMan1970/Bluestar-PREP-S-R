@@ -209,19 +209,19 @@ def _is_valid_candle_dict(c: dict) -> bool:
         mid = c["mid"]
         o = float(mid["o"])
         h = float(mid["h"])
-        l = float(mid["l"])
+        lo = float(mid["l"])
         cl = float(mid["c"])
     except (KeyError, ValueError, TypeError):
         return False
-    if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(l) and np.isfinite(cl)):
+    if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(lo) and np.isfinite(cl)):
         return False
-    if l <= 0:
+    if lo <= 0:
         return False
-    if h < l:
+    if h < lo:
         return False
-    if not (l <= o <= h):
+    if not (lo <= o <= h):
         return False
-    if not (l <= cl <= h):
+    if not (lo <= cl <= h):
         return False
     return True
 
@@ -844,18 +844,35 @@ class ScanResult:
     price_is_fallback: bool = False
 
 
-def _make_row(z: dict, ztype: str, cp: float, atr_val: float, sym_d: str,
-              tf_name: str, df_len: int, profile: InstrumentProfile) -> Dict[str, Any]:
-    dist = abs(cp - z["level"]) / cp * 100 if cp else 0.0
-    dist_atr = f"{round(abs(cp - z['level']) / atr_val, 1)}x" if (atr_val and atr_val > 0) else "N/A"
-    in_pdf = dist <= profile.pdf_max_dist_pct
+@dataclass(frozen=True)
+class _RowContext:
+    """Contexte immuable pour la construction d'une ligne de résultat."""
+    cp: float
+    atr_val: float
+    sym_d: str
+    tf_name: str
+    df_len: int
+    profile: InstrumentProfile
+
+
+def _make_row(z: dict, ztype: str, ctx: _RowContext) -> Dict[str, Any]:
+    """Construit un dictionnaire-ligne pour les DataFrames de résultats."""
+    dist = abs(ctx.cp - z["level"]) / ctx.cp * 100 if ctx.cp else 0.0
+    dist_atr = (
+        f"{round(abs(ctx.cp - z['level']) / ctx.atr_val, 1)}x"
+        if (ctx.atr_val and ctx.atr_val > 0)
+        else "N/A"
+    )
+    in_pdf = dist <= ctx.profile.pdf_max_dist_pct
     return {
-        "Actif": sym_d,
-        "Prix Actuel": f"{cp:.5f}" if cp else "N/A",
+        "Actif": ctx.sym_d,
+        "Prix Actuel": f"{ctx.cp:.5f}" if ctx.cp else "N/A",
         "Type": ztype,
         "Niveau": f"{z['level']:.5f}",
         "Force": f"{z['strength']} touches",
-        "Score (1TF)": compute_structural_score(z["strength"], 1, tf_name, z["age_bars"], df_len),
+        "Score (1TF)": compute_structural_score(
+            z["strength"], 1, ctx.tf_name, z["age_bars"], ctx.df_len,
+        ),
         "Statut": z["status"],
         "Dist. %": f"{dist:.2f}%",
         "Dist. ATR": dist_atr,
@@ -953,17 +970,95 @@ def _process_tf_frame(
     zone_pair = (sup, res)
     price_ctx = _build_daily_price_context(cp, sup, res) if tf_k == "daily" else ""
 
+    row_ctx = _RowContext(cp=cp, atr_val=atr_val, sym_d=sym_d,
+                          tf_name=tf_name, df_len=len(df), profile=profile)
     tf_r = (
-        [_make_row(z, "PIVOT" if z.get("near_price") else "Support",
-                   cp, atr_val, sym_d, tf_name, len(df), profile)
+        [_make_row(z, "PIVOT" if z.get("near_price") else "Support", row_ctx)
          for _, z in sup.iterrows()]
-        + [_make_row(z, "PIVOT" if z.get("near_price") else "Resistance",
-                     cp, atr_val, sym_d, tf_name, len(df), profile)
+        + [_make_row(z, "PIVOT" if z.get("near_price") else "Resistance", row_ctx)
            for _, z in res.iterrows()]
     )
     seen: Set[Tuple[str, str]] = set()
     uniq = [r for r in tf_r if (key := (r["Niveau"], r["Type"])) not in seen and not seen.add(key)]
     return (uniq if uniq else None), zone_pair, price_ctx
+
+
+def _validate_price_bounds(
+    sym: str, cp_live: float, profile: InstrumentProfile,
+) -> Optional[ScanResult]:
+    """Retourne un ScanResult d'erreur si le prix live est hors bornes du profil, sinon None."""
+    if profile.price_min is not None and cp_live < profile.price_min:
+        return ScanResult(
+            sym, {}, {}, cp_live, {}, {},
+            scan_error=(
+                f"PRIX HORS BORNES ({cp_live:.2f} < {profile.price_min:.0f})"
+                " — instrument OANDA mal configuré"
+            ),
+        )
+    if profile.price_max is not None and cp_live > profile.price_max:
+        return ScanResult(
+            sym, {}, {}, cp_live, {}, {},
+            scan_error=(
+                f"PRIX HORS BORNES ({cp_live:.2f} > {profile.price_max:.0f})"
+                " — instrument OANDA mal configuré"
+            ),
+        )
+    return None
+
+
+def _resolve_working_price(
+    cp_live: Optional[float],
+    data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
+    sym: str,
+) -> Tuple[Optional[float], bool]:
+    """Retourne (cp, price_is_fallback). Fallback sur le dernier close si le live est absent."""
+    if cp_live and cp_live > 0:
+        return cp_live, False
+    for tf_k in ("daily", "h4", "weekly"):
+        df = data_cube.get(sym, {}).get(tf_k)
+        if df is not None and not df.empty:
+            return float(df["close"].iloc[-1]), True
+    return None, False
+
+
+def _collect_tf_data(
+    sym: str,
+    data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
+    cp: float,
+    profile: InstrumentProfile,
+    min_touches_ui: int,
+    sym_d: str,
+) -> Tuple[Dict, Dict, Dict, Dict, str, List[str]]:
+    """Collecte zones, tendances, bars_map et price_ctx pour les 3 timeframes.
+
+    Retourne: (rows, zones_d, trends, bars_map, price_ctx, missing_tfs)
+    """
+    rows: Dict[str, Optional[list]] = {"H4": None, "Daily": None, "Weekly": None}
+    zones_d: Dict[str, tuple] = {}
+    trends: Dict[str, str] = {}
+    bars_map: Dict[str, int] = {}
+    price_ctx = ""
+    missing_tfs: List[str] = []
+
+    for tf_k, tf_name in (("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")):
+        df = data_cube.get(sym, {}).get(tf_k)
+        if df is None or df.empty:
+            missing_tfs.append(tf_name)
+            continue
+        bars_map[tf_name] = len(df)
+        lb, th = _TF_TREND_PARAMS.get(tf_name, (20, 2.0))
+        trends[tf_name] = compute_institutional_trend(df["close"], lookback=lb, threshold=th)
+        tf_rows, zone_pair, ctx = _process_tf_frame(
+            sym, tf_k, tf_name, df, cp, min_touches_ui, profile, sym_d,
+        )
+        if zone_pair is not None:
+            zones_d[tf_name] = zone_pair
+        if tf_rows is not None:
+            rows[tf_name] = tf_rows
+        if ctx:
+            price_ctx = ctx
+
+    return rows, zones_d, trends, bars_map, price_ctx, missing_tfs
 
 
 def _process_symbol(
@@ -972,53 +1067,28 @@ def _process_symbol(
     data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
     min_touches_ui: int,
 ) -> ScanResult:
+    """Orchestre l'analyse complète d'un symbole : validation, collecte TF, anomalies."""
     profile = get_profile(sym)
 
+    # 1. Validation bornes prix (retour court si hors bornes)
     if cp_live is not None and cp_live > 0:
-        if profile.price_min is not None and cp_live < profile.price_min:
-            return ScanResult(
-                sym, {}, {}, cp_live, {}, {},
-                scan_error=f"PRIX HORS BORNES ({cp_live:.2f} < {profile.price_min:.0f}) — instrument OANDA mal configuré",
-            )
-        if profile.price_max is not None and cp_live > profile.price_max:
-            return ScanResult(
-                sym, {}, {}, cp_live, {}, {},
-                scan_error=f"PRIX HORS BORNES ({cp_live:.2f} > {profile.price_max:.0f}) — instrument OANDA mal configuré",
-            )
+        err = _validate_price_bounds(sym, cp_live, profile)
+        if err is not None:
+            return err
 
     sym_d = sym.replace("_", "/")
-    cp: Optional[float] = cp_live
-    price_is_fallback = False
 
-    rows: Dict[str, Optional[list]] = {"H4": None, "Daily": None, "Weekly": None}
-    zones_d: Dict[str, tuple] = {}
-    trends: Dict[str, str] = {}
-    bars_map: Dict[str, int] = {}
-    price_ctx = ""
-    missing_tfs: List[str] = []
+    # 2. Prix de travail (live ou fallback close)
+    cp, price_is_fallback = _resolve_working_price(cp_live, data_cube, sym)
+    if cp is None:
+        return ScanResult(sym, {}, {}, None, {}, {}, scan_error="Aucune donnée disponible (prix + bougies)")
 
-    for tf_k, tf_name in [("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")]:
-        df = data_cube.get(sym, {}).get(tf_k)
-        if df is None or df.empty:
-            missing_tfs.append(tf_name)
-            continue
+    # 3. Collecte multi-TF
+    rows, zones_d, trends, bars_map, price_ctx, missing_tfs = _collect_tf_data(
+        sym, data_cube, cp, profile, min_touches_ui, sym_d,
+    )
 
-        if not cp:
-            cp = float(df["close"].iloc[-1])
-            price_is_fallback = True
-
-        bars_map[tf_name] = len(df)
-        lb, th = _TF_TREND_PARAMS.get(tf_name, (20, 2.0))
-        trends[tf_name] = compute_institutional_trend(df["close"], lookback=lb, threshold=th)
-
-        tf_rows, zone_pair, ctx = _process_tf_frame(sym, tf_k, tf_name, df, cp, min_touches_ui, profile, sym_d)
-        if zone_pair is not None:
-            zones_d[tf_name] = zone_pair
-        if tf_rows is not None:
-            rows[tf_name] = tf_rows
-        if ctx:
-            price_ctx = ctx
-
+    # 4. Détection anomalies
     sup_levels: List[float] = [
         lvl
         for _s, _r in zones_d.values()
@@ -1029,7 +1099,7 @@ def _process_symbol(
     last_close = float(daily_df["close"].iloc[-1]) if (daily_df is not None and not daily_df.empty) else None
     anomaly = flag_data_anomaly(sym, cp, sup_levels, last_candle_close=last_close)
 
-    if price_is_fallback and cp is not None:
+    if price_is_fallback:
         pf_msg = f"Prix live indisponible — utilisation du dernier close ({cp:.5f})"
         anomaly = f"{anomaly} | {pf_msg}" if anomaly else pf_msg
 
@@ -1207,11 +1277,11 @@ def strip_emojis_df(df: pd.DataFrame) -> pd.DataFrame:
 class PDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 15)
-        self.cell(0, 10,
+        self.cell(0, 10,                                                            # pylint: disable=unexpected-keyword-arg
                   _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'),
                   border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
-        self.cell(0, 6,
+        self.cell(0, 6,                                                             # pylint: disable=unexpected-keyword-arg
                   _safe_pdf_str(
                       f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
                       f"v{SCANNER_VERSION}  |  "
@@ -1228,7 +1298,8 @@ class PDF(FPDF):
 
     def chapter_title(self, title):
         self.set_font('Helvetica', 'B', 12)
-        self.cell(0, 10, _safe_pdf_str(title), border=0, align='L', new_x='LMARGIN', new_y='NEXT')
+        self.cell(0, 10, _safe_pdf_str(title), border=0, align='L',  # pylint: disable=unexpected-keyword-arg
+                  new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
 
     def chapter_anomalies(self, anomalies: dict):
@@ -1236,7 +1307,7 @@ class PDF(FPDF):
             return
         self.set_font('Helvetica', 'B', 10)
         self.cell(0, 7, _safe_pdf_str('ALERTES ANOMALIES PRIX'),
-                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')
+                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')  # pylint: disable=unexpected-keyword-arg
         self.ln(2)
         self.set_font('Helvetica', '', 8)
         for sym, msg in anomalies.items():
@@ -1246,7 +1317,7 @@ class PDF(FPDF):
 
     def chapter_summary(self, summaries):
         self.set_font('Helvetica', 'B', 10)
-        self.cell(0, 7,
+        self.cell(0, 7,                                                             # pylint: disable=unexpected-keyword-arg
                   _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'),
                   border=0, align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(2)
@@ -1257,12 +1328,13 @@ class PDF(FPDF):
             t_w = _safe_pdf_str(s.get('trend_weekly', 'N/A'))
             ctx = _safe_pdf_str(s.get('price_context', ''))
             self.set_font('Helvetica', 'B', 8)
-            self.cell(0, 5,
+            self.cell(0, 5,                                                         # pylint: disable=unexpected-keyword-arg
                       _safe_pdf_str(f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}"),
                       border=0, new_x='LMARGIN', new_y='NEXT')
             if ctx:
                 self.set_font('Helvetica', 'I', 7)
-                self.cell(0, 4, f"  Position : {ctx[:120]}", border=0, new_x='LMARGIN', new_y='NEXT')
+                self.cell(0, 4, f"  Position : {ctx[:120]}",                       # pylint: disable=unexpected-keyword-arg
+                          border=0, new_x='LMARGIN', new_y='NEXT')
             top = s.get('top_zones', [])
             self.set_font('Helvetica', '', 7)
             if top:
@@ -1276,9 +1348,10 @@ class PDF(FPDF):
                     txt = _safe_pdf_str(
                         f"  {sig}  Niv:{niv}  Dist:{dist}  Score:{sc}  TF:{tfs}  {ale}"
                     )
-                    self.cell(0, 4, txt[:130], border=0, new_x='LMARGIN', new_y='NEXT')
+                    self.cell(0, 4, txt[:130],                                      # pylint: disable=unexpected-keyword-arg
+                              border=0, new_x='LMARGIN', new_y='NEXT')
             else:
-                self.cell(0, 4, "  Aucune confluence pour cet actif.",
+                self.cell(0, 4, "  Aucune confluence pour cet actif.",              # pylint: disable=unexpected-keyword-arg
                           border=0, new_x='LMARGIN', new_y='NEXT')
             self.ln(1)
 
@@ -1364,7 +1437,7 @@ def _hash_results_dict(d: Dict[str, pd.DataFrame]) -> str:
             parts.append(f"{k}:empty")
         else:
             parts.append(f"{k}:{len(v)}:{hash(tuple(v.columns)) if hasattr(v, 'columns') else 'x'}")
-    return hashlib.md5("|".join(parts).encode()).hexdigest()
+    return hashlib.md5("|".join(parts).encode(), usedforsecurity=False).hexdigest()
 
 
 def _hash_list_of_dicts(lst: List[Dict[str, Any]]) -> str:
@@ -1375,14 +1448,15 @@ def _hash_list_of_dicts(lst: List[Dict[str, Any]]) -> str:
             [{k: str(v)[:50] for k, v in d.items() if not isinstance(v, (pd.DataFrame, pd.Series))}
              for d in lst],
             sort_keys=True, default=str,
-        ).encode()
+        ).encode(),
+        usedforsecurity=False,
     ).hexdigest()
 
 
 def _hash_anomalies(d: Dict[str, str]) -> str:
     if not d:
         return "no_anom"
-    return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()
+    return hashlib.md5(json.dumps(d, sort_keys=True).encode(), usedforsecurity=False).hexdigest()
 
 
 @st.cache_data(ttl=300, max_entries=8, show_spinner=False,
@@ -2297,3 +2371,4 @@ elif not st.session_state.get("pending_scan", False) and not st.session_state.ge
 
 if "scan_results" in st.session_state and not st.session_state.get("pending_scan", False):
     _display_results(st.session_state["scan_results"], max_dist_filter)
+ 
