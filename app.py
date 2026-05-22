@@ -102,7 +102,7 @@ def _cache_set(symbol: str, tf: str, df: Optional[pd.DataFrame]) -> None:
         _cache_purge_stale_locked()
 
 
-SCANNER_VERSION = "8.1-PROD"
+SCANNER_VERSION = "8.2-PROD"
 
 ALL_SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -167,8 +167,29 @@ def get_profile(symbol: str) -> InstrumentProfile:
 # ==============================================================================
 # [ LAYER 2: ASYNC DATA PIPELINE (OANDA) ]
 # ==============================================================================
-class OandaAuthError(Exception):
-    """Levée quand l'authentification OANDA échoue."""
+def _is_valid_candle_dict(c: dict) -> bool:
+    """AUD-013 : validation défensive d'une bougie OANDA brute.
+    Vérifie la cohérence OHLC : low > 0, high >= low, low <= open/close <= high.
+    Retourne False sur toute incohérence ou valeur non parsable."""
+    try:
+        mid = c["mid"]
+        o = float(mid["o"])
+        h = float(mid["h"])
+        l = float(mid["l"])
+        cl = float(mid["c"])
+    except (KeyError, ValueError, TypeError):
+        return False
+    if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(l) and np.isfinite(cl)):
+        return False
+    if l <= 0:
+        return False
+    if h < l:
+        return False
+    if not (l <= o <= h):
+        return False
+    if not (l <= cl <= h):
+        return False
+    return True
 
 
 class AsyncOandaClient:
@@ -176,6 +197,44 @@ class AsyncOandaClient:
         self.headers = {"Authorization": f"Bearer {token}"}
         self.account_id = account_id
         self.env_url: Optional[str] = None
+
+    @staticmethod
+    async def _get_json_with_retry(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        session: aiohttp.ClientSession,
+        url: str,
+        headers: dict,
+        params: dict,
+        timeout_total: float,
+        retries: int = 3,
+    ) -> Optional[dict]:
+        """AUD-012 : retry avec backoff exponentiel sur 429/5xx et erreurs réseau.
+        Retourne le JSON décodé ou None après épuisement des tentatives."""
+        backoff = 0.5
+        for attempt in range(retries):
+            try:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=timeout_total),
+                ) as r:
+                    if r.status == 200:
+                        return await r.json()
+                    if r.status in (429, 500, 502, 503, 504):
+                        if attempt < retries - 1:
+                            await asyncio.sleep(backoff * (2 ** attempt))
+                            continue
+                        return None
+                    # Erreur non-rejouable (4xx hors 429) → abandon immédiat
+                    return None
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                if attempt < retries - 1:
+                    logging.debug("Retry %d/%d for %s after %s: %s",
+                                  attempt + 1, retries, url, type(e).__name__, e)
+                    await asyncio.sleep(backoff * (2 ** attempt))
+                    continue
+                return None
+        return None
 
     async def initialize(self, session: aiohttp.ClientSession) -> bool:
         for url in ["https://api-fxpractice.oanda.com", "https://api-fxtrade.oanda.com"]:
@@ -211,37 +270,33 @@ class AsyncOandaClient:
         params = {"count": limit + 1, "granularity": gran, "price": "M"}
 
         async with sem:
-            try:
-                async with session.get(
-                    url,
-                    headers=self.headers,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    if r.status != 200:
-                        return symbol, tf, None
-                    data = await r.json()
-                    candles = [
-                        {
-                            "date": pd.to_datetime(c["time"]),
-                            "open": float(c["mid"]["o"]),
-                            "high": float(c["mid"]["h"]),
-                            "low": float(c["mid"]["l"]),
-                            "close": float(c["mid"]["c"]),
-                            "volume": int(c["volume"]),
-                        }
-                        for c in data.get("candles", [])
-                        if c.get("complete")
-                    ]
-                    if not candles:
-                        _cache_set(symbol, tf, None)
-                        return symbol, tf, None
-                    df = pd.DataFrame(candles).tail(limit).set_index("date")
-                    result_df = df if not df.empty else None
-                    _cache_set(symbol, tf, result_df)
-                    return symbol, tf, result_df
-            except (aiohttp.ClientError, OSError, asyncio.TimeoutError, KeyError, ValueError):
+            data = await self._get_json_with_retry(
+                session, url, self.headers, params, timeout_total=10, retries=3
+            )
+            if data is None:
                 return symbol, tf, None
+            try:
+                candles = [
+                    {
+                        "date": pd.to_datetime(c["time"]),
+                        "open": float(c["mid"]["o"]),
+                        "high": float(c["mid"]["h"]),
+                        "low": float(c["mid"]["l"]),
+                        "close": float(c["mid"]["c"]),
+                        "volume": int(c["volume"]),
+                    }
+                    for c in data.get("candles", [])
+                    if c.get("complete") and _is_valid_candle_dict(c)  # AUD-013
+                ]
+            except (KeyError, ValueError, TypeError) as e:
+                logging.warning("Candle parse error for %s/%s: %s", symbol, tf, e)
+                return symbol, tf, None
+            if not candles:
+                return symbol, tf, None
+            df = pd.DataFrame(candles).tail(limit).set_index("date")
+            result_df = df if not df.empty else None
+            _cache_set(symbol, tf, result_df)
+            return symbol, tf, result_df
 
     async def fetch_price(
         self,
@@ -251,21 +306,18 @@ class AsyncOandaClient:
     ) -> Tuple[str, Optional[float]]:
         url = f"{self.env_url}/v3/accounts/{self.account_id}/pricing"
         async with sem:
+            data = await self._get_json_with_retry(
+                session, url, self.headers, {"instruments": symbol},
+                timeout_total=5, retries=3,
+            )
+            if data is None:
+                return symbol, None
             try:
-                async with session.get(
-                    url,
-                    headers=self.headers,
-                    params={"instruments": symbol},
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as r:
-                    if r.status != 200:
-                        return symbol, None
-                    data = await r.json()
-                    if "prices" in data and data["prices"]:
-                        bid = float(data["prices"][0]["closeoutBid"])
-                        ask = float(data["prices"][0]["closeoutAsk"])
-                        return symbol, (bid + ask) / 2
-            except (aiohttp.ClientError, OSError, asyncio.TimeoutError, KeyError, ValueError):
+                if "prices" in data and data["prices"]:
+                    bid = float(data["prices"][0]["closeoutBid"])
+                    ask = float(data["prices"][0]["closeoutAsk"])
+                    return symbol, (bid + ask) / 2
+            except (KeyError, ValueError, TypeError):
                 pass
         return symbol, None
 
@@ -803,10 +855,19 @@ async def _fetch_live_prices(
     sem: asyncio.Semaphore,
     symbols: List[str],
 ) -> Dict[str, Optional[float]]:
-    """Récupère les prix live pour tous les symboles en parallèle."""
+    """Récupère les prix live pour tous les symboles en parallèle.
+    AUD-002 : return_exceptions=True pour qu'une seule erreur ne tue pas tout le scan."""
     price_tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
-    prices_res = await asyncio.gather(*price_tasks)
-    return dict(prices_res)
+    prices_res = await asyncio.gather(*price_tasks, return_exceptions=True)
+    out: Dict[str, Optional[float]] = {}
+    for sym, item in zip(symbols, prices_res):
+        if isinstance(item, Exception):
+            logging.error("Price fetch exception for %s: %s", sym, item)
+            out[sym] = None
+        else:
+            # item == (symbol, price)
+            out[item[0]] = item[1]
+    return out
 
 
 async def _fetch_candles_cube(
@@ -816,15 +877,20 @@ async def _fetch_candles_cube(
     symbols: List[str],
 ) -> Dict[str, Dict[str, Optional[pd.DataFrame]]]:
     """Récupère toutes les bougies (symboles × timeframes) et les organise
-    en un cube data_cube[symbol][tf]."""
+    en un cube data_cube[symbol][tf].
+    AUD-002 : return_exceptions=True pour résilience."""
     candle_tasks = [
         client.fetch_candles(session, sem, sym, tf)
         for sym in symbols
         for tf in _GRANULARITY_MAP
     ]
-    candles_res = await asyncio.gather(*candle_tasks)
+    candles_res = await asyncio.gather(*candle_tasks, return_exceptions=True)
     data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]] = {}
-    for sym, tf, df in candles_res:
+    for item in candles_res:
+        if isinstance(item, Exception):
+            logging.error("Candle fetch exception: %s", item)
+            continue
+        sym, tf, df = item
         data_cube.setdefault(sym, {})[tf] = df
     return data_cube
 
@@ -1015,7 +1081,7 @@ def _safe_pdf_str(text: str) -> str:
 
 
 def _sanitize_traceback(tb: str, sensitive_values: list) -> str:  # pylint: disable=redefined-outer-name
-    """FIX SEC-001 : sanitization stricte par regex de chaque secret entier."""
+    """FIX SEC-001 : sanitization regex stricte de chaque secret entier."""
     if not tb:
         return tb
     for val in sensitive_values:
@@ -1955,6 +2021,10 @@ with st.sidebar:
     st.caption("✅ AUD-003 — Cache négatif supprimé : None jamais stocké, retry possible")
     st.caption("✅ AUD-005/006 — Type zone structurel (majorité highs/lows), indices directs sans re-lookup flottant")
     st.caption("✅ AUD-009 — Hiérarchie statuts corrigée : Vierge < Testee < Role Reverse < Consommee")
+    st.caption("✅ AUD-002 — return_exceptions=True : résilience aux pannes partielles OANDA")
+    st.caption("✅ AUD-012 — Retry + backoff exponentiel sur 429/5xx (3 tentatives)")
+    st.caption("✅ AUD-013 — Validation OHLC des bougies (low>0, h>=l, l<=o,c<=h)")
+    st.caption("✅ AUD-017 — Token de scan unique anti-double-clic")
 
 
 def _collect_scan_results(raw_results: list, progress_bar) -> dict:  # pylint: disable=redefined-outer-name,too-many-locals
@@ -2081,78 +2151,92 @@ def _build_summaries(  # pylint: disable=redefined-outer-name,too-many-arguments
 # LOGIQUE PRINCIPALE
 # ==============================================================================
 if scan_button and symbols_to_scan and not st.session_state.get("scanning", False):
+    # AUD-017 : token unique pour neutraliser les double-clics ultra-rapides.
+    # Le pending_scan ne sera consommé que si le token correspond.
     st.session_state.pop("scan_results", None)
     st.session_state["scanning"] = True
     st.session_state["pending_scan"] = True
+    st.session_state["scan_token"] = f"{time.time():.6f}"
     st.rerun()
 
 if st.session_state.get("pending_scan", False) and symbols_to_scan:
-    st.session_state.pop("pending_scan", None)
-
-    if not access_token or not account_id:
+    # AUD-017 : on ne consomme le pending que si un token existe (cohérence d'état)
+    current_token = st.session_state.get("scan_token")
+    if not current_token:
+        # État incohérent : nettoyage défensif
+        st.session_state.pop("pending_scan", None)
         st.session_state["scanning"] = False
-        st.warning("Configurez vos secrets OANDA avant de lancer le scan.")
     else:
-        progress_bar = st.progress(0, text="Initialisation du scan async…")
+        st.session_state.pop("pending_scan", None)
 
-        try:
-            with st.spinner("Pipeline async I/O en cours…"):
-                raw_results = asyncio.run(
-                    run_institutional_scan(symbols_to_scan, access_token, account_id, min_touches)
-                )
-        except OandaAuthError as e:
-            st.error(str(e))
+        if not access_token or not account_id:
             st.session_state["scanning"] = False
-            st.stop()
-        except Exception as e:  # pylint: disable=broad-except
-            tb = _sanitize_traceback(traceback.format_exc(), [access_token, account_id])
-            logging.exception("Scan failure")
-            st.error(f"Erreur inattendue : {type(e).__name__} — {tb[-400:]}")
-            st.session_state["scanning"] = False
-            st.stop()
-
-        collected = _collect_scan_results(raw_results, progress_bar)
-        progress_bar.empty()
-        st.session_state["scanning"] = False
-
-        n_ok = len(symbols_to_scan) - len(collected["scan_errors"])
-        n_failures = len(collected["scan_errors"])  # pylint: disable=invalid-name
-        if n_failures == 0:
-            st.success(f"✅ Scan terminé — {n_ok} actifs analysés avec succès.")
+            st.session_state.pop("scan_token", None)
+            st.warning("Configurez vos secrets OANDA avant de lancer le scan.")
         else:
-            st.warning(f"⚠️ Scan terminé — {n_ok} actifs OK, {n_failures} en erreur.")
-        if collected["anomalies_map"]:
-            st.warning(f"⚠️ {len(collected['anomalies_map'])} anomalie(s) de prix détectée(s).")
-        if collected["missing_tfs_map"]:
-            st.info(f"📡 {len(collected['missing_tfs_map'])} actif(s) avec des TFs manquants.")
+            progress_bar = st.progress(0, text="Initialisation du scan async…")
 
-        st.info("🔍 Analyse des confluences multi-timeframes…")
-        conf_full = _compute_confluences(
-            symbols_to_scan,
-            collected["all_zones_map"], collected["prices_map"],
-            collected["bars_map_global"], confluence_threshold, collected["scan_errors"],
-        )
-        summaries = _build_summaries(
-            symbols_to_scan,
-            collected["prices_map"], collected["trends_map"], collected["all_zones_map"],
-            conf_full, collected["missing_tfs_map"], collected["price_fallback_map"],
-        )
+            try:
+                with st.spinner("Pipeline async I/O en cours…"):
+                    raw_results = asyncio.run(
+                        run_institutional_scan(symbols_to_scan, access_token, account_id, min_touches)
+                    )
+            except OandaAuthError as e:
+                st.error(str(e))
+                st.session_state["scanning"] = False
+                st.session_state.pop("scan_token", None)
+                st.stop()
+            except Exception as e:  # pylint: disable=broad-except
+                tb = _sanitize_traceback(traceback.format_exc(), [access_token, account_id])
+                logging.exception("Scan failure")
+                st.error(f"Erreur inattendue : {type(e).__name__} — {tb[-400:]}")
+                st.session_state["scanning"] = False
+                st.session_state.pop("scan_token", None)
+                st.stop()
 
-        df_h4 = pd.DataFrame(collected["results_h4"])
-        df_daily = pd.DataFrame(collected["results_daily"])
-        df_wk = pd.DataFrame(collected["results_weekly"])
-        rep_dict = {
-            "H4": _apply_pdf_filter(df_h4),
-            "Daily": _apply_pdf_filter(df_daily),
-            "Weekly": _apply_pdf_filter(df_wk),
-        }
-        st.session_state["scan_results"] = {
-            "df_h4": df_h4, "df_daily": df_daily, "df_weekly": df_wk,
-            "conf_full": conf_full, "report_dict": rep_dict,
-            "summaries": summaries, "anomalies": collected["anomalies_map"],
-            "scan_errors": collected["scan_errors"], "max_dist": max_dist_filter,
-            "missing_tfs_map": collected["missing_tfs_map"],
-        }
+            collected = _collect_scan_results(raw_results, progress_bar)
+            progress_bar.empty()
+            st.session_state["scanning"] = False
+            st.session_state.pop("scan_token", None)
+
+            n_ok = len(symbols_to_scan) - len(collected["scan_errors"])
+            n_failures = len(collected["scan_errors"])  # pylint: disable=invalid-name
+            if n_failures == 0:
+                st.success(f"✅ Scan terminé — {n_ok} actifs analysés avec succès.")
+            else:
+                st.warning(f"⚠️ Scan terminé — {n_ok} actifs OK, {n_failures} en erreur.")
+            if collected["anomalies_map"]:
+                st.warning(f"⚠️ {len(collected['anomalies_map'])} anomalie(s) de prix détectée(s).")
+            if collected["missing_tfs_map"]:
+                st.info(f"📡 {len(collected['missing_tfs_map'])} actif(s) avec des TFs manquants.")
+
+            st.info("🔍 Analyse des confluences multi-timeframes…")
+            conf_full = _compute_confluences(
+                symbols_to_scan,
+                collected["all_zones_map"], collected["prices_map"],
+                collected["bars_map_global"], confluence_threshold, collected["scan_errors"],
+            )
+            summaries = _build_summaries(
+                symbols_to_scan,
+                collected["prices_map"], collected["trends_map"], collected["all_zones_map"],
+                conf_full, collected["missing_tfs_map"], collected["price_fallback_map"],
+            )
+
+            df_h4 = pd.DataFrame(collected["results_h4"])
+            df_daily = pd.DataFrame(collected["results_daily"])
+            df_wk = pd.DataFrame(collected["results_weekly"])
+            rep_dict = {
+                "H4": _apply_pdf_filter(df_h4),
+                "Daily": _apply_pdf_filter(df_daily),
+                "Weekly": _apply_pdf_filter(df_wk),
+            }
+            st.session_state["scan_results"] = {
+                "df_h4": df_h4, "df_daily": df_daily, "df_weekly": df_wk,
+                "conf_full": conf_full, "report_dict": rep_dict,
+                "summaries": summaries, "anomalies": collected["anomalies_map"],
+                "scan_errors": collected["scan_errors"], "max_dist": max_dist_filter,
+                "missing_tfs_map": collected["missing_tfs_map"],
+            }
 
 elif not symbols_to_scan and not st.session_state.get("scanning", False):
     st.info("Sélectionnez des actifs à scanner dans la barre latérale.")
