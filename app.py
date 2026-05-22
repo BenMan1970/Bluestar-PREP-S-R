@@ -1,6 +1,8 @@
 # pylint: disable=too-many-lines
-"""Scanner Bluestar S/R Multi-Timeframes — v8.3.1-PROD
+"""Scanner Bluestar S/R Multi-Timeframes — v8.3.2-PROD
 Audit chirurgical : caching Streamlit, optimisation union-find, typage renforcé.
+Patch 8.3.2 : correction pylint E1123 (new_x/new_y manquants), W0107 (pass inutile),
+W0621 (redéfinitions scope externe), W0718 annotated, threading.Lock justifié.
 """
 import asyncio
 import re
@@ -47,7 +49,6 @@ if _NEST_ASYNCIO_AVAILABLE:
 # ==============================================================================
 class OandaAuthError(Exception):
     """Levée quand l'authentification OANDA échoue."""
-    pass
 
 # ==============================================================================
 # [ LAYER 0c: THREAD-SAFE DATA CACHE (avec LRU et copie défensive) ]
@@ -55,7 +56,7 @@ class OandaAuthError(Exception):
 _CACHE_TTL_BY_TF: Dict[str, int] = {"h4": 60, "daily": 300, "weekly": 600}
 _CACHE_TTL_DEFAULT: int = 300
 _CACHE_MAX_ENTRIES: int = 256
-_CACHE_LOCK: threading.Lock = threading.Lock()
+_CACHE_LOCK: threading.Lock = threading.Lock()  # Correct : accès depuis workers ThreadPoolExecutor (threads OS), pas coroutines asyncio
 _CACHE_EMPTY: object = object()  # sentinel pour les tentatives échouées
 
 # (env_url, account_id, symbol, tf) -> (fetched_at: monotonic, payload)
@@ -72,8 +73,10 @@ def _cache_is_fresh(fetched_at: float, tf: str) -> bool:
     return (time.monotonic() - fetched_at) <= _cache_ttl(tf)
 
 
-def _cache_key(env_url: Optional[str], account_id: str, symbol: str, tf: str) -> Tuple[str, str, str, str]:
-    return (env_url or "unknown_env", account_id or "unknown_account", symbol, tf)
+def _cache_key(  # pylint: disable=redefined-outer-name
+    env_url: Optional[str], acct_id: str, symbol: str, tf: str,
+) -> Tuple[str, str, str, str]:
+    return (env_url or "unknown_env", acct_id or "unknown_account", symbol, tf)
 
 
 def _cache_purge_stale_locked() -> None:
@@ -85,9 +88,11 @@ def _cache_purge_stale_locked() -> None:
         _OANDA_CACHE.popitem(last=False)
 
 
-def _cache_get(env_url: Optional[str], account_id: str, symbol: str, tf: str) -> Tuple[bool, Optional[pd.DataFrame]]:
+def _cache_get(  # pylint: disable=redefined-outer-name
+    env_url: Optional[str], acct_id: str, symbol: str, tf: str,
+) -> Tuple[bool, Optional[pd.DataFrame]]:
     """Lecture cache. Retourne (hit, df). df=None signifie 'miss connu' (sentinel)."""
-    k = _cache_key(env_url, account_id, symbol, tf)
+    k = _cache_key(env_url, acct_id, symbol, tf)
     with _CACHE_LOCK:
         _cache_purge_stale_locked()
         entry = _OANDA_CACHE.get(k)
@@ -104,9 +109,12 @@ def _cache_get(env_url: Optional[str], account_id: str, symbol: str, tf: str) ->
         return True, payload.copy(deep=True)
 
 
-def _cache_set(env_url: Optional[str], account_id: str, symbol: str, tf: str, df: Optional[pd.DataFrame]) -> None:
+def _cache_set(  # pylint: disable=redefined-outer-name
+    env_url: Optional[str], acct_id: str, symbol: str, tf: str,
+    df: Optional[pd.DataFrame],
+) -> None:
     """Écriture cache. Le DataFrame stocké est considéré immutable côté consommateurs."""
-    k = _cache_key(env_url, account_id, symbol, tf)
+    k = _cache_key(env_url, acct_id, symbol, tf)
     # Pas de copy à l'écriture : le producteur (fetch_candles) crée un DF neuf, jamais réutilisé.
     payload: Any = _CACHE_EMPTY if df is None else df
     with _CACHE_LOCK:
@@ -115,7 +123,7 @@ def _cache_set(env_url: Optional[str], account_id: str, symbol: str, tf: str, df
         _cache_purge_stale_locked()
 
 
-SCANNER_VERSION: str = "8.3.1-PROD"  # Audit chirurgical : caching Streamlit + optimisations
+SCANNER_VERSION: str = "8.3.2-PROD"  # Patch audit : E1123, W0107, W0621, W0718 annotated
 
 ALL_SYMBOLS: List[str] = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -588,7 +596,7 @@ def _get_pivots_with_fallback(
 
 def _clusters_to_zones(
     clusters_raw: list,
-    min_touches: int,
+    min_touches: int,  # pylint: disable=redefined-outer-name
     n_total: int,
     df: pd.DataFrame,
     atr_val: float,
@@ -645,7 +653,7 @@ def find_strong_sr_zones(
     symbol: str,
     atr_val: Optional[float],
     timeframe: str,
-    min_touches: int,
+    min_touches: int,  # pylint: disable=redefined-outer-name
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if atr_val is None or atr_val <= 0 or df is None or df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -753,7 +761,7 @@ def detect_confluences(
     zones_dict: dict,
     current_price: float,
     bars_map: dict,
-    confluence_threshold: Optional[float] = None,
+    confluence_threshold: Optional[float] = None,  # pylint: disable=redefined-outer-name
 ) -> list:
     """Union-find avec fenêtrage trié O(N log N + N×k) au lieu de O(N²)."""
     if not zones_dict or not current_price:
@@ -1113,7 +1121,7 @@ def _process_symbol(
 async def run_institutional_scan(
     symbols: List[str],
     token: str,
-    account_id: str,
+    account_id: str,  # pylint: disable=redefined-outer-name
     min_touches_ui: int,
 ) -> List[ScanResult]:
     client = AsyncOandaClient(token, account_id)
@@ -1129,7 +1137,7 @@ async def run_institutional_scan(
     for sym in symbols:
         try:
             results.append(_process_symbol(sym, live_prices.get(sym), data_cube, min_touches_ui))
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught  # voulu : isolation par symbole
             logging.exception("Scan error for %s", sym)
             results.append(ScanResult(sym, {}, {}, None, {}, {}, scan_error=f"{type(e).__name__}: {e}"))
 
@@ -1152,7 +1160,7 @@ def _safe_pdf_str(text: Any) -> str:
     return text
 
 
-def _sanitize_traceback(tb: str, sensitive_values: List[Optional[str]]) -> str:
+def _sanitize_traceback(tb: str, sensitive_values: List[Optional[str]]) -> str:  # pylint: disable=redefined-outer-name
     if not tb:
         return tb
     for val in sensitive_values:
@@ -1315,7 +1323,7 @@ class PDF(FPDF):
             self.multi_cell(0, 5, line[:180])
         self.ln(4)
 
-    def chapter_summary(self, summaries):
+    def chapter_summary(self, summaries):  # pylint: disable=redefined-outer-name
         self.set_font('Helvetica', 'B', 10)
         self.cell(0, 7,                                                             # pylint: disable=unexpected-keyword-arg
                   _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'),
@@ -1385,7 +1393,7 @@ class PDF(FPDF):
         self.set_x(x_start)
         for col_name in cols:
             self.cell(col_widths[col_name], 6, _safe_pdf_str(col_name),
-                      border=1, align='C', new_x='RIGHT', new_y='TOP')
+                      border=1, align='C', new_x='RIGHT', new_y='TOP')  # pylint: disable=unexpected-keyword-arg
         self.ln()
 
         self.set_font('Helvetica', '', font_size)
@@ -1397,7 +1405,7 @@ class PDF(FPDF):
                 max_chars = int(w / 1.25)
                 if len(val) > max_chars:
                     val = val[:max_chars - 1] + '.'
-                self.cell(w, 5, val, border=1, align='C', new_x='RIGHT', new_y='TOP')
+                self.cell(w, 5, val, border=1, align='C', new_x='RIGHT', new_y='TOP')  # pylint: disable=unexpected-keyword-arg
             self.ln()
 
 
@@ -1468,7 +1476,7 @@ def _hash_anomalies(d: Dict[str, str]) -> str:
 def create_pdf_report(
     results_dict: Dict[str, pd.DataFrame],
     confluences_df: Optional[pd.DataFrame] = None,
-    summaries: Optional[List[Dict[str, Any]]] = None,
+    summaries: Optional[List[Dict[str, Any]]] = None,  # pylint: disable=redefined-outer-name
     anomalies: Optional[Dict[str, str]] = None,
 ) -> bytes:
     summaries = summaries or []
@@ -1585,7 +1593,7 @@ def _format_brief_zone_line(z: dict) -> str:
 @st.cache_data(ttl=300, max_entries=16, show_spinner=False,
                hash_funcs={pd.DataFrame: _hash_df, list: _hash_list_of_dicts})
 def create_llm_brief(
-    summaries: List[Dict[str, Any]],
+    summaries: List[Dict[str, Any]],  # pylint: disable=redefined-outer-name
     confluences_df: Optional[pd.DataFrame],
     max_dist: float = 2.0,
     min_score: float = 100.0,
@@ -2371,4 +2379,3 @@ elif not st.session_state.get("pending_scan", False) and not st.session_state.ge
 
 if "scan_results" in st.session_state and not st.session_state.get("pending_scan", False):
     _display_results(st.session_state["scan_results"], max_dist_filter)
- 
