@@ -1,4 +1,7 @@
 # pylint: disable=too-many-lines
+"""Scanner Bluestar S/R Multi-Timeframes — v8.3.1-PROD
+Audit chirurgical : caching Streamlit, optimisation union-find, typage renforcé.
+"""
 import asyncio
 import re
 import threading
@@ -8,6 +11,7 @@ try:
     _NEST_ASYNCIO_AVAILABLE = True
 except ImportError:
     _NEST_ASYNCIO_AVAILABLE = False
+import hashlib
 import json
 import logging
 import traceback
@@ -15,7 +19,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import Optional, Tuple, List, Dict, Set
+from typing import Any, Optional, Tuple, List, Dict, Set
 
 try:
     from zoneinfo import ZoneInfo
@@ -49,14 +53,15 @@ class OandaAuthError(Exception):
 # [ LAYER 0c: THREAD-SAFE DATA CACHE (avec LRU et copie défensive) ]
 # ==============================================================================
 _CACHE_TTL_BY_TF: Dict[str, int] = {"h4": 60, "daily": 300, "weekly": 600}
-_CACHE_TTL_DEFAULT = 300
-_CACHE_MAX_ENTRIES = 256
-_CACHE_LOCK = threading.Lock()
-_CACHE_EMPTY = object()  # sentinel pour les tentatives échouées
+_CACHE_TTL_DEFAULT: int = 300
+_CACHE_MAX_ENTRIES: int = 256
+_CACHE_LOCK: threading.Lock = threading.Lock()
+_CACHE_EMPTY: object = object()  # sentinel pour les tentatives échouées
 
-# (env_url, account_id, symbol, tf) -> (fetched_at: float, payload: object)
-# payload = pd.DataFrame copy OR _CACHE_EMPTY
-_OANDA_CACHE: OrderedDict = OrderedDict()
+# (env_url, account_id, symbol, tf) -> (fetched_at: monotonic, payload)
+# payload = pd.DataFrame (immutable par convention) OR _CACHE_EMPTY
+# Contrat : les consommateurs NE DOIVENT PAS muter les DataFrames retournés.
+_OANDA_CACHE: "OrderedDict[Tuple[str, str, str, str], Tuple[float, Any]]" = OrderedDict()
 
 
 def _cache_ttl(tf: str) -> int:
@@ -64,15 +69,15 @@ def _cache_ttl(tf: str) -> int:
 
 
 def _cache_is_fresh(fetched_at: float, tf: str) -> bool:
-    return (time.time() - fetched_at) <= _cache_ttl(tf)
+    return (time.monotonic() - fetched_at) <= _cache_ttl(tf)
 
 
-def _cache_key(env_url: Optional[str], account_id: str, symbol: str, tf: str) -> tuple:
+def _cache_key(env_url: Optional[str], account_id: str, symbol: str, tf: str) -> Tuple[str, str, str, str]:
     return (env_url or "unknown_env", account_id or "unknown_account", symbol, tf)
 
 
 def _cache_purge_stale_locked() -> None:
-    now = time.time()
+    now = time.monotonic()
     stale = [k for k, (ts, _) in _OANDA_CACHE.items() if (now - ts) > _cache_ttl(k[3])]
     for k in stale:
         _OANDA_CACHE.pop(k, None)
@@ -81,6 +86,7 @@ def _cache_purge_stale_locked() -> None:
 
 
 def _cache_get(env_url: Optional[str], account_id: str, symbol: str, tf: str) -> Tuple[bool, Optional[pd.DataFrame]]:
+    """Lecture cache. Retourne (hit, df). df=None signifie 'miss connu' (sentinel)."""
     k = _cache_key(env_url, account_id, symbol, tf)
     with _CACHE_LOCK:
         _cache_purge_stale_locked()
@@ -93,22 +99,25 @@ def _cache_get(env_url: Optional[str], account_id: str, symbol: str, tf: str) ->
             return False, None
         _OANDA_CACHE.move_to_end(k)
         if payload is _CACHE_EMPTY:
-            return True, None  # marqueur "donnée manquante connue"
+            return True, None
+        # Copie défensive en lecture uniquement (écriture suppose immutabilité)
         return True, payload.copy(deep=True)
 
 
 def _cache_set(env_url: Optional[str], account_id: str, symbol: str, tf: str, df: Optional[pd.DataFrame]) -> None:
+    """Écriture cache. Le DataFrame stocké est considéré immutable côté consommateurs."""
     k = _cache_key(env_url, account_id, symbol, tf)
-    payload = _CACHE_EMPTY if df is None else df.copy(deep=True)
+    # Pas de copy à l'écriture : le producteur (fetch_candles) crée un DF neuf, jamais réutilisé.
+    payload: Any = _CACHE_EMPTY if df is None else df
     with _CACHE_LOCK:
-        _OANDA_CACHE[k] = (time.time(), payload)
+        _OANDA_CACHE[k] = (time.monotonic(), payload)
         _OANDA_CACHE.move_to_end(k)
         _cache_purge_stale_locked()
 
 
-SCANNER_VERSION = "8.3-PROD"  # Ajout des corrections finales
+SCANNER_VERSION: str = "8.3.1-PROD"  # Audit chirurgical : caching Streamlit + optimisations
 
-ALL_SYMBOLS = [
+ALL_SYMBOLS: List[str] = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
@@ -118,9 +127,35 @@ ALL_SYMBOLS = [
     "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR",
 ]
 
-_GRANULARITY_MAP = {"h4": "H4", "daily": "D", "weekly": "W"}
-TF_WEIGHT = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
-_TF_LAMBDA = {"H4": 2.0, "Daily": 1.0, "Weekly": 0.5}
+_GRANULARITY_MAP: Dict[str, str] = {"h4": "H4", "daily": "D", "weekly": "W"}
+TF_WEIGHT: Dict[str, float] = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
+_TF_LAMBDA: Dict[str, float] = {"H4": 2.0, "Daily": 1.0, "Weekly": 0.5}
+
+# ==============================================================================
+# [ HELPER : HASH STABLE POUR @st.cache_data ]
+# ==============================================================================
+def _hash_df(df: Optional[pd.DataFrame]) -> str:
+    """Hash léger et stable d'un DataFrame OHLCV pour @st.cache_data.
+    Basé sur (longueur, dernier timestamp, dernier close). Suffisant car
+    les DataFrames sont append-only (nouvelles bougies seulement)."""
+    if df is None or df.empty:
+        return "empty"
+    try:
+        last_ts = str(df.index[-1])
+        last_close = float(df["close"].iloc[-1])
+        return f"{len(df)}_{last_ts}_{last_close:.8f}"
+    except (KeyError, IndexError, TypeError, ValueError):
+        return f"unhashable_{len(df) if df is not None else 0}"
+
+
+def _hash_series(s: Optional[pd.Series]) -> str:
+    if s is None or len(s) == 0:
+        return "empty_series"
+    try:
+        return f"{len(s)}_{float(s.iloc[0]):.8f}_{float(s.iloc[-1]):.8f}"
+    except (IndexError, TypeError, ValueError):
+        return f"unhashable_series_{len(s) if s is not None else 0}"
+
 
 # ==============================================================================
 # [ LAYER 1: INSTRUMENT PROFILES ]
@@ -143,7 +178,7 @@ class InstrumentProfile:
     price_min: Optional[float] = None
     price_max: Optional[float] = None
 
-_PROFILES = {
+_PROFILES: Dict[str, InstrumentProfile] = {
     "EUR_USD":    InstrumentProfile("EUR_USD",    "FOREX", 0.0001, 1.2,  0.8,  0.6,  1.5, False, 0.20, 0.30, 1.0,  5.0, 5.0),
     "GBP_USD":    InstrumentProfile("GBP_USD",    "FOREX", 0.0001, 1.3,  0.85, 0.65, 1.5, False, 0.20, 0.30, 1.0,  5.0, 5.0),
     "USD_JPY":    InstrumentProfile("USD_JPY",    "FOREX", 0.01,   0.9,  0.5,  0.5,  1.5, False, 0.20, 0.30, 1.0,  5.0, 5.0),
@@ -153,7 +188,7 @@ _PROFILES = {
     "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    1.3,  0.8,  0.65, 2.0, True,  0.22, 0.32, 1.2,  8.0, 5.0, price_min=3000.0,  price_max=12000.0),
     "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    1.3,  0.8,  0.65, 2.0, True,  0.22, 0.32, 1.2,  8.0, 5.0, price_min=10000.0, price_max=30000.0),
 }
-_DEFAULT_PROFILE = InstrumentProfile("DEFAULT", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
+_DEFAULT_PROFILE: InstrumentProfile = InstrumentProfile("DEFAULT", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
 
 
 def get_profile(symbol: str) -> InstrumentProfile:
@@ -192,9 +227,9 @@ def _is_valid_candle_dict(c: dict) -> bool:
 
 
 class AsyncOandaClient:
-    def __init__(self, token: str, account_id: str):
-        self.headers = {"Authorization": f"Bearer {token}"}
-        self.account_id = account_id
+    def __init__(self, token: str, account_id: str) -> None:
+        self.headers: Dict[str, str] = {"Authorization": f"Bearer {token}"}
+        self.account_id: str = account_id
         self.env_url: Optional[str] = None
 
     @staticmethod
@@ -325,8 +360,10 @@ class AsyncOandaClient:
         return symbol, None
 
 # ==============================================================================
-# [ LAYER 3: QUANTITATIVE ENGINE (VECTORIZED) ]
+# [ LAYER 3: QUANTITATIVE ENGINE (VECTORIZED + CACHED) ]
 # ==============================================================================
+@st.cache_data(ttl=120, max_entries=512, show_spinner=False,
+               hash_funcs={pd.DataFrame: _hash_df})
 def compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
     if df is None or len(df) < period + 1:
         if df is not None and len(df) >= 2:
@@ -348,6 +385,8 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
     return float(fb) if pd.notna(fb) and fb > 0 else None
 
 
+@st.cache_data(ttl=120, max_entries=512, show_spinner=False,
+               hash_funcs={pd.Series: _hash_series})
 def compute_institutional_trend(closes: pd.Series, lookback: int = 20, threshold: float = 2.0) -> str:
     if closes is None or len(closes) < lookback:
         return "NEUTRE"
@@ -443,7 +482,7 @@ def agglomerative_1d_clustering(
     price_weight_pairs: List[tuple],
     bandwidth: float,
 ) -> List[List[tuple]]:
-    """Clustering avec limitation du diamètre maximal (2.5 * bandwidth) pour éviter les chaînages excessifs."""
+    """Clustering avec limitation du diamètre maximal (2.5 * bandwidth)."""
     if not price_weight_pairs or bandwidth <= 0:
         return [[pw] for pw in price_weight_pairs] if price_weight_pairs else []
     sorted_pw = sorted(price_weight_pairs, key=lambda x: x[0])
@@ -451,7 +490,6 @@ def agglomerative_1d_clustering(
     curr_cluster = [sorted_pw[0]]
     for i in range(1, len(sorted_pw)):
         gap = sorted_pw[i][0] - sorted_pw[i - 1][0]
-        # Nouveau cluster si trop loin du précédent OU si le diamètre du cluster courant dépasse 2.5×bandwidth
         if gap > bandwidth or (curr_cluster and (sorted_pw[i][0] - curr_cluster[0][0]) > 2.5 * bandwidth):
             clusters.append(curr_cluster)
             curr_cluster = [sorted_pw[i]]
@@ -522,7 +560,7 @@ def compute_structural_score(strength: int, nb_tf: int, tf_name: str, age_bars: 
 
 _STATUS_PRIORITY: Dict[str, int] = {"Vierge": 0, "Testee": 1, "Role Reverse": 2, "Consommee": 3}
 
-_PIVOT_FALLBACK_DIST = {"h4": 5, "daily": 8, "weekly": 10}
+_PIVOT_FALLBACK_DIST: Dict[str, int] = {"h4": 5, "daily": 8, "weekly": 10}
 
 
 def _get_pivots_with_fallback(
@@ -554,8 +592,8 @@ def _clusters_to_zones(
     n_total: int,
     df: pd.DataFrame,
     atr_val: float,
-) -> list:
-    strong = []
+) -> List[Dict[str, Any]]:
+    strong: List[Dict[str, Any]] = []
     for grp_pw in clusters_raw:
         if len(grp_pw) < min_touches:
             continue
@@ -576,9 +614,9 @@ def _clusters_to_zones(
     return strong
 
 
-def _merge_adjacent_zones(strong: list, merge_thresh: float) -> list:
+def _merge_adjacent_zones(strong: List[Dict[str, Any]], merge_thresh: float) -> List[Dict[str, Any]]:
     strong.sort(key=lambda x: x["level"])
-    merged: list = []
+    merged: List[Dict[str, Any]] = []
     for z in strong:
         if not merged or abs(z["level"] - merged[-1]["level"]) > merge_thresh:
             merged.append(z)
@@ -599,6 +637,8 @@ def _merge_adjacent_zones(strong: list, merge_thresh: float) -> list:
     return merged
 
 
+@st.cache_data(ttl=120, max_entries=256, show_spinner=False,
+               hash_funcs={pd.DataFrame: _hash_df})
 def find_strong_sr_zones(
     df: pd.DataFrame,
     current_price: float,
@@ -615,7 +655,6 @@ def find_strong_sr_zones(
 
     pivot_highs, pivot_lows = _get_pivots_with_fallback(df, profile, atr_val, timeframe)
 
-    # Construction des enregistrements avec ID unique pour éviter les comparaisons flottantes
     pivot_records = []
     pid = 0
     for i, p in pivot_highs.items():
@@ -629,7 +668,6 @@ def find_strong_sr_zones(
         return pd.DataFrame(), pd.DataFrame()
 
     bandwidth = atr_val * profile.cluster_radius_atr
-    # (price, weight, idx, ptype)
     price_weight_pairs = [(r[1], r[2], r[3], r[4]) for r in pivot_records]
     clusters_raw = agglomerative_1d_clustering(price_weight_pairs, bandwidth)
 
@@ -640,7 +678,6 @@ def find_strong_sr_zones(
     merged = _merge_adjacent_zones(strong, atr_val * profile.merge_threshold_atr)
 
     df_zones = pd.DataFrame(merged).sort_values("level").reset_index(drop=True)
-    # Renommage de la colonne trompeuse : is_pivot -> near_price
     df_zones["near_price"] = (np.abs(df_zones["level"] - current_price) / current_price * 100) <= 0.50
     return (
         df_zones[df_zones["level"] < current_price].copy(),
@@ -659,7 +696,7 @@ def _flatten_zones_to_dataframe(zones_dict: dict) -> pd.DataFrame:
                 continue
             tmp = tmp.assign(
                 tf=tf,
-                type=tmp["near_price"].map({True: "Pivot", False: ztype}),  # utilise near_price
+                type=tmp["near_price"].map({True: "Pivot", False: ztype}),
             )
             frames.append(tmp[["tf", "level", "strength", "age_bars", "status", "type", "near_price"]])
     if not frames:
@@ -675,7 +712,9 @@ def _score_and_classify_group(
 ) -> dict:
     sub_avg = group["level"].mean()
     sub_nb_tf = group["tf"].nunique()
-    sub_dist = abs(current_price - sub_avg) / current_price * 100
+    # Protection division par zéro (anomalie déjà détectée en amont normalement)
+    safe_cp = current_price if current_price and current_price > 0 else 1.0
+    sub_dist = abs(safe_cp - sub_avg) / safe_cp * 100
 
     tf_w = group["tf"].map(TF_WEIGHT).fillna(1.0).values
     totals = group["tf"].map(lambda t: bars_map.get(t, 500)).values.astype(float)
@@ -689,7 +728,7 @@ def _score_and_classify_group(
     if is_near_price:
         ctype, sig = "Pivot", "↔ PIVOT ZONE"
     else:
-        n_sup = (group["level"] < current_price).sum()
+        n_sup = (group["level"] < safe_cp).sum()
         ctype = "Support" if n_sup >= len(group) - n_sup else "Resistance"
         sig = "🟢 BUY ZONE" if ctype == "Support" else "🔴 SELL ZONE"
 
@@ -716,7 +755,7 @@ def detect_confluences(
     bars_map: dict,
     confluence_threshold: Optional[float] = None,
 ) -> list:
-    """Utilise union‑find pour des regroupements complets et déterministes."""
+    """Union-find avec fenêtrage trié O(N log N + N×k) au lieu de O(N²)."""
     if not zones_dict or not current_price:
         return []
 
@@ -727,17 +766,22 @@ def detect_confluences(
     profile = get_profile(symbol.replace("/", "_"))
     threshold = confluence_threshold if confluence_threshold is not None else profile.confluence_threshold_pct
 
-    # Union‑find
-    parent = list(range(len(z_df)))
-    rank = [0] * len(z_df)
+    # Tri par niveau pour fenêtrage early-break
+    z_df = z_df.sort_values("level").reset_index(drop=True)
+    n = len(z_df)
+    levels_arr = z_df["level"].values
 
-    def find(x):
+    # Union-find
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-    def union(x, y):
+    def union(x: int, y: int) -> None:
         rx, ry = find(x), find(y)
         if rx == ry:
             return
@@ -749,16 +793,21 @@ def detect_confluences(
             parent[ry] = rx
             rank[rx] += 1
 
-    # Construire le graphe de proximité
-    for i in range(len(z_df)):
-        for j in range(i + 1, len(z_df)):
-            dist = abs(z_df.iloc[i]["level"] - z_df.iloc[j]["level"]) / z_df.iloc[i]["level"] * 100
-            if dist <= threshold:
-                union(i, j)
+    # Fenêtrage O(N×k) : on s'arrête dès que la distance dépasse le seuil
+    for i in range(n):
+        li = levels_arr[i]
+        if li <= 0:
+            continue
+        j = i + 1
+        while j < n:
+            dist_pct = (levels_arr[j] - li) / li * 100
+            if dist_pct > threshold:
+                break
+            union(i, j)
+            j += 1
 
-    # Rassembler les composantes
     comp_map: Dict[int, List[int]] = {}
-    for idx in range(len(z_df)):
+    for idx in range(n):
         root = find(idx)
         comp_map.setdefault(root, []).append(idx)
 
@@ -769,7 +818,6 @@ def detect_confluences(
         group_full = z_df.iloc[indices]
         if group_full["tf"].nunique() < 2:
             continue
-        # Déduplication par TF : garder la zone la plus proche du centroïde
         sub_avg = group_full["level"].mean()
         group_full = group_full.assign(_dist=(group_full["level"] - sub_avg).abs())
         keep_idx = group_full.groupby("tf")["_dist"].idxmin().values
@@ -797,7 +845,7 @@ class ScanResult:
 
 
 def _make_row(z: dict, ztype: str, cp: float, atr_val: float, sym_d: str,
-              tf_name: str, df_len: int, profile: InstrumentProfile) -> dict:
+              tf_name: str, df_len: int, profile: InstrumentProfile) -> Dict[str, Any]:
     dist = abs(cp - z["level"]) / cp * 100 if cp else 0.0
     dist_atr = f"{round(abs(cp - z['level']) / atr_val, 1)}x" if (atr_val and atr_val > 0) else "N/A"
     in_pdf = dist <= profile.pdf_max_dist_pct
@@ -882,7 +930,7 @@ def _build_daily_price_context(
     return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
-_TF_TREND_PARAMS = {"H4": (50, 2.0), "Daily": (50, 1.8), "Weekly": (20, 1.5)}
+_TF_TREND_PARAMS: Dict[str, Tuple[int, float]] = {"H4": (50, 2.0), "Daily": (50, 1.8), "Weekly": (20, 1.5)}
 
 
 def _process_tf_frame(
@@ -913,7 +961,7 @@ def _process_tf_frame(
                      cp, atr_val, sym_d, tf_name, len(df), profile)
            for _, z in res.iterrows()]
     )
-    seen: set = set()
+    seen: Set[Tuple[str, str]] = set()
     uniq = [r for r in tf_r if (key := (r["Niveau"], r["Type"])) not in seen and not seen.add(key)]
     return (uniq if uniq else None), zone_pair, price_ctx
 
@@ -1027,14 +1075,14 @@ _EMOJI_MAP = [('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔�
               ('↑', '[HAUSSE]'), ('↓', '[BAISSE]'), ('→', '[NEUTRE]')]
 
 
-def _safe_pdf_str(text: str) -> str:
+def _safe_pdf_str(text: Any) -> str:
     text = str(text).translate(_ACCENT_MAP)
     for e, r in _EMOJI_MAP:
         text = text.replace(e, r)
     return text
 
 
-def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
+def _sanitize_traceback(tb: str, sensitive_values: List[Optional[str]]) -> str:
     if not tb:
         return tb
     for val in sensitive_values:
@@ -1045,7 +1093,7 @@ def _sanitize_traceback(tb: str, sensitive_values: list) -> str:
     return tb
 
 
-_INTERNAL_COLS = ["_dist_num", "_in_pdf"]
+_INTERNAL_COLS: List[str] = ["_dist_num", "_in_pdf"]
 
 
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -1056,11 +1104,16 @@ def _sym_display(sym: str) -> str:
     return sym.replace("_", "/")
 
 
-def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
+def flag_data_anomaly(
+    symbol: str,
+    current_price: Optional[float],
+    support_levels: List[float],
+    last_candle_close: Optional[float] = None,
+) -> Optional[str]:
     if current_price is None or current_price <= 0:
         return "Prix indisponible ou non valide"
     profile = get_profile(symbol)
-    messages = []
+    messages: List[str] = []
 
     if profile.price_min is not None and current_price < profile.price_min:
         messages.append(
@@ -1092,10 +1145,15 @@ def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=N
     return " | ".join(messages) if messages else None
 
 
-def get_price_context(current_price, supports, resistances, max_dist_pct: float = 5.0):
+def get_price_context(
+    current_price: Optional[float],
+    supports: Optional[pd.DataFrame],
+    resistances: Optional[pd.DataFrame],
+    max_dist_pct: float = 5.0,
+) -> str:
     if not current_price or current_price <= 0:
         return "Prix indisponible"
-    parts = []
+    parts: List[str] = []
     if supports is not None and not supports.empty:
         sup_nearby = supports[
             (supports["level"] < current_price)
@@ -1119,8 +1177,8 @@ def get_price_context(current_price, supports, resistances, max_dist_pct: float 
     return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
-def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> dict:
-    result: dict = {"nearest_support": None, "nearest_resistance": None}
+def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> Dict[str, Optional[dict]]:
+    result: Dict[str, Optional[dict]] = {"nearest_support": None, "nearest_resistance": None}
     if not ctx_str or ctx_str == "Zone intermediaire" or not current_price:
         return result
     pat = re.compile(r"(SUR support|S proche|SUR resistance|R proche):\s*([\d.]+)\s*\(([+-][\d.]+)%\)")
@@ -1139,7 +1197,7 @@ def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> dict:
     return result
 
 
-def strip_emojis_df(df):
+def strip_emojis_df(df: pd.DataFrame) -> pd.DataFrame:
     clean = df.copy()
     for col in clean.select_dtypes(include='object').columns:
         clean[col] = clean[col].astype(str).apply(_safe_pdf_str)
@@ -1276,13 +1334,14 @@ def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
     if "_in_pdf" in df.columns:
         return _clean_df(df[df["_in_pdf"]].copy()).reset_index(drop=True)
     if "Actif" in df.columns and "_dist_num" in df.columns:
-        def _threshold_for(actif: str) -> float:
-            return get_profile(actif.replace("/", "_")).pdf_max_dist_pct
-        thresholds = df["Actif"].apply(_threshold_for)
+        # Optimisation : map sur valeurs uniques au lieu de .apply ligne par ligne
+        unique_actifs = df["Actif"].unique()
+        thresh_map = {a: get_profile(a.replace("/", "_")).pdf_max_dist_pct for a in unique_actifs}
+        thresholds = df["Actif"].map(thresh_map)
         mask = df["_dist_num"] <= thresholds
         return _clean_df(df[mask].copy()).reset_index(drop=True)
     if "Dist. %" in df.columns:
-        def _to_f(s):
+        def _to_f(s: Any) -> float:
             try:
                 return float(str(s).replace("%", ""))
             except (ValueError, TypeError):
@@ -1291,7 +1350,53 @@ def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
     return _clean_df(df).reset_index(drop=True)
 
 
-def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomalies=None):
+# ============================================================
+# EXPORTS — Caching pour éviter régénération inutile sur reruns
+# ============================================================
+def _hash_results_dict(d: Dict[str, pd.DataFrame]) -> str:
+    """Hash léger d'un dict de DataFrames pour @st.cache_data."""
+    if not d:
+        return "empty_dict"
+    parts = []
+    for k in sorted(d.keys()):
+        v = d[k]
+        if v is None or (hasattr(v, 'empty') and v.empty):
+            parts.append(f"{k}:empty")
+        else:
+            parts.append(f"{k}:{len(v)}:{hash(tuple(v.columns)) if hasattr(v, 'columns') else 'x'}")
+    return hashlib.md5("|".join(parts).encode()).hexdigest()
+
+
+def _hash_list_of_dicts(lst: List[Dict[str, Any]]) -> str:
+    if not lst:
+        return "empty_list"
+    return hashlib.md5(
+        json.dumps(
+            [{k: str(v)[:50] for k, v in d.items() if not isinstance(v, (pd.DataFrame, pd.Series))}
+             for d in lst],
+            sort_keys=True, default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _hash_anomalies(d: Dict[str, str]) -> str:
+    if not d:
+        return "no_anom"
+    return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()
+
+
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False,
+               hash_funcs={
+                   dict: _hash_results_dict,
+                   pd.DataFrame: _hash_df,
+                   list: _hash_list_of_dicts,
+               })
+def create_pdf_report(
+    results_dict: Dict[str, pd.DataFrame],
+    confluences_df: Optional[pd.DataFrame] = None,
+    summaries: Optional[List[Dict[str, Any]]] = None,
+    anomalies: Optional[Dict[str, str]] = None,
+) -> bytes:
     summaries = summaries or []
     anomalies = anomalies or {}
     pdf = PDF('L', 'mm', 'A4')
@@ -1327,8 +1432,13 @@ def create_pdf_report(results_dict, confluences_df=None, summaries=None, anomali
     return bytes(pdf.output())
 
 
-def create_csv_report(results_dict, confluences_df=None):
-    all_dfs = []
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False,
+               hash_funcs={dict: _hash_results_dict, pd.DataFrame: _hash_df})
+def create_csv_report(
+    results_dict: Dict[str, pd.DataFrame],
+    confluences_df: Optional[pd.DataFrame] = None,
+) -> bytes:
+    all_dfs: List[pd.DataFrame] = []
     if confluences_df is not None and not confluences_df.empty:
         c = _clean_df(confluences_df).copy()
         c["Section"] = "CONFLUENCES"
@@ -1346,10 +1456,10 @@ def create_csv_report(results_dict, confluences_df=None):
     return buf.getvalue()
 
 
-_TREND_ARROW = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
-_STATUS_LABEL = {"Vierge": "V", "Testee": "T", "Role Reverse": "RR", "Consommee": "C"}
-_ALERT_LABEL = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠"}
-_SIGNAL_SHORT = {"PIVOT": "PIVOT", "BUY": "BUY  ", "SELL": "SELL "}
+_TREND_ARROW: Dict[str, str] = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
+_STATUS_LABEL: Dict[str, str] = {"Vierge": "V", "Testee": "T", "Role Reverse": "RR", "Consommee": "C"}
+_ALERT_LABEL: Dict[str, str] = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠"}
+_SIGNAL_SHORT: Dict[str, str] = {"PIVOT": "PIVOT", "BUY": "BUY  ", "SELL": "SELL "}
 
 
 def _filter_confluences_to_actif_zones(
@@ -1398,9 +1508,15 @@ def _format_brief_zone_line(z: dict) -> str:
     )
 
 
-def create_llm_brief(summaries, confluences_df,
-                     max_dist=2.0, min_score=100.0,
-                     allowed_statuts=("Vierge", "Testee", "Role Reverse")):
+@st.cache_data(ttl=300, max_entries=16, show_spinner=False,
+               hash_funcs={pd.DataFrame: _hash_df, list: _hash_list_of_dicts})
+def create_llm_brief(
+    summaries: List[Dict[str, Any]],
+    confluences_df: Optional[pd.DataFrame],
+    max_dist: float = 2.0,
+    min_score: float = 100.0,
+    allowed_statuts: Tuple[str, ...] = ("Vierge", "Testee", "Role Reverse"),
+) -> bytes:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines = [
         "# BRIEF S/R — Scanner Bluestar",
@@ -1506,15 +1622,15 @@ def _normalize_alert(raw: str) -> str:
     return ""
 
 
-_TF_ORDER = {"Weekly": 0, "Daily": 1, "H4": 2}
+_TF_ORDER: Dict[str, int] = {"Weekly": 0, "Daily": 1, "H4": 2}
 
 
-def _parse_timeframes(tf_str: str) -> list:
+def _parse_timeframes(tf_str: str) -> List[str]:
     parts = [p.strip() for p in tf_str.replace("+", ",").split(",") if p.strip()]
     return sorted(parts, key=lambda t: _TF_ORDER.get(t, 99))
 
 
-_BIAS_MAP = {"HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL"}
+_BIAS_MAP: Dict[str, str] = {"HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL"}
 
 
 def _trend_alignment(h4: str, daily: str, weekly: str) -> Tuple[str, str]:
@@ -1535,9 +1651,13 @@ def _trend_alignment(h4: str, daily: str, weekly: str) -> Tuple[str, str]:
     return alignment, dominant
 
 
-def _build_actif_groups(confluences_df: pd.DataFrame, max_dist: float, min_score: float,
-                        allowed_statuts: tuple) -> dict:
-    actif_groups: dict = {}
+def _build_actif_groups(
+    confluences_df: pd.DataFrame,
+    max_dist: float,
+    min_score: float,
+    allowed_statuts: tuple,
+) -> Dict[str, List[Dict[str, Any]]]:
+    actif_groups: Dict[str, List[Dict[str, Any]]] = {}
     for _, row in confluences_df.iterrows():
         try:
             dist_val = float(str(row.get("Distance %", 999)).replace("%", ""))
@@ -1577,11 +1697,17 @@ def _build_actif_groups(confluences_df: pd.DataFrame, max_dist: float, min_score
     return actif_groups
 
 
-def create_json_export(summaries, confluences_df,
-                       max_dist=5.0, min_score=60.0,
-                       allowed_statuts=("Vierge", "Testee", "Role Reverse")):
+@st.cache_data(ttl=300, max_entries=16, show_spinner=False,
+               hash_funcs={pd.DataFrame: _hash_df, list: _hash_list_of_dicts})
+def create_json_export(
+    summaries: List[Dict[str, Any]],
+    confluences_df: Optional[pd.DataFrame],
+    max_dist: float = 5.0,
+    min_score: float = 60.0,
+    allowed_statuts: Tuple[str, ...] = ("Vierge", "Testee", "Role Reverse"),
+) -> bytes:
     now_utc = datetime.now(timezone.utc)
-    output = {
+    output: Dict[str, Any] = {
         "generated_at": now_utc.isoformat(),
         "scanner_version": SCANNER_VERSION,
         "session": _get_ict_session(now_utc),
@@ -1629,7 +1755,7 @@ def _filter_and_sort(df: pd.DataFrame, max_pct: float) -> pd.DataFrame:
     if df.empty or "Dist. %" not in df.columns:
         return df
 
-    def _to_float(s):
+    def _to_float(s: Any) -> float:
         try:
             return float(str(s).replace("%", ""))
         except (ValueError, TypeError):
@@ -1693,72 +1819,92 @@ def _show_export_section(
     with st.expander("Cliquez ici pour télécharger les résultats"):
         col1, col2 = st.columns(2)
         with col1:
-            pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
-            st.download_button(
-                "📄 Rapport PDF (complet)", data=pdf_bytes,
-                file_name=f"rapport_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf", width='stretch',
-            )
+            try:
+                pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
+                st.download_button(
+                    "📄 Rapport PDF (complet)", data=pdf_bytes,
+                    file_name=f"rapport_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                    mime="application/pdf", width='stretch',
+                )
+            except Exception as e:
+                logging.exception("PDF generation failed")
+                st.error(f"Génération PDF impossible : {type(e).__name__}")
         with col2:
-            csv_bytes = create_csv_report(rep_dict, conf_full)
-            st.download_button(
-                "📊 Données brutes CSV", data=csv_bytes,
-                file_name=f"donnees_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv", width='stretch',
-            )
+            try:
+                csv_bytes = create_csv_report(rep_dict, conf_full)
+                st.download_button(
+                    "📊 Données brutes CSV", data=csv_bytes,
+                    file_name=f"donnees_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv", width='stretch',
+                )
+            except Exception as e:
+                logging.exception("CSV generation failed")
+                st.error(f"Génération CSV impossible : {type(e).__name__}")
 
         st.divider()
         st.markdown("**🤖 Exports optimisés LLM**")
         st.caption("Paramètres LLM configurables dans la barre latérale (section 3).")
-        llm_max_dist = st.session_state.get("llm_max_dist", 2.0)
-        llm_min_score = st.session_state.get("llm_min_score", 100)
+        llm_max_dist = float(st.session_state.get("llm_max_dist", 2.0))
+        llm_min_score = float(st.session_state.get("llm_min_score", 100))
         llm_statuts_raw = st.session_state.get("llm_statuts", ["Vierge", "Testee", "Role Reverse"])
         llm_statuts = tuple(llm_statuts_raw) if llm_statuts_raw else ("Vierge", "Testee", "Role Reverse")
         st.caption(
             f"🔧 Filtres actifs : Dist < **{llm_max_dist}%** | "
             f"Score ≥ **{llm_min_score}** | {', '.join(llm_statuts)}"
         )
+        md_bytes = b""
         col3, col4 = st.columns(2)
         with col3:
-            md_bytes = create_llm_brief(
-                summaries, conf_full,
-                max_dist=llm_max_dist, min_score=llm_min_score,
-                allowed_statuts=llm_statuts,
-            )
-            st.download_button(
-                "🤖 Brief LLM (Markdown filtré)", data=md_bytes,
-                file_name=f"brief_llm_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
-                mime="text/markdown", width='stretch',
-            )
+            try:
+                md_bytes = create_llm_brief(
+                    summaries, conf_full,
+                    max_dist=llm_max_dist, min_score=llm_min_score,
+                    allowed_statuts=llm_statuts,
+                )
+                st.download_button(
+                    "🤖 Brief LLM (Markdown filtré)", data=md_bytes,
+                    file_name=f"brief_llm_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
+                    mime="text/markdown", width='stretch',
+                )
+            except Exception as e:
+                logging.exception("LLM brief generation failed")
+                st.error(f"Génération brief LLM impossible : {type(e).__name__}")
         with col4:
-            json_bytes = create_json_export(
-                summaries, conf_full,
-                max_dist=llm_max_dist, min_score=float(llm_min_score),
-                allowed_statuts=tuple(llm_statuts),
-            )
-            st.download_button(
-                "🔧 Export JSON structuré", data=json_bytes,
-                file_name=f"sr_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-                mime="application/json", width='stretch',
-            )
+            try:
+                json_bytes = create_json_export(
+                    summaries, conf_full,
+                    max_dist=llm_max_dist, min_score=llm_min_score,
+                    allowed_statuts=llm_statuts,
+                )
+                st.download_button(
+                    "🔧 Export JSON structuré", data=json_bytes,
+                    file_name=f"sr_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                    mime="application/json", width='stretch',
+                )
+            except Exception as e:
+                logging.exception("JSON export failed")
+                st.error(f"Génération JSON impossible : {type(e).__name__}")
 
         st.divider()
         st.markdown("**👁️ Aperçu du Brief LLM**")
         st.caption(f"Filtres : Dist < {llm_max_dist}% | Score ≥ {llm_min_score} | {', '.join(llm_statuts)}")
         try:
-            brief_preview = md_bytes.decode("utf-8")
-            n_zones = sum(
-                1 for line in brief_preview.split("\n")
-                if line.strip().startswith(("- BUY", "- SELL", "- PIVOT"))
-            )
-            n_actifs = brief_preview.count("### ")
-            st.info(
-                f"**{n_actifs} actifs** avec **{n_zones} zones** dans le brief LLM "
-                f"(≈ {n_zones * 15 + n_actifs * 10:,} tokens estimés)"
-            )
-            st.text_area("Brief LLM (copiable directement)", value=brief_preview,
-                         height=400, label_visibility="collapsed")
-        except (UnicodeDecodeError, AttributeError, TypeError):
+            brief_preview = md_bytes.decode("utf-8") if md_bytes else ""
+            if brief_preview:
+                n_zones = sum(
+                    1 for line in brief_preview.split("\n")
+                    if line.strip().startswith(("- BUY", "- SELL", "- PIVOT"))
+                )
+                n_actifs = brief_preview.count("### ")
+                st.info(
+                    f"**{n_actifs} actifs** avec **{n_zones} zones** dans le brief LLM "
+                    f"(≈ {n_zones * 15 + n_actifs * 10:,} tokens estimés)"
+                )
+                st.text_area("Brief LLM (copiable directement)", value=brief_preview,
+                             height=400, label_visibility="collapsed")
+            else:
+                st.warning("Aperçu non disponible.")
+        except (UnicodeDecodeError, AttributeError, TypeError, MemoryError):
             st.warning("Aperçu non disponible.")
 
 
@@ -1775,7 +1921,7 @@ _TF_COL_CONFIG = {
 }
 
 
-def _display_results(sr: dict, max_dist_filter: float):
+def _display_results(sr: dict, max_dist_filter: float) -> None:
     _df_h4 = sr.get("df_h4", pd.DataFrame())
     _df_daily = sr.get("df_daily", pd.DataFrame())
     _df_wk = sr.get("df_weekly", pd.DataFrame())
@@ -1813,9 +1959,9 @@ def _display_results(sr: dict, max_dist_filter: float):
 
 
 # ==============================================================================
-# CONSTANTES UI (préservation visuelle stricte)
+# CONSTANTES UI
 # ==============================================================================
-CONFLUENCE_THRESHOLD_MAP = {
+CONFLUENCE_THRESHOLD_MAP: Dict[str, float] = {
     "US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, "DE30_EUR": 1.2,
     "XAU_USD": 1.5,
 }
@@ -1931,20 +2077,17 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Corrections finales**")
-    st.caption("✅ Résilience async : return_exceptions=True sur tous les gathers")
-    st.caption("✅ Retry/backoff sur appels OANDA (429/5xx)")
-    st.caption("✅ Validation rigoureuse des bougies (OHLC cohérent)")
-    st.caption("✅ Cache immuable avec copie défensive + sentinel")
-    st.caption("✅ Type de zone structurel (majorité pivots highs/lows)")
-    st.caption("✅ Clustering avec limite de diamètre (évite chaînage excessif)")
-    st.caption("✅ Confluences par union-find (déterministe, complet)")
-    st.caption("✅ Renommage is_pivot → near_price (clarté)")
-    st.caption("✅ Exception OandaAuthError définie")
-    st.caption("✅ Token unique anti-double-clic UI")
+    st.caption(f"**v{SCANNER_VERSION} — Audit chirurgical**")
+    st.caption("✅ Caching @st.cache_data sur fonctions pures lourdes")
+    st.caption("✅ Caching @st.cache_data sur exports PDF/CSV/JSON/MD")
+    st.caption("✅ Union-find O(N log N) au lieu de O(N²)")
+    st.caption("✅ time.monotonic() pour robustesse NTP")
+    st.caption("✅ Typage renforcé sur helpers")
+    st.caption("✅ Try/except renforcé sur exports")
+    st.caption("✅ Map vectorisé sur seuils PDF")
 
 
-def _collect_scan_results(raw_results: list, progress_bar) -> dict:
+def _collect_scan_results(raw_results: list, progress_bar: Any) -> dict:
     results_h4: list = []
     results_daily: list = []
     results_weekly: list = []
@@ -2028,8 +2171,8 @@ def _build_summaries(
     conf_full: pd.DataFrame,
     missing_tfs_map: dict,
     price_fallback_map: dict,
-) -> list:
-    summaries = []
+) -> List[Dict[str, Any]]:
+    summaries: List[Dict[str, Any]] = []
     for sym in symbols_to_scan:
         sym_d = _sym_display(sym)
         trends = trends_map.get(sym, {})
