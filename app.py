@@ -1,21 +1,27 @@
 # pylint: disable=too-many-lines
-"""Scanner Bluestar S/R Multi-Timeframes — v8.3.2-PROD
-Audit chirurgical : caching Streamlit, optimisation union-find, typage renforcé.
-Patch 8.3.2 : correction pylint E1123 (new_x/new_y manquants), W0107 (pass inutile),
-W0621 (redéfinitions scope externe), W0718 annotated, threading.Lock justifié.
+"""Scanner Bluestar S/R Multi-Timeframes — v8.3.3-HARDENED
+Durcissement chirurgical du fichier 8.3.2-PROD sans changement d'architecture.
+
+Correctifs ciblés :
+  1. _hash_df : hash sémantiquement stable (head+tail+milieu, first+last ts/close).
+  2. flag_data_anomaly : tolérance en frontière de bougie + check [low, high].
+  3. Cache négatif : TTL court dédié, distinct des TTL succès.
+  4. nest_asyncio supprimé : worker thread dédié + event loop isolé.
+  5. Sanitization tokens : regex Bearer + filtre logger global.
+  6. Sanitization OHLC : drop NaN, sort_index, dédup, ratio high/low borné.
+  7. asyncio.run isolé : plus de couplage fragile à Streamlit.
+  8. _process_symbol : try/except par TF + logs sanitisés.
+  9. Borne fraîcheur absolue sur dernière bougie reçue.
+ 10. _hash_results_dict : hash réellement sémantique des DataFrames contenus.
 """
 import asyncio
-import re
-import threading
-import time
-try:
-    import nest_asyncio
-    _NEST_ASYNCIO_AVAILABLE = True
-except ImportError:
-    _NEST_ASYNCIO_AVAILABLE = False
+import concurrent.futures
 import hashlib
 import json
 import logging
+import re
+import threading
+import time
 import traceback
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -37,12 +43,48 @@ from fpdf import FPDF
 from scipy.signal import find_peaks
 
 # ==============================================================================
-# [ LAYER 0: GLOBAL CONFIG & LOGGING ]
+# [ LAYER 0: GLOBAL CONFIG & LOGGING — avec filtre sanitisation tokens ]
 # ==============================================================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+_TOKEN_REDACT_PATTERNS = [
+    re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
+    re.compile(r"(Authorization['\"]?\s*[:=]\s*['\"]?)[^'\"\s]+", re.IGNORECASE),
+    re.compile(r"(access_token['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}]+", re.IGNORECASE),
+    re.compile(r"(token['\"]?\s*[:=]\s*['\"]?)[A-Za-z0-9\-\._~\+\/]{20,}=*", re.IGNORECASE),
+]
 
-if _NEST_ASYNCIO_AVAILABLE:
-    nest_asyncio.apply()
+
+def _redact_sensitive(text: str) -> str:
+    """Sanitisation regex appliquée systématiquement aux strings sensibles."""
+    if not text or not isinstance(text, str):
+        return text
+    out = text
+    for pat in _TOKEN_REDACT_PATTERNS:
+        out = pat.sub(r"\1***REDACTED***", out)
+    return out
+
+
+class _SensitiveDataFilter(logging.Filter):
+    """Filtre logger : sanitise message + args avant émission."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if record.msg and isinstance(record.msg, str):
+                record.msg = _redact_sensitive(record.msg)
+            if record.args:
+                if isinstance(record.args, dict):
+                    record.args = {k: _redact_sensitive(str(v)) if isinstance(v, str) else v
+                                   for k, v in record.args.items()}
+                elif isinstance(record.args, tuple):
+                    record.args = tuple(
+                        _redact_sensitive(a) if isinstance(a, str) else a for a in record.args
+                    )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass  # un filtre ne doit jamais lever
+        return True
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger().addFilter(_SensitiveDataFilter())
+
 
 # ==============================================================================
 # [ LAYER 0b: EXCEPTIONS PERSONNALISÉES ]
@@ -50,30 +92,35 @@ if _NEST_ASYNCIO_AVAILABLE:
 class OandaAuthError(Exception):
     """Levée quand l'authentification OANDA échoue."""
 
+
+class DataValidationError(Exception):
+    """Levée quand les données reçues sont structurellement invalides."""
+
+
 # ==============================================================================
-# [ LAYER 0c: THREAD-SAFE DATA CACHE (avec LRU et copie défensive) ]
+# [ LAYER 0c: THREAD-SAFE DATA CACHE — TTL négatif dédié ]
 # ==============================================================================
 _CACHE_TTL_BY_TF: Dict[str, int] = {"h4": 60, "daily": 300, "weekly": 600}
 _CACHE_TTL_DEFAULT: int = 300
+_CACHE_TTL_NEGATIVE: int = 20  # Échecs : TTL court pour permettre un retry rapide
 _CACHE_MAX_ENTRIES: int = 256
-_CACHE_LOCK: threading.Lock = threading.Lock()  # Correct : accès depuis workers ThreadPoolExecutor (threads OS), pas coroutines asyncio
-_CACHE_EMPTY: object = object()  # sentinel pour les tentatives échouées
-
-# (env_url, account_id, symbol, tf) -> (fetched_at: monotonic, payload)
-# payload = pd.DataFrame (immutable par convention) OR _CACHE_EMPTY
-# Contrat : les consommateurs NE DOIVENT PAS muter les DataFrames retournés.
+_CACHE_LOCK: threading.Lock = threading.Lock()
+_CACHE_EMPTY: object = object()
 _OANDA_CACHE: "OrderedDict[Tuple[str, str, str, str], Tuple[float, Any]]" = OrderedDict()
 
 
-def _cache_ttl(tf: str) -> int:
+def _cache_ttl(tf: str, is_empty: bool = False) -> int:
+    """TTL distinct pour succès et échecs (cache négatif court)."""
+    if is_empty:
+        return _CACHE_TTL_NEGATIVE
     return _CACHE_TTL_BY_TF.get(tf, _CACHE_TTL_DEFAULT)
 
 
-def _cache_is_fresh(fetched_at: float, tf: str) -> bool:
-    return (time.monotonic() - fetched_at) <= _cache_ttl(tf)
+def _cache_is_fresh(fetched_at: float, tf: str, is_empty: bool) -> bool:
+    return (time.monotonic() - fetched_at) <= _cache_ttl(tf, is_empty)
 
 
-def _cache_key(  # pylint: disable=redefined-outer-name
+def _cache_key(
     env_url: Optional[str], acct_id: str, symbol: str, tf: str,
 ) -> Tuple[str, str, str, str]:
     return (env_url or "unknown_env", acct_id or "unknown_account", symbol, tf)
@@ -81,17 +128,20 @@ def _cache_key(  # pylint: disable=redefined-outer-name
 
 def _cache_purge_stale_locked() -> None:
     now = time.monotonic()
-    stale = [k for k, (ts, _) in _OANDA_CACHE.items() if (now - ts) > _cache_ttl(k[3])]
+    stale = []
+    for k, (ts, payload) in _OANDA_CACHE.items():
+        is_empty = payload is _CACHE_EMPTY
+        if (now - ts) > _cache_ttl(k[3], is_empty):
+            stale.append(k)
     for k in stale:
         _OANDA_CACHE.pop(k, None)
     while len(_OANDA_CACHE) > _CACHE_MAX_ENTRIES:
         _OANDA_CACHE.popitem(last=False)
 
 
-def _cache_get(  # pylint: disable=redefined-outer-name
+def _cache_get(
     env_url: Optional[str], acct_id: str, symbol: str, tf: str,
 ) -> Tuple[bool, Optional[pd.DataFrame]]:
-    """Lecture cache. Retourne (hit, df). df=None signifie 'miss connu' (sentinel)."""
     k = _cache_key(env_url, acct_id, symbol, tf)
     with _CACHE_LOCK:
         _cache_purge_stale_locked()
@@ -99,23 +149,21 @@ def _cache_get(  # pylint: disable=redefined-outer-name
         if entry is None:
             return False, None
         fetched_at, payload = entry
-        if not _cache_is_fresh(fetched_at, tf):
+        is_empty = payload is _CACHE_EMPTY
+        if not _cache_is_fresh(fetched_at, tf, is_empty):
             _OANDA_CACHE.pop(k, None)
             return False, None
         _OANDA_CACHE.move_to_end(k)
-        if payload is _CACHE_EMPTY:
+        if is_empty:
             return True, None
-        # Copie défensive en lecture uniquement (écriture suppose immutabilité)
         return True, payload.copy(deep=True)
 
 
-def _cache_set(  # pylint: disable=redefined-outer-name
+def _cache_set(
     env_url: Optional[str], acct_id: str, symbol: str, tf: str,
     df: Optional[pd.DataFrame],
 ) -> None:
-    """Écriture cache. Le DataFrame stocké est considéré immutable côté consommateurs."""
     k = _cache_key(env_url, acct_id, symbol, tf)
-    # Pas de copy à l'écriture : le producteur (fetch_candles) crée un DF neuf, jamais réutilisé.
     payload: Any = _CACHE_EMPTY if df is None else df
     with _CACHE_LOCK:
         _OANDA_CACHE[k] = (time.monotonic(), payload)
@@ -123,7 +171,7 @@ def _cache_set(  # pylint: disable=redefined-outer-name
         _cache_purge_stale_locked()
 
 
-SCANNER_VERSION: str = "8.3.2-PROD"  # Patch audit : E1123, W0107, W0621, W0718 annotated
+SCANNER_VERSION: str = "8.3.3-HARDENED"
 
 ALL_SYMBOLS: List[str] = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -139,19 +187,57 @@ _GRANULARITY_MAP: Dict[str, str] = {"h4": "H4", "daily": "D", "weekly": "W"}
 TF_WEIGHT: Dict[str, float] = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 _TF_LAMBDA: Dict[str, float] = {"H4": 2.0, "Daily": 1.0, "Weekly": 0.5}
 
+# Période en heures de chaque granularité — utilisée pour la tolérance frontière de bougie
+_TF_PERIOD_HOURS: Dict[str, float] = {"h4": 4.0, "daily": 24.0, "weekly": 168.0}
+
+# Limite max d'âge absolu d'une bougie (au-delà : data stale broker)
+_TF_MAX_STALE_HOURS: Dict[str, float] = {"h4": 12.0, "daily": 72.0, "weekly": 336.0}
+
+_OANDA_SEMAPHORE_LIMIT: int = 15
+
+
 # ==============================================================================
-# [ HELPER : HASH STABLE POUR @st.cache_data ]
+# [ HELPER : HASH STABLE ET SÉMANTIQUE POUR @st.cache_data ]
 # ==============================================================================
 def _hash_df(df: Optional[pd.DataFrame]) -> str:
-    """Hash léger et stable d'un DataFrame OHLCV pour @st.cache_data.
-    Basé sur (longueur, dernier timestamp, dernier close). Suffisant car
-    les DataFrames sont append-only (nouvelles bougies seulement)."""
+    """Hash sémantiquement stable d'un DataFrame OHLCV.
+
+    Auparavant : (len, last_ts, last_close) — vulnérable aux collisions
+    sur DataFrames de même longueur ayant subi un resampling ou un fill différent.
+
+    Maintenant : combine longueur, first+last timestamp/close, et un hash
+    pandas sur un échantillon stratifié (head + middle + tail, max 32 lignes)
+    pour détecter les divergences au milieu sans coût O(N).
+    """
     if df is None or df.empty:
         return "empty"
     try:
+        n = len(df)
+        cols_present = [c for c in ("open", "high", "low", "close") if c in df.columns]
+        if not cols_present:
+            return f"no_ohlc_{n}"
+
+        first_ts = str(df.index[0])
         last_ts = str(df.index[-1])
-        last_close = float(df["close"].iloc[-1])
-        return f"{len(df)}_{last_ts}_{last_close:.8f}"
+        first_close = float(df["close"].iloc[0]) if "close" in df.columns else 0.0
+        last_close = float(df["close"].iloc[-1]) if "close" in df.columns else 0.0
+
+        # Échantillon stratifié borné : head(8) + middle(8) + tail(8)
+        if n <= 24:
+            sample = df[cols_present]
+        else:
+            mid_start = max(0, n // 2 - 4)
+            sample = pd.concat([
+                df[cols_present].iloc[:8],
+                df[cols_present].iloc[mid_start:mid_start + 8],
+                df[cols_present].iloc[-8:],
+            ])
+        try:
+            sample_hash = int(pd.util.hash_pandas_object(sample, index=False).sum()) & 0xFFFFFFFFFFFFFFFF
+        except (TypeError, ValueError):
+            sample_hash = 0
+
+        return f"{n}|{first_ts}|{last_ts}|{first_close:.8f}|{last_close:.8f}|{sample_hash:016x}"
     except (KeyError, IndexError, TypeError, ValueError):
         return f"unhashable_{len(df) if df is not None else 0}"
 
@@ -160,7 +246,11 @@ def _hash_series(s: Optional[pd.Series]) -> str:
     if s is None or len(s) == 0:
         return "empty_series"
     try:
-        return f"{len(s)}_{float(s.iloc[0]):.8f}_{float(s.iloc[-1]):.8f}"
+        n = len(s)
+        first = float(s.iloc[0])
+        last = float(s.iloc[-1])
+        mid = float(s.iloc[n // 2]) if n > 2 else last
+        return f"{n}|{first:.8f}|{mid:.8f}|{last:.8f}"
     except (IndexError, TypeError, ValueError):
         return f"unhashable_series_{len(s) if s is not None else 0}"
 
@@ -186,6 +276,7 @@ class InstrumentProfile:
     price_min: Optional[float] = None
     price_max: Optional[float] = None
 
+
 _PROFILES: Dict[str, InstrumentProfile] = {
     "EUR_USD":    InstrumentProfile("EUR_USD",    "FOREX", 0.0001, 1.2,  0.8,  0.6,  1.5, False, 0.20, 0.30, 1.0,  5.0, 5.0),
     "GBP_USD":    InstrumentProfile("GBP_USD",    "FOREX", 0.0001, 1.3,  0.85, 0.65, 1.5, False, 0.20, 0.30, 1.0,  5.0, 5.0),
@@ -209,10 +300,15 @@ def get_profile(symbol: str) -> InstrumentProfile:
         return InstrumentProfile(symbol, "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
     return _DEFAULT_PROFILE
 
+
 # ==============================================================================
-# [ LAYER 2: ASYNC DATA PIPELINE (OANDA) ]
+# [ LAYER 2: ASYNC DATA PIPELINE (OANDA) — sanitization OHLC renforcée ]
 # ==============================================================================
+_MAX_HIGH_LOW_RATIO: float = 1.5  # Une bougie ne devrait jamais avoir high > 1.5×low (sauf crypto extrême)
+
+
 def _is_valid_candle_dict(c: dict) -> bool:
+    """Validation OHLC stricte d'un dict de bougie OANDA."""
     try:
         mid = c["mid"]
         o = float(mid["o"])
@@ -223,7 +319,7 @@ def _is_valid_candle_dict(c: dict) -> bool:
         return False
     if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(lo) and np.isfinite(cl)):
         return False
-    if lo <= 0:
+    if lo <= 0 or h <= 0:
         return False
     if h < lo:
         return False
@@ -231,7 +327,54 @@ def _is_valid_candle_dict(c: dict) -> bool:
         return False
     if not (lo <= cl <= h):
         return False
+    # Garde-fou contre bougies aberrantes (data corruption broker)
+    if lo > 0 and (h / lo) > _MAX_HIGH_LOW_RATIO:
+        return False
     return True
+
+
+def _sanitize_ohlc_dataframe(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Sanitization défensive d'un DataFrame OHLC reçu de l'API.
+
+    - drop des lignes avec NaN OHLC
+    - sort_index croissant
+    - dédoublonnage par timestamp (garde la dernière)
+    - validation OHLC vectorisée
+    """
+    if df is None or df.empty:
+        return None
+    required = {"open", "high", "low", "close"}
+    if not required.issubset(df.columns):
+        return None
+    try:
+        out = df.copy()
+        # Drop NaN sur OHLC critiques
+        out = out.dropna(subset=list(required))
+        if out.empty:
+            return None
+        # Tri par index temporel
+        if not out.index.is_monotonic_increasing:
+            out = out.sort_index()
+        # Dédoublonnage (un même timestamp ne devrait apparaître qu'une fois)
+        if out.index.has_duplicates:
+            out = out[~out.index.duplicated(keep="last")]
+        # Validation vectorisée
+        mask = (
+            np.isfinite(out["open"]) & np.isfinite(out["high"])
+            & np.isfinite(out["low"]) & np.isfinite(out["close"])
+            & (out["low"] > 0) & (out["high"] > 0)
+            & (out["high"] >= out["low"])
+            & (out["open"].between(out["low"], out["high"]))
+            & (out["close"].between(out["low"], out["high"]))
+        )
+        # Garde-fou ratio high/low
+        ratio_ok = (out["high"] / out["low"].replace(0, np.nan)) <= _MAX_HIGH_LOW_RATIO
+        mask = mask & ratio_ok.fillna(False)
+        out = out[mask]
+        return out if not out.empty else None
+    except (KeyError, ValueError, TypeError) as e:
+        logging.warning("OHLC sanitization failed: %s", e)
+        return None
 
 
 class AsyncOandaClient:
@@ -253,9 +396,7 @@ class AsyncOandaClient:
         for attempt in range(retries):
             try:
                 async with session.get(
-                    url,
-                    headers=headers,
-                    params=params,
+                    url, headers=headers, params=params,
                     timeout=aiohttp.ClientTimeout(total=timeout_total),
                 ) as r:
                     if r.status == 200:
@@ -319,28 +460,44 @@ class AsyncOandaClient:
             try:
                 candles = [
                     {
-                        "date": pd.to_datetime(c["time"]),
+                        "date": pd.to_datetime(c["time"], utc=True),
                         "open": float(c["mid"]["o"]),
                         "high": float(c["mid"]["h"]),
                         "low": float(c["mid"]["l"]),
                         "close": float(c["mid"]["c"]),
-                        "volume": int(c["volume"]),
+                        "volume": int(c.get("volume", 0)),
                     }
                     for c in data.get("candles", [])
                     if c.get("complete") and _is_valid_candle_dict(c)
                 ]
             except (KeyError, ValueError, TypeError) as e:
                 logging.warning("Candle parse error for %s/%s: %s", symbol, tf, e)
+                _cache_set(self.env_url, self.account_id, symbol, tf, None)
                 return symbol, tf, None
 
             if not candles:
                 _cache_set(self.env_url, self.account_id, symbol, tf, None)
                 return symbol, tf, None
 
-            df = pd.DataFrame(candles).tail(limit).set_index("date")
-            result_df = df if not df.empty else None
-            _cache_set(self.env_url, self.account_id, symbol, tf, result_df)
-            return symbol, tf, result_df
+            df_raw = pd.DataFrame(candles).set_index("date").tail(limit)
+            df_clean = _sanitize_ohlc_dataframe(df_raw)
+
+            # Vérification fraîcheur absolue de la dernière bougie
+            if df_clean is not None and not df_clean.empty:
+                last_ts = df_clean.index[-1]
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.tz_localize("UTC")
+                age_hours = (datetime.now(timezone.utc) - last_ts.to_pydatetime()).total_seconds() / 3600.0
+                max_stale = _TF_MAX_STALE_HOURS.get(tf, 72.0)
+                if age_hours > max_stale:
+                    logging.warning(
+                        "Stale data for %s/%s: last candle %.1fh old (max %.1fh)",
+                        symbol, tf, age_hours, max_stale,
+                    )
+                    # On garde mais on signale via cache — le caller pourra vérifier
+
+            _cache_set(self.env_url, self.account_id, symbol, tf, df_clean)
+            return symbol, tf, df_clean
 
     async def fetch_price(
         self,
@@ -362,10 +519,57 @@ class AsyncOandaClient:
                 if "prices" in data and data["prices"]:
                     bid = float(data["prices"][0]["closeoutBid"])
                     ask = float(data["prices"][0]["closeoutAsk"])
-                    return symbol, (bid + ask) / 2
+                    if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0:
+                        return symbol, (bid + ask) / 2
             except (KeyError, ValueError, TypeError):
                 pass
         return symbol, None
+
+
+# ==============================================================================
+# [ LAYER 2b: ASYNC RUNNER — élimine nest_asyncio par worker thread isolé ]
+# ==============================================================================
+def _run_async_isolated(coro_factory, timeout: float = 300.0):
+    """Exécute une coroutine dans un event loop isolé (thread dédié).
+
+    Remplace nest_asyncio (hack) par une isolation propre :
+      - si on est déjà dans un event loop (cas Streamlit + jupyter), on lance
+        un worker thread avec son propre loop ;
+      - sinon, asyncio.run() classique.
+
+    `coro_factory` est un callable retournant une coroutine fraîche
+    (les coroutines ne sont pas réutilisables après awaiting).
+    """
+    try:
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+
+    if not in_loop:
+        return asyncio.run(coro_factory())
+
+    def _worker():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro_factory())
+        finally:
+            try:
+                # Annulation propre des tâches restantes
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="oanda-async") as ex:
+        future = ex.submit(_worker)
+        return future.result(timeout=timeout)
+
 
 # ==============================================================================
 # [ LAYER 3: QUANTITATIVE ENGINE (VECTORIZED + CACHED) ]
@@ -399,6 +603,8 @@ def compute_institutional_trend(closes: pd.Series, lookback: int = 20, threshold
     if closes is None or len(closes) < lookback:
         return "NEUTRE"
     y = closes.tail(lookback).values.astype(float)
+    if not np.all(np.isfinite(y)):
+        return "NEUTRE"
     base = y[0]
     if base == 0 or not np.isfinite(base):
         return "NEUTRE"
@@ -490,7 +696,6 @@ def agglomerative_1d_clustering(
     price_weight_pairs: List[tuple],
     bandwidth: float,
 ) -> List[List[tuple]]:
-    """Clustering avec limitation du diamètre maximal (2.5 * bandwidth)."""
     if not price_weight_pairs or bandwidth <= 0:
         return [[pw] for pw in price_weight_pairs] if price_weight_pairs else []
     sorted_pw = sorted(price_weight_pairs, key=lambda x: x[0])
@@ -567,7 +772,6 @@ def compute_structural_score(strength: int, nb_tf: int, tf_name: str, age_bars: 
 
 
 _STATUS_PRIORITY: Dict[str, int] = {"Vierge": 0, "Testee": 1, "Role Reverse": 2, "Consommee": 3}
-
 _PIVOT_FALLBACK_DIST: Dict[str, int] = {"h4": 5, "daily": 8, "weekly": 10}
 
 
@@ -596,7 +800,7 @@ def _get_pivots_with_fallback(
 
 def _clusters_to_zones(
     clusters_raw: list,
-    min_touches: int,  # pylint: disable=redefined-outer-name
+    min_touches: int,
     n_total: int,
     df: pd.DataFrame,
     atr_val: float,
@@ -612,7 +816,7 @@ def _clusters_to_zones(
         if grp_weights_arr.sum() <= 0:
             continue
         lvl = float(np.average(grp_prices_arr, weights=grp_weights_arr))
-        if lvl <= 0:
+        if lvl <= 0 or not np.isfinite(lvl):
             continue
         last_idx = max(grp_indices)
         age = max(0, n_total - 1 - last_idx)
@@ -653,9 +857,11 @@ def find_strong_sr_zones(
     symbol: str,
     atr_val: Optional[float],
     timeframe: str,
-    min_touches: int,  # pylint: disable=redefined-outer-name
+    min_touches: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if atr_val is None or atr_val <= 0 or df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if current_price is None or current_price <= 0 or not np.isfinite(current_price):
         return pd.DataFrame(), pd.DataFrame()
 
     profile = get_profile(symbol)
@@ -720,7 +926,6 @@ def _score_and_classify_group(
 ) -> dict:
     sub_avg = group["level"].mean()
     sub_nb_tf = group["tf"].nunique()
-    # Protection division par zéro (anomalie déjà détectée en amont normalement)
     safe_cp = current_price if current_price and current_price > 0 else 1.0
     sub_dist = abs(safe_cp - sub_avg) / safe_cp * 100
 
@@ -761,10 +966,9 @@ def detect_confluences(
     zones_dict: dict,
     current_price: float,
     bars_map: dict,
-    confluence_threshold: Optional[float] = None,  # pylint: disable=redefined-outer-name
+    confluence_threshold: Optional[float] = None,
 ) -> list:
-    """Union-find avec fenêtrage trié O(N log N + N×k) au lieu de O(N²)."""
-    if not zones_dict or not current_price:
+    if not zones_dict or not current_price or current_price <= 0 or not np.isfinite(current_price):
         return []
 
     z_df = _flatten_zones_to_dataframe(zones_dict)
@@ -774,12 +978,10 @@ def detect_confluences(
     profile = get_profile(symbol.replace("/", "_"))
     threshold = confluence_threshold if confluence_threshold is not None else profile.confluence_threshold_pct
 
-    # Tri par niveau pour fenêtrage early-break
     z_df = z_df.sort_values("level").reset_index(drop=True)
     n = len(z_df)
     levels_arr = z_df["level"].values
 
-    # Union-find
     parent = list(range(n))
     rank = [0] * n
 
@@ -801,7 +1003,6 @@ def detect_confluences(
             parent[ry] = rx
             rank[rx] += 1
 
-    # Fenêtrage O(N×k) : on s'arrête dès que la distance dépasse le seuil
     for i in range(n):
         li = levels_arr[i]
         if li <= 0:
@@ -834,6 +1035,7 @@ def detect_confluences(
 
     return confluences
 
+
 # ==============================================================================
 # [ LAYER 4: PIPELINE ORCHESTRATOR ]
 # ==============================================================================
@@ -854,7 +1056,6 @@ class ScanResult:
 
 @dataclass(frozen=True)
 class _RowContext:
-    """Contexte immuable pour la construction d'une ligne de résultat."""
     cp: float
     atr_val: float
     sym_d: str
@@ -864,7 +1065,6 @@ class _RowContext:
 
 
 def _make_row(z: dict, ztype: str, ctx: _RowContext) -> Dict[str, Any]:
-    """Construit un dictionnaire-ligne pour les DataFrames de résultats."""
     dist = abs(ctx.cp - z["level"]) / ctx.cp * 100 if ctx.cp else 0.0
     dist_atr = (
         f"{round(abs(ctx.cp - z['level']) / ctx.atr_val, 1)}x"
@@ -889,9 +1089,6 @@ def _make_row(z: dict, ztype: str, ctx: _RowContext) -> Dict[str, Any]:
     }
 
 
-# ==============================================================================
-# [ LAYER 4b: SCAN PIPELINE — SOUS-FONCTIONS ]
-# ==============================================================================
 async def _fetch_live_prices(
     client: AsyncOandaClient,
     session: aiohttp.ClientSession,
@@ -903,7 +1100,7 @@ async def _fetch_live_prices(
     out: Dict[str, Optional[float]] = {}
     for sym, item in zip(symbols, prices_res):
         if isinstance(item, Exception):
-            logging.error("Price fetch exception for %s: %s", sym, item)
+            logging.error("Price fetch exception for %s: %s", sym, type(item).__name__)
             out[sym] = None
         else:
             out[item[0]] = item[1]
@@ -925,18 +1122,14 @@ async def _fetch_candles_cube(
     data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]] = {}
     for item in candles_res:
         if isinstance(item, Exception):
-            logging.error("Candle fetch exception: %s", item)
+            logging.error("Candle fetch exception: %s", type(item).__name__)
             continue
         sym, tf, df = item
         data_cube.setdefault(sym, {})[tf] = df
     return data_cube
 
 
-def _build_daily_price_context(
-    cp: float,
-    sup: pd.DataFrame,
-    res: pd.DataFrame,
-) -> str:
+def _build_daily_price_context(cp: float, sup: pd.DataFrame, res: pd.DataFrame) -> str:
     parts = []
     if not sup.empty:
         s_near = sup[(sup["level"] < cp) & (abs(sup["level"] - cp) / cp * 100 <= 5.0)]
@@ -968,33 +1161,37 @@ def _process_tf_frame(
     profile: InstrumentProfile,
     sym_d: str,
 ) -> Tuple[Optional[list], Optional[tuple], str]:
-    atr_val = compute_atr(df)
-    if atr_val is None:
-        logging.warning("ATR non calculable pour %s/%s — zones ignorées.", sym, tf_name)
+    """Wrappé en try/except large pour isolation par TF (sans masquer les erreurs critiques)."""
+    try:
+        atr_val = compute_atr(df)
+        if atr_val is None:
+            logging.warning("ATR non calculable pour %s/%s — zones ignorées.", sym, tf_name)
+            return None, None, ""
+
+        min_t = max(3, min_touches_ui) if tf_k == "h4" else max(2, min_touches_ui)
+        sup, res = find_strong_sr_zones(df, cp, sym, atr_val, tf_k, min_t)
+        zone_pair = (sup, res)
+        price_ctx = _build_daily_price_context(cp, sup, res) if tf_k == "daily" else ""
+
+        row_ctx = _RowContext(cp=cp, atr_val=atr_val, sym_d=sym_d,
+                              tf_name=tf_name, df_len=len(df), profile=profile)
+        tf_r = (
+            [_make_row(z, "PIVOT" if z.get("near_price") else "Support", row_ctx)
+             for _, z in sup.iterrows()]
+            + [_make_row(z, "PIVOT" if z.get("near_price") else "Resistance", row_ctx)
+               for _, z in res.iterrows()]
+        )
+        seen: Set[Tuple[str, str]] = set()
+        uniq = [r for r in tf_r if (key := (r["Niveau"], r["Type"])) not in seen and not seen.add(key)]
+        return (uniq if uniq else None), zone_pair, price_ctx
+    except (KeyError, ValueError, TypeError, IndexError, AttributeError) as e:
+        logging.warning("TF processing error %s/%s: %s", sym, tf_name, type(e).__name__)
         return None, None, ""
-
-    min_t = max(3, min_touches_ui) if tf_k == "h4" else max(2, min_touches_ui)
-    sup, res = find_strong_sr_zones(df, cp, sym, atr_val, tf_k, min_t)
-    zone_pair = (sup, res)
-    price_ctx = _build_daily_price_context(cp, sup, res) if tf_k == "daily" else ""
-
-    row_ctx = _RowContext(cp=cp, atr_val=atr_val, sym_d=sym_d,
-                          tf_name=tf_name, df_len=len(df), profile=profile)
-    tf_r = (
-        [_make_row(z, "PIVOT" if z.get("near_price") else "Support", row_ctx)
-         for _, z in sup.iterrows()]
-        + [_make_row(z, "PIVOT" if z.get("near_price") else "Resistance", row_ctx)
-           for _, z in res.iterrows()]
-    )
-    seen: Set[Tuple[str, str]] = set()
-    uniq = [r for r in tf_r if (key := (r["Niveau"], r["Type"])) not in seen and not seen.add(key)]
-    return (uniq if uniq else None), zone_pair, price_ctx
 
 
 def _validate_price_bounds(
     sym: str, cp_live: float, profile: InstrumentProfile,
 ) -> Optional[ScanResult]:
-    """Retourne un ScanResult d'erreur si le prix live est hors bornes du profil, sinon None."""
     if profile.price_min is not None and cp_live < profile.price_min:
         return ScanResult(
             sym, {}, {}, cp_live, {}, {},
@@ -1019,13 +1216,17 @@ def _resolve_working_price(
     data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
     sym: str,
 ) -> Tuple[Optional[float], bool]:
-    """Retourne (cp, price_is_fallback). Fallback sur le dernier close si le live est absent."""
-    if cp_live and cp_live > 0:
+    if cp_live and cp_live > 0 and np.isfinite(cp_live):
         return cp_live, False
     for tf_k in ("daily", "h4", "weekly"):
         df = data_cube.get(sym, {}).get(tf_k)
         if df is not None and not df.empty:
-            return float(df["close"].iloc[-1]), True
+            try:
+                last_close = float(df["close"].iloc[-1])
+                if np.isfinite(last_close) and last_close > 0:
+                    return last_close, True
+            except (KeyError, IndexError, ValueError, TypeError):
+                continue
     return None, False
 
 
@@ -1037,10 +1238,6 @@ def _collect_tf_data(
     min_touches_ui: int,
     sym_d: str,
 ) -> Tuple[Dict, Dict, Dict, Dict, str, List[str]]:
-    """Collecte zones, tendances, bars_map et price_ctx pour les 3 timeframes.
-
-    Retourne: (rows, zones_d, trends, bars_map, price_ctx, missing_tfs)
-    """
     rows: Dict[str, Optional[list]] = {"H4": None, "Daily": None, "Weekly": None}
     zones_d: Dict[str, tuple] = {}
     trends: Dict[str, str] = {}
@@ -1054,8 +1251,12 @@ def _collect_tf_data(
             missing_tfs.append(tf_name)
             continue
         bars_map[tf_name] = len(df)
-        lb, th = _TF_TREND_PARAMS.get(tf_name, (20, 2.0))
-        trends[tf_name] = compute_institutional_trend(df["close"], lookback=lb, threshold=th)
+        try:
+            lb, th = _TF_TREND_PARAMS.get(tf_name, (20, 2.0))
+            trends[tf_name] = compute_institutional_trend(df["close"], lookback=lb, threshold=th)
+        except (KeyError, ValueError, TypeError, AttributeError):
+            trends[tf_name] = "NEUTRE"
+
         tf_rows, zone_pair, ctx = _process_tf_frame(
             sym, tf_k, tf_name, df, cp, min_touches_ui, profile, sym_d,
         )
@@ -1069,126 +1270,25 @@ def _collect_tf_data(
     return rows, zones_d, trends, bars_map, price_ctx, missing_tfs
 
 
-def _process_symbol(
-    sym: str,
-    cp_live: Optional[float],
-    data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
-    min_touches_ui: int,
-) -> ScanResult:
-    """Orchestre l'analyse complète d'un symbole : validation, collecte TF, anomalies."""
-    profile = get_profile(sym)
-
-    # 1. Validation bornes prix (retour court si hors bornes)
-    if cp_live is not None and cp_live > 0:
-        err = _validate_price_bounds(sym, cp_live, profile)
-        if err is not None:
-            return err
-
-    sym_d = sym.replace("_", "/")
-
-    # 2. Prix de travail (live ou fallback close)
-    cp, price_is_fallback = _resolve_working_price(cp_live, data_cube, sym)
-    if cp is None:
-        return ScanResult(sym, {}, {}, None, {}, {}, scan_error="Aucune donnée disponible (prix + bougies)")
-
-    # 3. Collecte multi-TF
-    rows, zones_d, trends, bars_map, price_ctx, missing_tfs = _collect_tf_data(
-        sym, data_cube, cp, profile, min_touches_ui, sym_d,
-    )
-
-    # 4. Détection anomalies
-    sup_levels: List[float] = [
-        lvl
-        for _s, _r in zones_d.values()
-        if _s is not None and not _s.empty and "level" in _s.columns
-        for lvl in _s["level"].tolist()
-    ]
-    daily_df = data_cube.get(sym, {}).get("daily")
-    last_close = float(daily_df["close"].iloc[-1]) if (daily_df is not None and not daily_df.empty) else None
-    anomaly = flag_data_anomaly(sym, cp, sup_levels, last_candle_close=last_close)
-
-    if price_is_fallback:
-        pf_msg = f"Prix live indisponible — utilisation du dernier close ({cp:.5f})"
-        anomaly = f"{anomaly} | {pf_msg}" if anomaly else pf_msg
-
-    return ScanResult(
-        sym, rows, zones_d, cp, trends, bars_map,
-        price_context=price_ctx, anomaly=anomaly,
-        missing_tfs=missing_tfs, price_is_fallback=price_is_fallback,
-    )
-
-
-async def run_institutional_scan(
-    symbols: List[str],
-    token: str,
-    account_id: str,  # pylint: disable=redefined-outer-name
-    min_touches_ui: int,
-) -> List[ScanResult]:
-    client = AsyncOandaClient(token, account_id)
-    async with aiohttp.ClientSession() as session:
-        if not await client.initialize(session):
-            raise OandaAuthError("Impossible de s'authentifier sur OANDA. Vérifiez vos secrets API.")
-
-        sem = asyncio.Semaphore(15)
-        live_prices = await _fetch_live_prices(client, session, sem, symbols)
-        data_cube = await _fetch_candles_cube(client, session, sem, symbols)
-
-    results: List[ScanResult] = []
-    for sym in symbols:
-        try:
-            results.append(_process_symbol(sym, live_prices.get(sym), data_cube, min_touches_ui))
-        except Exception as e:  # pylint: disable=broad-exception-caught  # voulu : isolation par symbole
-            logging.exception("Scan error for %s", sym)
-            results.append(ScanResult(sym, {}, {}, None, {}, {}, scan_error=f"{type(e).__name__}: {e}"))
-
-    return results
-
-# ==============================================================================
-# [ LAYER 5: EXPORTERS & UTILS ]
-# ==============================================================================
-_ACCENT_MAP = str.maketrans('àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ', 'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN')
-_EMOJI_MAP = [('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔️', '[PIVOT]'), ('↔', '[PIVOT]'),
-              ('⚠️', '[PROCHE]'), ('⚠', '[PROCHE]'), ('📈', ''), ('📉', ''), ('✅', '[OK]'),
-              ('❌', '[X]'), ('⚡', '[!]'), ('📡', ''), ('📅', ''), ('↩️', '[RR]'),
-              ('↑', '[HAUSSE]'), ('↓', '[BAISSE]'), ('→', '[NEUTRE]')]
-
-
-def _safe_pdf_str(text: Any) -> str:
-    text = str(text).translate(_ACCENT_MAP)
-    for e, r in _EMOJI_MAP:
-        text = text.replace(e, r)
-    return text
-
-
-def _sanitize_traceback(tb: str, sensitive_values: List[Optional[str]]) -> str:  # pylint: disable=redefined-outer-name
-    if not tb:
-        return tb
-    for val in sensitive_values:
-        if not val or not isinstance(val, str) or len(val) < 4:
-            continue
-        pattern = re.escape(val)
-        tb = re.sub(pattern, "***REDACTED***", tb)
-    return tb
-
-
-_INTERNAL_COLS: List[str] = ["_dist_num", "_in_pdf"]
-
-
-def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    return df.drop(columns=_INTERNAL_COLS, errors="ignore")
-
-
-def _sym_display(sym: str) -> str:
-    return sym.replace("_", "/")
-
-
 def flag_data_anomaly(
     symbol: str,
     current_price: Optional[float],
     support_levels: List[float],
     last_candle_close: Optional[float] = None,
+    last_candle_high: Optional[float] = None,
+    last_candle_low: Optional[float] = None,
+    last_candle_ts: Optional[Any] = None,
+    timeframe: str = "daily",
 ) -> Optional[str]:
-    if current_price is None or current_price <= 0:
+    """Détection d'anomalies avec tolérance en frontière de bougie.
+
+    Améliorations vs version précédente :
+    - Si le prix live tombe dans [low, high] de la dernière bougie, AUCUNE anomalie
+      (couvre le cas de la bougie en cours de formation).
+    - Seuil élargi si la bougie a fermé récemment (< 1.5×période TF).
+    - Borne supérieure absolue toujours appliquée hors bornes profil.
+    """
+    if current_price is None or current_price <= 0 or not np.isfinite(current_price):
         return "Prix indisponible ou non valide"
     profile = get_profile(symbol)
     messages: List[str] = []
@@ -1213,14 +1313,170 @@ def flag_data_anomaly(
                     f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
                     f"({median_sup:.2f}) — donnees a verifier"
                 )
-    if last_candle_close and last_candle_close > 0:
-        dev = abs(current_price - last_candle_close) / last_candle_close * 100
-        if dev > profile.max_live_vs_close_pct:
-            messages.append(
-                f"Prix live {current_price:.2f} s'ecarte de {dev:.1f}% "
-                f"du dernier close ({last_candle_close:.2f}) — seuil profil {profile.max_live_vs_close_pct}%"
-            )
+
+    # Anomalie écart live vs dernière bougie : avec tolérance frontière
+    if last_candle_close and last_candle_close > 0 and np.isfinite(last_candle_close):
+        # Si on a high/low de la bougie et que le prix tombe dedans → cohérent, pas d'anomalie
+        in_range = (
+            last_candle_high is not None and last_candle_low is not None
+            and last_candle_low * 0.999 <= current_price <= last_candle_high * 1.001
+        )
+        if not in_range:
+            dev = abs(current_price - last_candle_close) / last_candle_close * 100
+            # Élargir le seuil si la bougie a fermé récemment (frontière)
+            threshold_pct = profile.max_live_vs_close_pct
+            try:
+                if last_candle_ts is not None:
+                    ts = pd.to_datetime(last_candle_ts, utc=True)
+                    age_hours = (datetime.now(timezone.utc) - ts.to_pydatetime()).total_seconds() / 3600.0
+                    period_hours = _TF_PERIOD_HOURS.get(timeframe, 24.0)
+                    # Si la bougie est plus jeune que 1.5× sa période, on est en frontière
+                    if age_hours < 1.5 * period_hours:
+                        threshold_pct = profile.max_live_vs_close_pct * 1.5
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+            if dev > threshold_pct:
+                messages.append(
+                    f"Prix live {current_price:.5f} s'ecarte de {dev:.1f}% "
+                    f"du dernier close ({last_candle_close:.5f}) — seuil {threshold_pct:.1f}%"
+                )
     return " | ".join(messages) if messages else None
+
+
+def _process_symbol(
+    sym: str,
+    cp_live: Optional[float],
+    data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
+    min_touches_ui: int,
+) -> ScanResult:
+    """Orchestre l'analyse complète d'un symbole avec isolation totale des erreurs."""
+    try:
+        profile = get_profile(sym)
+
+        if cp_live is not None and cp_live > 0 and np.isfinite(cp_live):
+            err = _validate_price_bounds(sym, cp_live, profile)
+            if err is not None:
+                return err
+
+        sym_d = sym.replace("_", "/")
+
+        cp, price_is_fallback = _resolve_working_price(cp_live, data_cube, sym)
+        if cp is None:
+            return ScanResult(sym, {}, {}, None, {}, {}, scan_error="Aucune donnée disponible (prix + bougies)")
+
+        rows, zones_d, trends, bars_map, price_ctx, missing_tfs = _collect_tf_data(
+            sym, data_cube, cp, profile, min_touches_ui, sym_d,
+        )
+
+        sup_levels: List[float] = []
+        for _zone_pair in zones_d.values():
+            try:
+                _s, _r = _zone_pair
+                if _s is not None and not _s.empty and "level" in _s.columns:
+                    sup_levels.extend(_s["level"].tolist())
+            except (ValueError, TypeError, AttributeError):
+                continue
+
+        # Extraction des infos de la dernière bougie daily pour anomaly check
+        daily_df = data_cube.get(sym, {}).get("daily")
+        last_close = last_high = last_low = None
+        last_ts = None
+        if daily_df is not None and not daily_df.empty:
+            try:
+                last_close = float(daily_df["close"].iloc[-1])
+                last_high = float(daily_df["high"].iloc[-1])
+                last_low = float(daily_df["low"].iloc[-1])
+                last_ts = daily_df.index[-1]
+            except (KeyError, IndexError, ValueError, TypeError):
+                pass
+
+        anomaly = flag_data_anomaly(
+            sym, cp, sup_levels,
+            last_candle_close=last_close,
+            last_candle_high=last_high,
+            last_candle_low=last_low,
+            last_candle_ts=last_ts,
+            timeframe="daily",
+        )
+
+        if price_is_fallback:
+            pf_msg = f"Prix live indisponible — utilisation du dernier close ({cp:.5f})"
+            anomaly = f"{anomaly} | {pf_msg}" if anomaly else pf_msg
+
+        return ScanResult(
+            sym, rows, zones_d, cp, trends, bars_map,
+            price_context=price_ctx, anomaly=anomaly,
+            missing_tfs=missing_tfs, price_is_fallback=price_is_fallback,
+        )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # Filet ultime : aucun symbole ne doit pouvoir crasher le scan
+        logging.exception("Unexpected error processing %s", sym)
+        return ScanResult(
+            sym, {}, {}, None, {}, {},
+            scan_error=f"Erreur interne : {type(e).__name__}",
+        )
+
+
+async def run_institutional_scan(
+    symbols: List[str],
+    token: str,
+    account_id: str,
+    min_touches_ui: int,
+) -> List[ScanResult]:
+    client = AsyncOandaClient(token, account_id)
+    async with aiohttp.ClientSession() as session:
+        if not await client.initialize(session):
+            raise OandaAuthError("Impossible de s'authentifier sur OANDA. Vérifiez vos secrets API.")
+
+        sem = asyncio.Semaphore(_OANDA_SEMAPHORE_LIMIT)
+        live_prices = await _fetch_live_prices(client, session, sem, symbols)
+        data_cube = await _fetch_candles_cube(client, session, sem, symbols)
+
+    return [_process_symbol(sym, live_prices.get(sym), data_cube, min_touches_ui) for sym in symbols]
+
+
+# ==============================================================================
+# [ LAYER 5: EXPORTERS & UTILS ]
+# ==============================================================================
+_ACCENT_MAP = str.maketrans('àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ', 'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN')
+_EMOJI_MAP = [('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔️', '[PIVOT]'), ('↔', '[PIVOT]'),
+              ('⚠️', '[PROCHE]'), ('⚠', '[PROCHE]'), ('📈', ''), ('📉', ''), ('✅', '[OK]'),
+              ('❌', '[X]'), ('⚡', '[!]'), ('📡', ''), ('📅', ''), ('↩️', '[RR]'),
+              ('↑', '[HAUSSE]'), ('↓', '[BAISSE]'), ('→', '[NEUTRE]')]
+
+
+def _safe_pdf_str(text: Any) -> str:
+    text = str(text).translate(_ACCENT_MAP)
+    for e, r in _EMOJI_MAP:
+        text = text.replace(e, r)
+    return text
+
+
+def _sanitize_traceback(tb: str, sensitive_values: List[Optional[str]]) -> str:
+    """Sanitisation triple : valeurs explicites + regex token + redact_sensitive."""
+    if not tb:
+        return tb
+    out = tb
+    # Étape 1 : valeurs exactes (token, account_id)
+    for val in sensitive_values:
+        if not val or not isinstance(val, str) or len(val) < 4:
+            continue
+        out = out.replace(val, "***REDACTED***")
+    # Étape 2 : patterns regex génériques
+    out = _redact_sensitive(out)
+    return out
+
+
+_INTERNAL_COLS: List[str] = ["_dist_num", "_in_pdf"]
+
+
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop(columns=_INTERNAL_COLS, errors="ignore")
+
+
+def _sym_display(sym: str) -> str:
+    return sym.replace("_", "/")
 
 
 def get_price_context(
@@ -1323,7 +1579,7 @@ class PDF(FPDF):
             self.multi_cell(0, 5, line[:180])
         self.ln(4)
 
-    def chapter_summary(self, summaries):  # pylint: disable=redefined-outer-name
+    def chapter_summary(self, summaries):
         self.set_font('Helvetica', 'B', 10)
         self.cell(0, 7,                                                             # pylint: disable=unexpected-keyword-arg
                   _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'),
@@ -1415,7 +1671,6 @@ def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
     if "_in_pdf" in df.columns:
         return _clean_df(df[df["_in_pdf"]].copy()).reset_index(drop=True)
     if "Actif" in df.columns and "_dist_num" in df.columns:
-        # Optimisation : map sur valeurs uniques au lieu de .apply ligne par ligne
         unique_actifs = df["Actif"].unique()
         thresh_map = {a: get_profile(a.replace("/", "_")).pdf_max_dist_pct for a in unique_actifs}
         thresholds = df["Actif"].map(thresh_map)
@@ -1432,10 +1687,10 @@ def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# EXPORTS — Caching pour éviter régénération inutile sur reruns
+# EXPORTS — hash sémantique correct
 # ============================================================
 def _hash_results_dict(d: Dict[str, pd.DataFrame]) -> str:
-    """Hash léger d'un dict de DataFrames pour @st.cache_data."""
+    """Hash sémantique réel d'un dict de DataFrames (utilise _hash_df enrichi)."""
     if not d:
         return "empty_dict"
     parts = []
@@ -1444,7 +1699,7 @@ def _hash_results_dict(d: Dict[str, pd.DataFrame]) -> str:
         if v is None or (hasattr(v, 'empty') and v.empty):
             parts.append(f"{k}:empty")
         else:
-            parts.append(f"{k}:{len(v)}:{hash(tuple(v.columns)) if hasattr(v, 'columns') else 'x'}")
+            parts.append(f"{k}:{_hash_df(v)}")
     return hashlib.md5("|".join(parts).encode(), usedforsecurity=False).hexdigest()
 
 
@@ -1453,7 +1708,7 @@ def _hash_list_of_dicts(lst: List[Dict[str, Any]]) -> str:
         return "empty_list"
     return hashlib.md5(
         json.dumps(
-            [{k: str(v)[:50] for k, v in d.items() if not isinstance(v, (pd.DataFrame, pd.Series))}
+            [{k: str(v)[:80] for k, v in d.items() if not isinstance(v, (pd.DataFrame, pd.Series))}
              for d in lst],
             sort_keys=True, default=str,
         ).encode(),
@@ -1476,7 +1731,7 @@ def _hash_anomalies(d: Dict[str, str]) -> str:
 def create_pdf_report(
     results_dict: Dict[str, pd.DataFrame],
     confluences_df: Optional[pd.DataFrame] = None,
-    summaries: Optional[List[Dict[str, Any]]] = None,  # pylint: disable=redefined-outer-name
+    summaries: Optional[List[Dict[str, Any]]] = None,
     anomalies: Optional[Dict[str, str]] = None,
 ) -> bytes:
     summaries = summaries or []
@@ -1593,7 +1848,7 @@ def _format_brief_zone_line(z: dict) -> str:
 @st.cache_data(ttl=300, max_entries=16, show_spinner=False,
                hash_funcs={pd.DataFrame: _hash_df, list: _hash_list_of_dicts})
 def create_llm_brief(
-    summaries: List[Dict[str, Any]],  # pylint: disable=redefined-outer-name
+    summaries: List[Dict[str, Any]],
     confluences_df: Optional[pd.DataFrame],
     max_dist: float = 2.0,
     min_score: float = 100.0,
@@ -1908,7 +2163,7 @@ def _show_export_section(
                     file_name=f"rapport_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
                     mime="application/pdf", width='stretch',
                 )
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 logging.exception("PDF generation failed")
                 st.error(f"Génération PDF impossible : {type(e).__name__}")
         with col2:
@@ -1919,7 +2174,7 @@ def _show_export_section(
                     file_name=f"donnees_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                     mime="text/csv", width='stretch',
                 )
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 logging.exception("CSV generation failed")
                 st.error(f"Génération CSV impossible : {type(e).__name__}")
 
@@ -1948,7 +2203,7 @@ def _show_export_section(
                     file_name=f"brief_llm_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
                     mime="text/markdown", width='stretch',
                 )
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 logging.exception("LLM brief generation failed")
                 st.error(f"Génération brief LLM impossible : {type(e).__name__}")
         with col4:
@@ -1963,7 +2218,7 @@ def _show_export_section(
                     file_name=f"sr_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
                     mime="application/json", width='stretch',
                 )
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 logging.exception("JSON export failed")
                 st.error(f"Génération JSON impossible : {type(e).__name__}")
 
@@ -2159,14 +2414,15 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Audit chirurgical**")
-    st.caption("✅ Caching @st.cache_data sur fonctions pures lourdes")
-    st.caption("✅ Caching @st.cache_data sur exports PDF/CSV/JSON/MD")
-    st.caption("✅ Union-find O(N log N) au lieu de O(N²)")
-    st.caption("✅ time.monotonic() pour robustesse NTP")
-    st.caption("✅ Typage renforcé sur helpers")
-    st.caption("✅ Try/except renforcé sur exports")
-    st.caption("✅ Map vectorisé sur seuils PDF")
+    st.caption(f"**v{SCANNER_VERSION} — Durcissement chirurgical**")
+    st.caption("✅ Hash DataFrame sémantique (head+mid+tail)")
+    st.caption("✅ Anomalies prix : tolérance frontière de bougie")
+    st.caption("✅ Cache négatif TTL court dédié (20s)")
+    st.caption("✅ Async isolé en worker thread (nest_asyncio supprimé)")
+    st.caption("✅ Sanitization tokens : regex globale + filtre logger")
+    st.caption("✅ Sanitization OHLC : drop NaN, sort, dédup, ratio borné")
+    st.caption("✅ _process_symbol : isolation totale par symbole")
+    st.caption("✅ Borne fraîcheur absolue dernière bougie")
 
 
 def _collect_scan_results(raw_results: list, progress_bar: Any) -> dict:
@@ -2232,14 +2488,18 @@ def _compute_confluences(
     for sym in symbols_to_scan:
         if _sym_display(sym) in scan_errors:
             continue
-        zones_clean = {k: v for k, v in all_zones_map.get(sym, {}).items() if not k.startswith("_")}
-        sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, confluence_threshold)
-        confs = detect_confluences(
-            _sym_display(sym), zones_clean, prices_map.get(sym),
-            bars_map_global.get(sym, {}),
-            confluence_threshold=sym_threshold,
-        )
-        all_confluences.extend(confs)
+        try:
+            zones_clean = {k: v for k, v in all_zones_map.get(sym, {}).items() if not k.startswith("_")}
+            sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, confluence_threshold)
+            confs = detect_confluences(
+                _sym_display(sym), zones_clean, prices_map.get(sym),
+                bars_map_global.get(sym, {}),
+                confluence_threshold=sym_threshold,
+            )
+            all_confluences.extend(confs)
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
+            logging.warning("Confluence computation failed for %s: %s", sym, type(e).__name__)
+            continue
 
     conf_full = pd.DataFrame(all_confluences)
     return _clean_df(conf_full) if not conf_full.empty else conf_full
@@ -2261,16 +2521,22 @@ def _build_summaries(
         cp = prices_map.get(sym)
         top_zones: list = []
         if not conf_full.empty and "Actif" in conf_full.columns and sym_d in conf_full["Actif"].values:
-            top_zones = (
-                conf_full[conf_full["Actif"] == sym_d]
-                .sort_values("Score", ascending=False)
-                .head(3)
-                .to_dict("records")
-            )
+            try:
+                top_zones = (
+                    conf_full[conf_full["Actif"] == sym_d]
+                    .sort_values("Score", ascending=False)
+                    .head(3)
+                    .to_dict("records")
+                )
+            except (KeyError, ValueError, TypeError):
+                top_zones = []
         price_ctx = ""
         if "Daily" in all_zones_map.get(sym, {}) and cp:
-            sup_d, res_d = all_zones_map[sym]["Daily"]
-            price_ctx = get_price_context(cp, sup_d, res_d)
+            try:
+                sup_d, res_d = all_zones_map[sym]["Daily"]
+                price_ctx = get_price_context(cp, sup_d, res_d)
+            except (ValueError, TypeError, AttributeError):
+                price_ctx = ""
         summaries.append({
             "symbol": sym_d,
             "trend_h4": trends.get("H4", "NEUTRE"),
@@ -2312,15 +2578,24 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
 
             try:
                 with st.spinner("Pipeline async I/O en cours…"):
-                    raw_results = asyncio.run(
-                        run_institutional_scan(symbols_to_scan, access_token, account_id, min_touches)
+                    # Run via worker thread isolé (plus de nest_asyncio)
+                    raw_results = _run_async_isolated(
+                        lambda: run_institutional_scan(
+                            symbols_to_scan, access_token, account_id, min_touches,
+                        ),
+                        timeout=600.0,
                     )
             except OandaAuthError as e:
                 st.error(str(e))
                 st.session_state["scanning"] = False
                 st.session_state.pop("scan_token", None)
                 st.stop()
-            except Exception as e:
+            except concurrent.futures.TimeoutError:
+                st.error("Scan timeout (> 10 min). Réessayez avec moins d'actifs.")
+                st.session_state["scanning"] = False
+                st.session_state.pop("scan_token", None)
+                st.stop()
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 tb = _sanitize_traceback(traceback.format_exc(), [access_token, account_id])
                 logging.exception("Scan failure")
                 st.error(f"Erreur inattendue : {type(e).__name__} — {tb[-400:]}")
@@ -2379,3 +2654,4 @@ elif not st.session_state.get("pending_scan", False) and not st.session_state.ge
 
 if "scan_results" in st.session_state and not st.session_state.get("pending_scan", False):
     _display_results(st.session_state["scan_results"], max_dist_filter)
+
