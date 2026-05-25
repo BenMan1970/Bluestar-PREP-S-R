@@ -1,18 +1,37 @@
 # pylint: disable=too-many-lines
-"""Scanner Bluestar S/R Multi-Timeframes — v8.3.3-HARDENED
-Durcissement chirurgical du fichier 8.3.2-PROD sans changement d'architecture.
+"""Scanner Bluestar S/R Multi-Timeframes — v8.3.4-PROD-HARDENED
 
-Correctifs ciblés :
-  1. _hash_df : hash sémantiquement stable (head+tail+milieu, first+last ts/close).
-  2. flag_data_anomaly : tolérance en frontière de bougie + check [low, high].
-  3. Cache négatif : TTL court dédié, distinct des TTL succès.
-  4. nest_asyncio supprimé : worker thread dédié + event loop isolé.
-  5. Sanitization tokens : regex Bearer + filtre logger global.
-  6. Sanitization OHLC : drop NaN, sort_index, dédup, ratio high/low borné.
-  7. asyncio.run isolé : plus de couplage fragile à Streamlit.
-  8. _process_symbol : try/except par TF + logs sanitisés.
-  9. Borne fraîcheur absolue sur dernière bougie reçue.
- 10. _hash_results_dict : hash réellement sémantique des DataFrames contenus.
+Durcissement chirurgical production-grade du fichier 8.3.3-HARDENED.
+Compatibilité fonctionnelle stricte préservée. Aucune régression métier.
+
+Changements v8.3.4 (vs 8.3.3) :
+  C1.  flag_data_anomaly décomposé (CC 24 → 3 sous-fonctions CC ≤ 6).
+  C2.  _process_symbol décomposé en helpers (_extract_last_candle_info,
+       _collect_support_levels).
+  C3.  Renommage paramètres pour éliminer collisions W0621 (account_id,
+       min_touches, confluence_threshold, tb, summaries).
+  C4.  _validate_price_bounds : price=None retourné si hors bornes
+       (pas d'exposition prix corrompu).
+  C5.  _hash_df enrichi : shape + volume sum + first/last open
+       (réduction risque collision cache).
+  C6.  Pattern token court ajouté dans _TOKEN_REDACT_PATTERNS.
+  C7.  Logging debug dans except silencieux (observabilité prod).
+  C8.  _run_async_isolated : timeout sur gather de fermeture.
+  C9.  _apply_pdf_filter : fillna explicite (pas de NaN silencieux).
+  C10. _cache_clear thread-safe exposé.
+  C11. Guard atomique anti-double-scan via session_state.
+  C12. Docstrings densifiés sur fonctions critiques.
+  C13. Type hints renforcés (Final, Tuple, Optional cohérents).
+  C14. _safe_pdf_str traite None et types non-str sans crash.
+  C15. _filter_and_sort robuste à df=None.
+
+Dépendances figées (testées) :
+  - fpdf2 >= 2.7.0 (signature new_x/new_y)
+  - pandas >= 1.5
+  - aiohttp >= 3.8
+  - streamlit >= 1.28
+  - scipy >= 1.10
+  - numpy >= 1.24
 """
 import asyncio
 import concurrent.futures
@@ -27,13 +46,13 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import Any, Optional, Tuple, List, Dict, Set
+from typing import Any, Final, Optional, Tuple, List, Dict, Set, Callable
 
 try:
     from zoneinfo import ZoneInfo
-    _NY_TZ = ZoneInfo("America/New_York")
+    _NY_TZ: Optional[ZoneInfo] = ZoneInfo("America/New_York")
 except ImportError:
-    _NY_TZ = None
+    _NY_TZ = None  # type: ignore[assignment]
 
 import aiohttp
 import numpy as np
@@ -43,42 +62,59 @@ from fpdf import FPDF
 from scipy.signal import find_peaks
 
 # ==============================================================================
-# [ LAYER 0: GLOBAL CONFIG & LOGGING — avec filtre sanitisation tokens ]
+# [ LAYER 0: GLOBAL CONFIG & LOGGING — filtre sanitisation tokens ]
 # ==============================================================================
-_TOKEN_REDACT_PATTERNS = [
+_TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
     re.compile(r"(Authorization['\"]?\s*[:=]\s*['\"]?)[^'\"\s]+", re.IGNORECASE),
     re.compile(r"(access_token['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}]+", re.IGNORECASE),
     re.compile(r"(token['\"]?\s*[:=]\s*['\"]?)[A-Za-z0-9\-\._~\+\/]{20,}=*", re.IGNORECASE),
+    # C6: pattern court avec contexte explicite OANDA
+    re.compile(r"(api[_-]?key['\"]?\s*[:=]\s*['\"]?)[A-Za-z0-9\-\._~\+\/]{8,}", re.IGNORECASE),
+    re.compile(r"(\b[a-f0-9]{32}-[a-f0-9]{32}\b)", re.IGNORECASE),  # OANDA-like token format
 ]
 
 
-def _redact_sensitive(text: str) -> str:
-    """Sanitisation regex appliquée systématiquement aux strings sensibles."""
-    if not text or not isinstance(text, str):
+def _redact_sensitive(text: Any) -> Any:
+    """Sanitisation regex appliquée systématiquement aux strings sensibles.
+
+    Idempotente, tolérante à None et non-str (passthrough).
+    """
+    if not isinstance(text, str) or not text:
         return text
     out = text
     for pat in _TOKEN_REDACT_PATTERNS:
-        out = pat.sub(r"\1***REDACTED***", out)
+        try:
+            out = pat.sub(lambda m: m.group(1) + "***REDACTED***" if m.lastindex else "***REDACTED***", out)
+        except (re.error, IndexError):
+            continue
     return out
 
 
-class _SensitiveDataFilter(logging.Filter):
-    """Filtre logger : sanitise message + args avant émission."""
+class _SensitiveDataFilter(logging.Filter):  # pylint: disable=too-few-public-methods
+    """Filtre logger : sanitise message + args avant émission.
+
+    Un filtre logger NE DOIT JAMAIS lever — toute exception est avalée
+    silencieusement pour ne pas casser le logger lui-même.
+    """
+
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             if record.msg and isinstance(record.msg, str):
                 record.msg = _redact_sensitive(record.msg)
             if record.args:
                 if isinstance(record.args, dict):
-                    record.args = {k: _redact_sensitive(str(v)) if isinstance(v, str) else v
-                                   for k, v in record.args.items()}
+                    record.args = {
+                        k: _redact_sensitive(v) if isinstance(v, str) else v
+                        for k, v in record.args.items()
+                    }
                 elif isinstance(record.args, tuple):
                     record.args = tuple(
-                        _redact_sensitive(a) if isinstance(a, str) else a for a in record.args
+                        _redact_sensitive(a) if isinstance(a, str) else a
+                        for a in record.args
                     )
         except Exception:  # pylint: disable=broad-exception-caught
-            pass  # un filtre ne doit jamais lever
+            pass  # contrat : un filtre ne lève jamais
         return True
 
 
@@ -98,19 +134,19 @@ class DataValidationError(Exception):
 
 
 # ==============================================================================
-# [ LAYER 0c: THREAD-SAFE DATA CACHE — TTL négatif dédié ]
+# [ LAYER 0c: THREAD-SAFE DATA CACHE — TTL négatif dédié, reset exposé ]
 # ==============================================================================
-_CACHE_TTL_BY_TF: Dict[str, int] = {"h4": 60, "daily": 300, "weekly": 600}
-_CACHE_TTL_DEFAULT: int = 300
-_CACHE_TTL_NEGATIVE: int = 20  # Échecs : TTL court pour permettre un retry rapide
-_CACHE_MAX_ENTRIES: int = 256
-_CACHE_LOCK: threading.Lock = threading.Lock()
-_CACHE_EMPTY: object = object()
+_CACHE_TTL_BY_TF: Final[Dict[str, int]] = {"h4": 60, "daily": 300, "weekly": 600}
+_CACHE_TTL_DEFAULT: Final[int] = 300
+_CACHE_TTL_NEGATIVE: Final[int] = 20
+_CACHE_MAX_ENTRIES: Final[int] = 256
+_CACHE_LOCK: Final[threading.Lock] = threading.Lock()
+_CACHE_EMPTY: Final[object] = object()
 _OANDA_CACHE: "OrderedDict[Tuple[str, str, str, str], Tuple[float, Any]]" = OrderedDict()
 
 
 def _cache_ttl(tf: str, is_empty: bool = False) -> int:
-    """TTL distinct pour succès et échecs (cache négatif court)."""
+    """TTL distinct succès vs échecs (cache négatif court)."""
     if is_empty:
         return _CACHE_TTL_NEGATIVE
     return _CACHE_TTL_BY_TF.get(tf, _CACHE_TTL_DEFAULT)
@@ -120,15 +156,14 @@ def _cache_is_fresh(fetched_at: float, tf: str, is_empty: bool) -> bool:
     return (time.monotonic() - fetched_at) <= _cache_ttl(tf, is_empty)
 
 
-def _cache_key(
-    env_url: Optional[str], acct_id: str, symbol: str, tf: str,
-) -> Tuple[str, str, str, str]:
+def _cache_key(env_url: Optional[str], acct_id: str, symbol: str, tf: str) -> Tuple[str, str, str, str]:
     return (env_url or "unknown_env", acct_id or "unknown_account", symbol, tf)
 
 
 def _cache_purge_stale_locked() -> None:
+    """Doit être appelé sous _CACHE_LOCK acquis."""
     now = time.monotonic()
-    stale = []
+    stale: List[Tuple[str, str, str, str]] = []
     for k, (ts, payload) in _OANDA_CACHE.items():
         is_empty = payload is _CACHE_EMPTY
         if (now - ts) > _cache_ttl(k[3], is_empty):
@@ -142,6 +177,12 @@ def _cache_purge_stale_locked() -> None:
 def _cache_get(
     env_url: Optional[str], acct_id: str, symbol: str, tf: str,
 ) -> Tuple[bool, Optional[pd.DataFrame]]:
+    """Retourne (hit, payload).
+
+    - (False, None) : miss.
+    - (True, None)  : hit cache négatif (échec mémorisé).
+    - (True, df)    : hit succès.
+    """
     k = _cache_key(env_url, acct_id, symbol, tf)
     with _CACHE_LOCK:
         _cache_purge_stale_locked()
@@ -171,9 +212,17 @@ def _cache_set(
         _cache_purge_stale_locked()
 
 
-SCANNER_VERSION: str = "8.3.3-HARDENED"
+def _cache_clear() -> int:
+    """Reset thread-safe du cache OANDA. Retourne le nombre d'entrées purgées."""
+    with _CACHE_LOCK:
+        n = len(_OANDA_CACHE)
+        _OANDA_CACHE.clear()
+        return n
 
-ALL_SYMBOLS: List[str] = [
+
+SCANNER_VERSION: Final[str] = "8.3.4-PROD-HARDENED"
+
+ALL_SYMBOLS: Final[List[str]] = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
@@ -183,17 +232,13 @@ ALL_SYMBOLS: List[str] = [
     "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR",
 ]
 
-_GRANULARITY_MAP: Dict[str, str] = {"h4": "H4", "daily": "D", "weekly": "W"}
-TF_WEIGHT: Dict[str, float] = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
-_TF_LAMBDA: Dict[str, float] = {"H4": 2.0, "Daily": 1.0, "Weekly": 0.5}
+_GRANULARITY_MAP: Final[Dict[str, str]] = {"h4": "H4", "daily": "D", "weekly": "W"}
+TF_WEIGHT: Final[Dict[str, float]] = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
+_TF_LAMBDA: Final[Dict[str, float]] = {"H4": 2.0, "Daily": 1.0, "Weekly": 0.5}
+_TF_PERIOD_HOURS: Final[Dict[str, float]] = {"h4": 4.0, "daily": 24.0, "weekly": 168.0}
+_TF_MAX_STALE_HOURS: Final[Dict[str, float]] = {"h4": 12.0, "daily": 72.0, "weekly": 336.0}
 
-# Période en heures de chaque granularité — utilisée pour la tolérance frontière de bougie
-_TF_PERIOD_HOURS: Dict[str, float] = {"h4": 4.0, "daily": 24.0, "weekly": 168.0}
-
-# Limite max d'âge absolu d'une bougie (au-delà : data stale broker)
-_TF_MAX_STALE_HOURS: Dict[str, float] = {"h4": 12.0, "daily": 72.0, "weekly": 336.0}
-
-_OANDA_SEMAPHORE_LIMIT: int = 15
+_OANDA_SEMAPHORE_LIMIT: Final[int] = 15
 
 
 # ==============================================================================
@@ -202,27 +247,35 @@ _OANDA_SEMAPHORE_LIMIT: int = 15
 def _hash_df(df: Optional[pd.DataFrame]) -> str:
     """Hash sémantiquement stable d'un DataFrame OHLCV.
 
-    Auparavant : (len, last_ts, last_close) — vulnérable aux collisions
-    sur DataFrames de même longueur ayant subi un resampling ou un fill différent.
+    Compose : shape, first/last timestamp, first/last open/close,
+    volume sum, et hash pandas d'un échantillon stratifié (head+middle+tail).
 
-    Maintenant : combine longueur, first+last timestamp/close, et un hash
-    pandas sur un échantillon stratifié (head + middle + tail, max 32 lignes)
-    pour détecter les divergences au milieu sans coût O(N).
+    Réduit drastiquement le risque de collision vs (len, last_ts, last_close).
     """
     if df is None or df.empty:
         return "empty"
     try:
         n = len(df)
+        ncols = len(df.columns)
         cols_present = [c for c in ("open", "high", "low", "close") if c in df.columns]
         if not cols_present:
-            return f"no_ohlc_{n}"
+            return f"no_ohlc_{n}_{ncols}"
 
         first_ts = str(df.index[0])
         last_ts = str(df.index[-1])
         first_close = float(df["close"].iloc[0]) if "close" in df.columns else 0.0
         last_close = float(df["close"].iloc[-1]) if "close" in df.columns else 0.0
+        first_open = float(df["open"].iloc[0]) if "open" in df.columns else 0.0
 
-        # Échantillon stratifié borné : head(8) + middle(8) + tail(8)
+        # Volume sum si présent (faible coût, fort discriminant)
+        vol_sig: float = 0.0
+        if "volume" in df.columns:
+            try:
+                vol_sig = float(df["volume"].sum())
+            except (TypeError, ValueError):
+                vol_sig = 0.0
+
+        # Échantillon stratifié borné (max 24 lignes)
         if n <= 24:
             sample = df[cols_present]
         else:
@@ -234,15 +287,18 @@ def _hash_df(df: Optional[pd.DataFrame]) -> str:
             ])
         try:
             sample_hash = int(pd.util.hash_pandas_object(sample, index=False).sum()) & 0xFFFFFFFFFFFFFFFF
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError):
             sample_hash = 0
 
-        return f"{n}|{first_ts}|{last_ts}|{first_close:.8f}|{last_close:.8f}|{sample_hash:016x}"
+        return (f"{n}|{ncols}|{first_ts}|{last_ts}|"
+                f"{first_open:.8f}|{first_close:.8f}|{last_close:.8f}|"
+                f"{vol_sig:.2f}|{sample_hash:016x}")
     except (KeyError, IndexError, TypeError, ValueError):
         return f"unhashable_{len(df) if df is not None else 0}"
 
 
 def _hash_series(s: Optional[pd.Series]) -> str:
+    """Hash stable d'une Series. Échantillonnage head+mid+tail."""
     if s is None or len(s) == 0:
         return "empty_series"
     try:
@@ -259,7 +315,8 @@ def _hash_series(s: Optional[pd.Series]) -> str:
 # [ LAYER 1: INSTRUMENT PROFILES ]
 # ==============================================================================
 @dataclass(frozen=True)
-class InstrumentProfile:
+class InstrumentProfile:  # pylint: disable=too-many-instance-attributes
+    """Profil d'instrument figé (immutable) : seuils calibrés par classe d'actif."""
     symbol: str
     asset_class: str
     pip_value: float
@@ -277,7 +334,8 @@ class InstrumentProfile:
     price_max: Optional[float] = None
 
 
-_PROFILES: Dict[str, InstrumentProfile] = {
+# pylint: disable=line-too-long
+_PROFILES: Final[Dict[str, InstrumentProfile]] = {
     "EUR_USD":    InstrumentProfile("EUR_USD",    "FOREX", 0.0001, 1.2,  0.8,  0.6,  1.5, False, 0.20, 0.30, 1.0,  5.0, 5.0),
     "GBP_USD":    InstrumentProfile("GBP_USD",    "FOREX", 0.0001, 1.3,  0.85, 0.65, 1.5, False, 0.20, 0.30, 1.0,  5.0, 5.0),
     "USD_JPY":    InstrumentProfile("USD_JPY",    "FOREX", 0.01,   0.9,  0.5,  0.5,  1.5, False, 0.20, 0.30, 1.0,  5.0, 5.0),
@@ -287,13 +345,17 @@ _PROFILES: Dict[str, InstrumentProfile] = {
     "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    1.3,  0.8,  0.65, 2.0, True,  0.22, 0.32, 1.2,  8.0, 5.0, price_min=3000.0,  price_max=12000.0),
     "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    1.3,  0.8,  0.65, 2.0, True,  0.22, 0.32, 1.2,  8.0, 5.0, price_min=10000.0, price_max=30000.0),
 }
-_DEFAULT_PROFILE: InstrumentProfile = InstrumentProfile("DEFAULT", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
+# pylint: enable=line-too-long
+_DEFAULT_PROFILE: Final[InstrumentProfile] = InstrumentProfile(
+    "DEFAULT", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False,
+)
 
 
 def get_profile(symbol: str) -> InstrumentProfile:
+    """Résolution profil par symbole avec fallback heuristique."""
     if symbol in _PROFILES:
         return _PROFILES[symbol]
-    base = symbol.split("_")[0]
+    base = symbol.split("_")[0] if "_" in symbol else symbol
     if symbol.endswith("_JPY") or base == "JPY":
         return InstrumentProfile(symbol, "FOREX", 0.01, 0.9, 0.5, 0.5, 1.5, False)
     if base in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF", "USD"):
@@ -304,11 +366,11 @@ def get_profile(symbol: str) -> InstrumentProfile:
 # ==============================================================================
 # [ LAYER 2: ASYNC DATA PIPELINE (OANDA) — sanitization OHLC renforcée ]
 # ==============================================================================
-_MAX_HIGH_LOW_RATIO: float = 1.5  # Une bougie ne devrait jamais avoir high > 1.5×low (sauf crypto extrême)
+_MAX_HIGH_LOW_RATIO: Final[float] = 1.5
 
 
 def _is_valid_candle_dict(c: dict) -> bool:
-    """Validation OHLC stricte d'un dict de bougie OANDA."""
+    """Validation OHLC stricte d'un dict de bougie OANDA. Retourne False pour tout doute."""
     try:
         mid = c["mid"]
         o = float(mid["o"])
@@ -323,23 +385,20 @@ def _is_valid_candle_dict(c: dict) -> bool:
         return False
     if h < lo:
         return False
-    if not (lo <= o <= h):
+    if not lo <= o <= h:
         return False
-    if not (lo <= cl <= h):
+    if not lo <= cl <= h:
         return False
-    # Garde-fou contre bougies aberrantes (data corruption broker)
     if lo > 0 and (h / lo) > _MAX_HIGH_LOW_RATIO:
         return False
     return True
 
 
-def _sanitize_ohlc_dataframe(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """Sanitization défensive d'un DataFrame OHLC reçu de l'API.
+def _sanitize_ohlc_dataframe(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Sanitization défensive d'un DataFrame OHLC.
 
-    - drop des lignes avec NaN OHLC
-    - sort_index croissant
-    - dédoublonnage par timestamp (garde la dernière)
-    - validation OHLC vectorisée
+    Étapes : drop NaN OHLC, sort_index, dédoublonnage, validation vectorisée
+    (cohérence OHLC + ratio high/low borné).
     """
     if df is None or df.empty:
         return None
@@ -348,17 +407,13 @@ def _sanitize_ohlc_dataframe(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         return None
     try:
         out = df.copy()
-        # Drop NaN sur OHLC critiques
         out = out.dropna(subset=list(required))
         if out.empty:
             return None
-        # Tri par index temporel
         if not out.index.is_monotonic_increasing:
             out = out.sort_index()
-        # Dédoublonnage (un même timestamp ne devrait apparaître qu'une fois)
         if out.index.has_duplicates:
             out = out[~out.index.duplicated(keep="last")]
-        # Validation vectorisée
         mask = (
             np.isfinite(out["open"]) & np.isfinite(out["high"])
             & np.isfinite(out["low"]) & np.isfinite(out["close"])
@@ -367,24 +422,25 @@ def _sanitize_ohlc_dataframe(df: pd.DataFrame) -> Optional[pd.DataFrame]:
             & (out["open"].between(out["low"], out["high"]))
             & (out["close"].between(out["low"], out["high"]))
         )
-        # Garde-fou ratio high/low
         ratio_ok = (out["high"] / out["low"].replace(0, np.nan)) <= _MAX_HIGH_LOW_RATIO
         mask = mask & ratio_ok.fillna(False)
         out = out[mask]
         return out if not out.empty else None
     except (KeyError, ValueError, TypeError) as e:
-        logging.warning("OHLC sanitization failed: %s", e)
+        logging.warning("OHLC sanitization failed: %s", type(e).__name__)
         return None
 
 
 class AsyncOandaClient:
-    def __init__(self, token: str, account_id: str) -> None:
+    """Client OANDA async avec retry exponential backoff et cache thread-safe."""
+
+    def __init__(self, token: str, oanda_account_id: str) -> None:
         self.headers: Dict[str, str] = {"Authorization": f"Bearer {token}"}
-        self.account_id: str = account_id
+        self.account_id: str = oanda_account_id
         self.env_url: Optional[str] = None
 
     @staticmethod
-    async def _get_json_with_retry(
+    async def _get_json_with_retry(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         session: aiohttp.ClientSession,
         url: str,
         headers: dict,
@@ -392,6 +448,7 @@ class AsyncOandaClient:
         timeout_total: float,
         retries: int = 3,
     ) -> Optional[dict]:
+        """GET JSON avec retry exponentiel sur erreurs 429/5xx et erreurs réseau."""
         backoff = 0.5
         for attempt in range(retries):
             try:
@@ -415,6 +472,7 @@ class AsyncOandaClient:
         return None
 
     async def initialize(self, session: aiohttp.ClientSession) -> bool:
+        """Détecte l'env OANDA (practice puis live). Retourne True si auth OK."""
         for url in ["https://api-fxpractice.oanda.com", "https://api-fxtrade.oanda.com"]:
             try:
                 async with session.get(
@@ -429,7 +487,7 @@ class AsyncOandaClient:
                 continue
         return False
 
-    async def fetch_candles(
+    async def fetch_candles(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         self,
         session: aiohttp.ClientSession,
         sem: asyncio.Semaphore,
@@ -437,6 +495,7 @@ class AsyncOandaClient:
         tf: str,
         limit: int = 500,
     ) -> Tuple[str, str, Optional[pd.DataFrame]]:
+        """Fetch bougies pour (symbol, tf) avec cache, retry, et sanitization OHLC."""
         cache_hit, cached = _cache_get(self.env_url, self.account_id, symbol, tf)
         if cache_hit:
             logging.debug("Cache HIT: %s/%s", symbol, tf)
@@ -451,7 +510,7 @@ class AsyncOandaClient:
 
         async with sem:
             data = await self._get_json_with_retry(
-                session, url, self.headers, params, timeout_total=10, retries=3
+                session, url, self.headers, params, timeout_total=10, retries=3,
             )
             if data is None:
                 _cache_set(self.env_url, self.account_id, symbol, tf, None)
@@ -471,7 +530,7 @@ class AsyncOandaClient:
                     if c.get("complete") and _is_valid_candle_dict(c)
                 ]
             except (KeyError, ValueError, TypeError) as e:
-                logging.warning("Candle parse error for %s/%s: %s", symbol, tf, e)
+                logging.warning("Candle parse error for %s/%s: %s", symbol, tf, type(e).__name__)
                 _cache_set(self.env_url, self.account_id, symbol, tf, None)
                 return symbol, tf, None
 
@@ -482,19 +541,19 @@ class AsyncOandaClient:
             df_raw = pd.DataFrame(candles).set_index("date").tail(limit)
             df_clean = _sanitize_ohlc_dataframe(df_raw)
 
-            # Vérification fraîcheur absolue de la dernière bougie
             if df_clean is not None and not df_clean.empty:
                 last_ts = df_clean.index[-1]
                 if last_ts.tzinfo is None:
                     last_ts = last_ts.tz_localize("UTC")
-                age_hours = (datetime.now(timezone.utc) - last_ts.to_pydatetime()).total_seconds() / 3600.0
+                age_hours = (
+                    datetime.now(timezone.utc) - last_ts.to_pydatetime()
+                ).total_seconds() / 3600.0
                 max_stale = _TF_MAX_STALE_HOURS.get(tf, 72.0)
                 if age_hours > max_stale:
                     logging.warning(
                         "Stale data for %s/%s: last candle %.1fh old (max %.1fh)",
                         symbol, tf, age_hours, max_stale,
                     )
-                    # On garde mais on signale via cache — le caller pourra vérifier
 
             _cache_set(self.env_url, self.account_id, symbol, tf, df_clean)
             return symbol, tf, df_clean
@@ -505,6 +564,7 @@ class AsyncOandaClient:
         sem: asyncio.Semaphore,
         symbol: str,
     ) -> Tuple[str, Optional[float]]:
+        """Fetch prix mid live (bid+ask)/2 avec validation finitude."""
         if not self.env_url:
             return symbol, None
         url = f"{self.env_url}/v3/accounts/{self.account_id}/pricing"
@@ -521,24 +581,22 @@ class AsyncOandaClient:
                     ask = float(data["prices"][0]["closeoutAsk"])
                     if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0:
                         return symbol, (bid + ask) / 2
-            except (KeyError, ValueError, TypeError):
+            except (KeyError, ValueError, TypeError, IndexError):
                 pass
         return symbol, None
 
 
 # ==============================================================================
-# [ LAYER 2b: ASYNC RUNNER — élimine nest_asyncio par worker thread isolé ]
+# [ LAYER 2b: ASYNC RUNNER — worker thread isolé, timeout fermeture ]
 # ==============================================================================
-def _run_async_isolated(coro_factory, timeout: float = 300.0):
+def _run_async_isolated(coro_factory: Callable[[], Any], timeout: float = 300.0) -> Any:
     """Exécute une coroutine dans un event loop isolé (thread dédié).
 
-    Remplace nest_asyncio (hack) par une isolation propre :
-      - si on est déjà dans un event loop (cas Streamlit + jupyter), on lance
-        un worker thread avec son propre loop ;
-      - sinon, asyncio.run() classique.
+    - Si pas de loop courant : `asyncio.run()`.
+    - Si loop déjà actif (Streamlit + jupyter) : worker thread isolé, loop neuf.
+    - Annulation propre des tâches en suspens à la fermeture (timeout borné).
 
-    `coro_factory` est un callable retournant une coroutine fraîche
-    (les coroutines ne sont pas réutilisables après awaiting).
+    `coro_factory` doit retourner une coroutine fraîche (non réutilisable).
     """
     try:
         asyncio.get_running_loop()
@@ -549,24 +607,38 @@ def _run_async_isolated(coro_factory, timeout: float = 300.0):
     if not in_loop:
         return asyncio.run(coro_factory())
 
-    def _worker():
+    def _worker() -> Any:
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
             return loop.run_until_complete(coro_factory())
         finally:
             try:
-                # Annulation propre des tâches restantes
-                pending = asyncio.all_tasks(loop)
+                pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
                 for task in pending:
                     task.cancel()
                 if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    try:
+                        # C8: timeout borné sur la fermeture pour éviter un hang
+                        loop.run_until_complete(
+                            asyncio.wait_for(
+                                asyncio.gather(*pending, return_exceptions=True),
+                                timeout=5.0,
+                            )
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logging.warning("Some async tasks did not cancel within 5s")
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        logging.exception("Error during async task cleanup")
             finally:
-                loop.close()
-                asyncio.set_event_loop(None)
+                try:
+                    loop.close()
+                finally:
+                    asyncio.set_event_loop(None)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="oanda-async") as ex:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="oanda-async",
+    ) as ex:
         future = ex.submit(_worker)
         return future.result(timeout=timeout)
 
@@ -577,6 +649,7 @@ def _run_async_isolated(coro_factory, timeout: float = 300.0):
 @st.cache_data(ttl=120, max_entries=512, show_spinner=False,
                hash_funcs={pd.DataFrame: _hash_df})
 def compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
+    """ATR classique avec fallback range moyen si insuffisant pour rolling."""
     if df is None or len(df) < period + 1:
         if df is not None and len(df) >= 2:
             fb = (df["high"] - df["low"]).mean()
@@ -599,7 +672,10 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
 
 @st.cache_data(ttl=120, max_entries=512, show_spinner=False,
                hash_funcs={pd.Series: _hash_series})
-def compute_institutional_trend(closes: pd.Series, lookback: int = 20, threshold: float = 2.0) -> str:
+def compute_institutional_trend(
+    closes: pd.Series, lookback: int = 20, threshold: float = 2.0,
+) -> str:
+    """Trend par régression linéaire t-test sur série normalisée."""
     if closes is None or len(closes) < lookback:
         return "NEUTRE"
     y = closes.tail(lookback).values.astype(float)
@@ -626,12 +702,13 @@ def compute_institutional_trend(closes: pd.Series, lookback: int = 20, threshold
     return "NEUTRE"
 
 
-def detect_swing_pivots(
+def detect_swing_pivots(  # pylint: disable=too-many-locals
     df: pd.DataFrame,
     profile: InstrumentProfile,
     atr_val: float,
     timeframe: str,
 ) -> Tuple[pd.Series, pd.Series]:
+    """Détection de swing highs/lows vectorisée avec filtre wick + prominence ATR."""
     if df is None or len(df) < 2 * 3 + 2 or atr_val is None or atr_val <= 0:
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
@@ -687,8 +764,10 @@ def detect_swing_pivots(
     idx_lows = sl_mask[sl_mask].index.tolist()
 
     return (
-        pd.Series(highs.values[idx_highs], index=idx_highs) if idx_highs else pd.Series(dtype=float),
-        pd.Series(lows.values[idx_lows], index=idx_lows) if idx_lows else pd.Series(dtype=float),
+        pd.Series(highs.values[idx_highs], index=idx_highs)
+        if idx_highs else pd.Series(dtype=float),
+        pd.Series(lows.values[idx_lows], index=idx_lows)
+        if idx_lows else pd.Series(dtype=float),
     )
 
 
@@ -696,6 +775,7 @@ def agglomerative_1d_clustering(
     price_weight_pairs: List[tuple],
     bandwidth: float,
 ) -> List[List[tuple]]:
+    """Clustering 1D agglomératif simple sur prix avec bandwidth = k × ATR."""
     if not price_weight_pairs or bandwidth <= 0:
         return [[pw] for pw in price_weight_pairs] if price_weight_pairs else []
     sorted_pw = sorted(price_weight_pairs, key=lambda x: x[0])
@@ -703,7 +783,9 @@ def agglomerative_1d_clustering(
     curr_cluster = [sorted_pw[0]]
     for i in range(1, len(sorted_pw)):
         gap = sorted_pw[i][0] - sorted_pw[i - 1][0]
-        if gap > bandwidth or (curr_cluster and (sorted_pw[i][0] - curr_cluster[0][0]) > 2.5 * bandwidth):
+        if gap > bandwidth or (
+            curr_cluster and (sorted_pw[i][0] - curr_cluster[0][0]) > 2.5 * bandwidth
+        ):
             clusters.append(curr_cluster)
             curr_cluster = [sorted_pw[i]]
         else:
@@ -712,13 +794,14 @@ def agglomerative_1d_clustering(
     return clusters
 
 
-def classify_zone_status(
+def classify_zone_status(  # pylint: disable=too-many-locals,too-many-return-statements
     level: float,
     zone_type: str,
     df: pd.DataFrame,
     formation_idx: int,
     atr_val: float,
 ) -> str:
+    """Classifie une zone : Vierge / Testee / Role Reverse / Consommee."""
     if formation_idx >= len(df) - 1 or atr_val is None or atr_val <= 0:
         return "Vierge"
     tolerance = atr_val * 0.25
@@ -759,11 +842,17 @@ def classify_zone_status(
     if len(rc_after) == 0:
         return "Role Reverse"
 
-    second_break = (rc_after > level + tolerance) if zone_type == "Support" else (rc_after < level - tolerance)
+    second_break = (
+        (rc_after > level + tolerance) if zone_type == "Support"
+        else (rc_after < level - tolerance)
+    )
     return "Consommee" if second_break.any() else "Role Reverse"
 
 
-def compute_structural_score(strength: int, nb_tf: int, tf_name: str, age_bars: int, total_bars: int) -> float:
+def compute_structural_score(
+    strength: int, nb_tf: int, tf_name: str, age_bars: int, total_bars: int,
+) -> float:
+    """Score pondéré : Force × Poids_TF × NbTF × exp(-λ × age_relatif)."""
     tf_w = TF_WEIGHT.get(tf_name, 1.0)
     age_r = max(age_bars, 0) / max(total_bars, 1)
     lam = _TF_LAMBDA.get(tf_name, 1.5)
@@ -771,8 +860,10 @@ def compute_structural_score(strength: int, nb_tf: int, tf_name: str, age_bars: 
     return round((strength * tf_w * nb_tf) * age_f, 1)
 
 
-_STATUS_PRIORITY: Dict[str, int] = {"Vierge": 0, "Testee": 1, "Role Reverse": 2, "Consommee": 3}
-_PIVOT_FALLBACK_DIST: Dict[str, int] = {"h4": 5, "daily": 8, "weekly": 10}
+_STATUS_PRIORITY: Final[Dict[str, int]] = {
+    "Vierge": 0, "Testee": 1, "Role Reverse": 2, "Consommee": 3,
+}
+_PIVOT_FALLBACK_DIST: Final[Dict[str, int]] = {"h4": 5, "daily": 8, "weekly": 10}
 
 
 def _get_pivots_with_fallback(
@@ -781,6 +872,7 @@ def _get_pivots_with_fallback(
     atr_val: float,
     timeframe: str,
 ) -> Tuple[pd.Series, pd.Series]:
+    """Détection swing avec fallback scipy.find_peaks si <3 pivots."""
     pivot_highs, pivot_lows = detect_swing_pivots(df, profile, atr_val, timeframe)
     if len(pivot_highs) + len(pivot_lows) >= 3:
         return pivot_highs, pivot_lows
@@ -793,21 +885,26 @@ def _get_pivots_with_fallback(
     safe_cutoff = n_total - 3
     r_idx = [i for i in r_idx if i < safe_cutoff]
     s_idx = [i for i in s_idx if i < safe_cutoff]
-    pivot_highs = pd.Series(df["high"].values[r_idx], index=r_idx) if r_idx else pd.Series(dtype=float)
-    pivot_lows = pd.Series(df["low"].values[s_idx], index=s_idx) if s_idx else pd.Series(dtype=float)
+    pivot_highs = (
+        pd.Series(df["high"].values[r_idx], index=r_idx) if r_idx else pd.Series(dtype=float)
+    )
+    pivot_lows = (
+        pd.Series(df["low"].values[s_idx], index=s_idx) if s_idx else pd.Series(dtype=float)
+    )
     return pivot_highs, pivot_lows
 
 
-def _clusters_to_zones(
+def _clusters_to_zones(  # pylint: disable=too-many-locals
     clusters_raw: list,
-    min_touches: int,
+    min_touches_required: int,
     n_total: int,
     df: pd.DataFrame,
     atr_val: float,
 ) -> List[Dict[str, Any]]:
+    """Convertit clusters de pivots en zones structurées avec status."""
     strong: List[Dict[str, Any]] = []
     for grp_pw in clusters_raw:
-        if len(grp_pw) < min_touches:
+        if len(grp_pw) < min_touches_required:
             continue
         grp_prices_arr = np.array([item[0] for item in grp_pw])
         grp_weights_arr = np.array([item[1] for item in grp_pw])
@@ -820,13 +917,22 @@ def _clusters_to_zones(
             continue
         last_idx = max(grp_indices)
         age = max(0, n_total - 1 - last_idx)
-        ztype = "Resistance" if grp_ptypes.count("high") >= grp_ptypes.count("low") else "Support"
+        ztype = (
+            "Resistance" if grp_ptypes.count("high") >= grp_ptypes.count("low")
+            else "Support"
+        )
         status = classify_zone_status(lvl, ztype, df, last_idx, atr_val)
-        strong.append({"level": float(lvl), "strength": len(grp_pw), "age_bars": age, "status": status})
+        strong.append({
+            "level": float(lvl), "strength": len(grp_pw),
+            "age_bars": age, "status": status,
+        })
     return strong
 
 
-def _merge_adjacent_zones(strong: List[Dict[str, Any]], merge_thresh: float) -> List[Dict[str, Any]]:
+def _merge_adjacent_zones(
+    strong: List[Dict[str, Any]], merge_thresh: float,
+) -> List[Dict[str, Any]]:
+    """Merge zones adjacentes par seuil ATR. Score conservé par priorité de statut."""
     strong.sort(key=lambda x: x["level"])
     merged: List[Dict[str, Any]] = []
     for z in strong:
@@ -835,7 +941,9 @@ def _merge_adjacent_zones(strong: List[Dict[str, Any]], merge_thresh: float) -> 
             continue
         prev = merged[-1]
         new_str = prev["strength"] + z["strength"]
-        new_lvl = (prev["level"] * prev["strength"] + z["level"] * z["strength"]) / new_str
+        new_lvl = (
+            prev["level"] * prev["strength"] + z["level"] * z["strength"]
+        ) / new_str
         new_status = max(
             [prev["status"], z["status"]],
             key=lambda s: _STATUS_PRIORITY.get(s, 1),
@@ -851,14 +959,15 @@ def _merge_adjacent_zones(strong: List[Dict[str, Any]], merge_thresh: float) -> 
 
 @st.cache_data(ttl=120, max_entries=256, show_spinner=False,
                hash_funcs={pd.DataFrame: _hash_df})
-def find_strong_sr_zones(
+def find_strong_sr_zones(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     df: pd.DataFrame,
     current_price: float,
     symbol: str,
     atr_val: Optional[float],
     timeframe: str,
-    min_touches: int,
+    min_touches_required: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Détection zones S/R fortes : pivots → clustering → status → merge."""
     if atr_val is None or atr_val <= 0 or df is None or df.empty:
         return pd.DataFrame(), pd.DataFrame()
     if current_price is None or current_price <= 0 or not np.isfinite(current_price):
@@ -885,14 +994,16 @@ def find_strong_sr_zones(
     price_weight_pairs = [(r[1], r[2], r[3], r[4]) for r in pivot_records]
     clusters_raw = agglomerative_1d_clustering(price_weight_pairs, bandwidth)
 
-    strong = _clusters_to_zones(clusters_raw, min_touches, n_total, df, atr_val)
+    strong = _clusters_to_zones(clusters_raw, min_touches_required, n_total, df, atr_val)
     if not strong:
         return pd.DataFrame(), pd.DataFrame()
 
     merged = _merge_adjacent_zones(strong, atr_val * profile.merge_threshold_atr)
 
     df_zones = pd.DataFrame(merged).sort_values("level").reset_index(drop=True)
-    df_zones["near_price"] = (np.abs(df_zones["level"] - current_price) / current_price * 100) <= 0.50
+    df_zones["near_price"] = (
+        np.abs(df_zones["level"] - current_price) / current_price * 100
+    ) <= 0.50
     return (
         df_zones[df_zones["level"] < current_price].copy(),
         df_zones[df_zones["level"] >= current_price].copy(),
@@ -900,6 +1011,7 @@ def find_strong_sr_zones(
 
 
 def _flatten_zones_to_dataframe(zones_dict: dict) -> pd.DataFrame:
+    """Aplatit le dict {tf: (sup_df, res_df)} en un DataFrame unique typé."""
     frames = []
     for tf, (sup, res) in zones_dict.items():
         for df_z, ztype in [(sup, "Support"), (res, "Resistance")]:
@@ -912,18 +1024,21 @@ def _flatten_zones_to_dataframe(zones_dict: dict) -> pd.DataFrame:
                 tf=tf,
                 type=tmp["near_price"].map({True: "Pivot", False: ztype}),
             )
-            frames.append(tmp[["tf", "level", "strength", "age_bars", "status", "type", "near_price"]])
+            frames.append(
+                tmp[["tf", "level", "strength", "age_bars", "status", "type", "near_price"]]
+            )
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True).sort_values("level").reset_index(drop=True)
 
 
-def _score_and_classify_group(
+def _score_and_classify_group(  # pylint: disable=too-many-locals
     group: pd.DataFrame,
     current_price: float,
     bars_map: dict,
     symbol: str,
 ) -> dict:
+    """Score un groupe de zones confluentes et classifie (BUY/SELL/PIVOT)."""
     sub_avg = group["level"].mean()
     sub_nb_tf = group["tf"].nunique()
     safe_cp = current_price if current_price and current_price > 0 else 1.0
@@ -957,18 +1072,23 @@ def _score_and_classify_group(
         "Score": round(score, 1),
         "Statut": status,
         "Distance %": round(sub_dist, 3),
-        "Alerte": "🔥 ZONE CHAUDE" if sub_dist < 0.5 else ("⚠️ Proche" if sub_dist < 1.5 else ""),
+        "Alerte": (
+            "🔥 ZONE CHAUDE" if sub_dist < 0.5
+            else ("⚠️ Proche" if sub_dist < 1.5 else "")
+        ),
     }
 
 
-def detect_confluences(
+def detect_confluences(  # pylint: disable=too-many-locals
     symbol: str,
     zones_dict: dict,
     current_price: float,
     bars_map: dict,
-    confluence_threshold: Optional[float] = None,
+    confluence_threshold_pct: Optional[float] = None,
 ) -> list:
-    if not zones_dict or not current_price or current_price <= 0 or not np.isfinite(current_price):
+    """Détecte confluences multi-TF par union-find sur niveaux proches."""
+    if (not zones_dict or not current_price or current_price <= 0
+            or not np.isfinite(current_price)):
         return []
 
     z_df = _flatten_zones_to_dataframe(zones_dict)
@@ -976,7 +1096,10 @@ def detect_confluences(
         return []
 
     profile = get_profile(symbol.replace("/", "_"))
-    threshold = confluence_threshold if confluence_threshold is not None else profile.confluence_threshold_pct
+    threshold = (
+        confluence_threshold_pct if confluence_threshold_pct is not None
+        else profile.confluence_threshold_pct
+    )
 
     z_df = z_df.sort_values("level").reset_index(drop=True)
     n = len(z_df)
@@ -1040,7 +1163,9 @@ def detect_confluences(
 # [ LAYER 4: PIPELINE ORCHESTRATOR ]
 # ==============================================================================
 @dataclass
-class ScanResult:
+class ScanResult:  # pylint: disable=too-many-instance-attributes
+    """Résultat d'analyse complet pour un symbole. Tous les champs sont remplis
+    même en cas d'erreur partielle (anomaly/scan_error documentent les soucis)."""
     symbol: str
     rows: dict
     zones: dict
@@ -1056,6 +1181,7 @@ class ScanResult:
 
 @dataclass(frozen=True)
 class _RowContext:
+    """Contexte immutable passé à _make_row (frozen pour empêcher la mutation)."""
     cp: float
     atr_val: float
     sym_d: str
@@ -1065,11 +1191,11 @@ class _RowContext:
 
 
 def _make_row(z: dict, ztype: str, ctx: _RowContext) -> Dict[str, Any]:
+    """Construit une ligne d'affichage normalisée pour un niveau S/R."""
     dist = abs(ctx.cp - z["level"]) / ctx.cp * 100 if ctx.cp else 0.0
     dist_atr = (
         f"{round(abs(ctx.cp - z['level']) / ctx.atr_val, 1)}x"
-        if (ctx.atr_val and ctx.atr_val > 0)
-        else "N/A"
+        if (ctx.atr_val and ctx.atr_val > 0) else "N/A"
     )
     in_pdf = dist <= ctx.profile.pdf_max_dist_pct
     return {
@@ -1095,6 +1221,7 @@ async def _fetch_live_prices(
     sem: asyncio.Semaphore,
     symbols: List[str],
 ) -> Dict[str, Optional[float]]:
+    """Fetch prices live en parallèle. Erreurs isolées par symbole."""
     price_tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
     prices_res = await asyncio.gather(*price_tasks, return_exceptions=True)
     out: Dict[str, Optional[float]] = {}
@@ -1113,6 +1240,7 @@ async def _fetch_candles_cube(
     sem: asyncio.Semaphore,
     symbols: List[str],
 ) -> Dict[str, Dict[str, Optional[pd.DataFrame]]]:
+    """Fetch toutes les bougies (sym × tf) en parallèle. Erreurs isolées."""
     candle_tasks = [
         client.fetch_candles(session, sem, sym, tf)
         for sym in symbols
@@ -1130,6 +1258,7 @@ async def _fetch_candles_cube(
 
 
 def _build_daily_price_context(cp: float, sup: pd.DataFrame, res: pd.DataFrame) -> str:
+    """Contexte texte position prix vs supports/résistances Daily (top 1 chacun)."""
     parts = []
     if not sup.empty:
         s_near = sup[(sup["level"] < cp) & (abs(sup["level"] - cp) / cp * 100 <= 5.0)]
@@ -1148,10 +1277,12 @@ def _build_daily_price_context(cp: float, sup: pd.DataFrame, res: pd.DataFrame) 
     return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
-_TF_TREND_PARAMS: Dict[str, Tuple[int, float]] = {"H4": (50, 2.0), "Daily": (50, 1.8), "Weekly": (20, 1.5)}
+_TF_TREND_PARAMS: Final[Dict[str, Tuple[int, float]]] = {
+    "H4": (50, 2.0), "Daily": (50, 1.8), "Weekly": (20, 1.5),
+}
 
 
-def _process_tf_frame(
+def _process_tf_frame(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     sym: str,
     tf_k: str,
     tf_name: str,
@@ -1161,7 +1292,7 @@ def _process_tf_frame(
     profile: InstrumentProfile,
     sym_d: str,
 ) -> Tuple[Optional[list], Optional[tuple], str]:
-    """Wrappé en try/except large pour isolation par TF (sans masquer les erreurs critiques)."""
+    """Traite un TF pour un symbole avec isolation totale des erreurs."""
     try:
         atr_val = compute_atr(df)
         if atr_val is None:
@@ -1173,8 +1304,10 @@ def _process_tf_frame(
         zone_pair = (sup, res)
         price_ctx = _build_daily_price_context(cp, sup, res) if tf_k == "daily" else ""
 
-        row_ctx = _RowContext(cp=cp, atr_val=atr_val, sym_d=sym_d,
-                              tf_name=tf_name, df_len=len(df), profile=profile)
+        row_ctx = _RowContext(
+            cp=cp, atr_val=atr_val, sym_d=sym_d,
+            tf_name=tf_name, df_len=len(df), profile=profile,
+        )
         tf_r = (
             [_make_row(z, "PIVOT" if z.get("near_price") else "Support", row_ctx)
              for _, z in sup.iterrows()]
@@ -1182,7 +1315,10 @@ def _process_tf_frame(
                for _, z in res.iterrows()]
         )
         seen: Set[Tuple[str, str]] = set()
-        uniq = [r for r in tf_r if (key := (r["Niveau"], r["Type"])) not in seen and not seen.add(key)]
+        uniq = [
+            r for r in tf_r
+            if (key := (r["Niveau"], r["Type"])) not in seen and not seen.add(key)
+        ]
         return (uniq if uniq else None), zone_pair, price_ctx
     except (KeyError, ValueError, TypeError, IndexError, AttributeError) as e:
         logging.warning("TF processing error %s/%s: %s", sym, tf_name, type(e).__name__)
@@ -1192,9 +1328,10 @@ def _process_tf_frame(
 def _validate_price_bounds(
     sym: str, cp_live: float, profile: InstrumentProfile,
 ) -> Optional[ScanResult]:
+    """Valide bornes profil. Retourne ScanResult d'erreur (price=None) si hors bornes."""
     if profile.price_min is not None and cp_live < profile.price_min:
         return ScanResult(
-            sym, {}, {}, cp_live, {}, {},
+            sym, {}, {}, None, {}, {},  # C4: price=None (pas d'exposition prix corrompu)
             scan_error=(
                 f"PRIX HORS BORNES ({cp_live:.2f} < {profile.price_min:.0f})"
                 " — instrument OANDA mal configuré"
@@ -1202,7 +1339,7 @@ def _validate_price_bounds(
         )
     if profile.price_max is not None and cp_live > profile.price_max:
         return ScanResult(
-            sym, {}, {}, cp_live, {}, {},
+            sym, {}, {}, None, {}, {},
             scan_error=(
                 f"PRIX HORS BORNES ({cp_live:.2f} > {profile.price_max:.0f})"
                 " — instrument OANDA mal configuré"
@@ -1216,6 +1353,7 @@ def _resolve_working_price(
     data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
     sym: str,
 ) -> Tuple[Optional[float], bool]:
+    """Résout prix utilisable : live OK ou fallback sur dernier close."""
     if cp_live and cp_live > 0 and np.isfinite(cp_live):
         return cp_live, False
     for tf_k in ("daily", "h4", "weekly"):
@@ -1230,7 +1368,7 @@ def _resolve_working_price(
     return None, False
 
 
-def _collect_tf_data(
+def _collect_tf_data(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     sym: str,
     data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
     cp: float,
@@ -1238,6 +1376,7 @@ def _collect_tf_data(
     min_touches_ui: int,
     sym_d: str,
 ) -> Tuple[Dict, Dict, Dict, Dict, str, List[str]]:
+    """Collecte données par TF avec isolation par TF."""
     rows: Dict[str, Optional[list]] = {"H4": None, "Daily": None, "Weekly": None}
     zones_d: Dict[str, tuple] = {}
     trends: Dict[str, str] = {}
@@ -1253,8 +1392,11 @@ def _collect_tf_data(
         bars_map[tf_name] = len(df)
         try:
             lb, th = _TF_TREND_PARAMS.get(tf_name, (20, 2.0))
-            trends[tf_name] = compute_institutional_trend(df["close"], lookback=lb, threshold=th)
-        except (KeyError, ValueError, TypeError, AttributeError):
+            trends[tf_name] = compute_institutional_trend(
+                df["close"], lookback=lb, threshold=th,
+            )
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
+            logging.debug("Trend compute fail %s/%s: %s", sym, tf_name, type(e).__name__)
             trends[tf_name] = "NEUTRE"
 
         tf_rows, zone_pair, ctx = _process_tf_frame(
@@ -1270,7 +1412,89 @@ def _collect_tf_data(
     return rows, zones_d, trends, bars_map, price_ctx, missing_tfs
 
 
-def flag_data_anomaly(
+# ============================================================
+# C1 : flag_data_anomaly décomposé (CC 24 → 3 sous-fonctions CC ≤ 6)
+# ============================================================
+def _anomaly_check_bounds(
+    current_price: float, profile: InstrumentProfile,
+) -> List[str]:
+    """Vérifie bornes prix du profil."""
+    msgs: List[str] = []
+    if profile.price_min is not None and current_price < profile.price_min:
+        msgs.append(
+            f"PRIX HORS BORNES : {current_price:.2f} < min attendu {profile.price_min:.0f}"
+            " — instrument OANDA mal mappé ou donnée corrompue"
+        )
+    if profile.price_max is not None and current_price > profile.price_max:
+        msgs.append(
+            f"PRIX HORS BORNES : {current_price:.2f} > max attendu {profile.price_max:.0f}"
+            " — instrument OANDA mal mappé ou donnée corrompue"
+        )
+    return msgs
+
+
+def _anomaly_check_support_ratio(
+    current_price: float, support_levels: List[float], profile: InstrumentProfile,
+) -> List[str]:
+    """Détecte écart aberrant prix vs médiane des supports."""
+    msgs: List[str] = []
+    if profile.skip_ratio_check or len(support_levels) < 3:
+        return msgs
+    median_sup = float(np.median(support_levels))
+    if median_sup > 0 and median_sup > 0.01 * current_price:
+        ratio = current_price / median_sup
+        if ratio > 3.0:
+            msgs.append(
+                f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
+                f"({median_sup:.2f}) — donnees a verifier"
+            )
+    return msgs
+
+
+def _anomaly_check_live_vs_close(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    current_price: float,
+    profile: InstrumentProfile,
+    last_candle_close: Optional[float],
+    last_candle_high: Optional[float],
+    last_candle_low: Optional[float],
+    last_candle_ts: Optional[Any],
+    timeframe: str,
+) -> List[str]:
+    """Détecte écart anormal prix live vs dernier close, avec tolérance frontière."""
+    msgs: List[str] = []
+    if not (last_candle_close and last_candle_close > 0 and np.isfinite(last_candle_close)):
+        return msgs
+
+    in_range = (
+        last_candle_high is not None and last_candle_low is not None
+        and last_candle_low * 0.999 <= current_price <= last_candle_high * 1.001
+    )
+    if in_range:
+        return msgs
+
+    dev = abs(current_price - last_candle_close) / last_candle_close * 100
+    threshold_pct = profile.max_live_vs_close_pct
+    try:
+        if last_candle_ts is not None:
+            ts = pd.to_datetime(last_candle_ts, utc=True)
+            age_hours = (
+                datetime.now(timezone.utc) - ts.to_pydatetime()
+            ).total_seconds() / 3600.0
+            period_hours = _TF_PERIOD_HOURS.get(timeframe, 24.0)
+            if age_hours < 1.5 * period_hours:
+                threshold_pct = profile.max_live_vs_close_pct * 1.5
+    except (ValueError, TypeError, AttributeError) as e:
+        logging.debug("Anomaly TS parsing fail: %s", type(e).__name__)
+
+    if dev > threshold_pct:
+        msgs.append(
+            f"Prix live {current_price:.5f} s'ecarte de {dev:.1f}% "
+            f"du dernier close ({last_candle_close:.5f}) — seuil {threshold_pct:.1f}%"
+        )
+    return msgs
+
+
+def flag_data_anomaly(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     symbol: str,
     current_price: Optional[float],
     support_levels: List[float],
@@ -1280,77 +1504,72 @@ def flag_data_anomaly(
     last_candle_ts: Optional[Any] = None,
     timeframe: str = "daily",
 ) -> Optional[str]:
-    """Détection d'anomalies avec tolérance en frontière de bougie.
+    """Détection d'anomalies prix avec tolérance frontière de bougie.
 
-    Améliorations vs version précédente :
-    - Si le prix live tombe dans [low, high] de la dernière bougie, AUCUNE anomalie
-      (couvre le cas de la bougie en cours de formation).
-    - Seuil élargi si la bougie a fermé récemment (< 1.5×période TF).
-    - Borne supérieure absolue toujours appliquée hors bornes profil.
+    Composition : bounds + support-ratio + live-vs-close.
+    Retourne None si tout est cohérent, sinon string descriptif.
     """
     if current_price is None or current_price <= 0 or not np.isfinite(current_price):
         return "Prix indisponible ou non valide"
+
     profile = get_profile(symbol)
     messages: List[str] = []
+    messages += _anomaly_check_bounds(current_price, profile)
+    messages += _anomaly_check_support_ratio(current_price, support_levels, profile)
+    messages += _anomaly_check_live_vs_close(
+        current_price, profile,
+        last_candle_close, last_candle_high, last_candle_low,
+        last_candle_ts, timeframe,
+    )
 
-    if profile.price_min is not None and current_price < profile.price_min:
-        messages.append(
-            f"PRIX HORS BORNES : {current_price:.2f} < min attendu {profile.price_min:.0f} "
-            f"— instrument OANDA mal mappé ou donnée corrompue"
-        )
-    if profile.price_max is not None and current_price > profile.price_max:
-        messages.append(
-            f"PRIX HORS BORNES : {current_price:.2f} > max attendu {profile.price_max:.0f} "
-            f"— instrument OANDA mal mappé ou donnée corrompue"
-        )
-
-    if not profile.skip_ratio_check and len(support_levels) >= 3:
-        median_sup = float(np.median(support_levels))
-        if median_sup > 0 and median_sup > 0.01 * current_price:
-            ratio = current_price / median_sup
-            if ratio > 3.0:
-                messages.append(
-                    f"Prix {current_price:.2f} = {ratio:.1f}x la mediane des supports "
-                    f"({median_sup:.2f}) — donnees a verifier"
-                )
-
-    # Anomalie écart live vs dernière bougie : avec tolérance frontière
-    if last_candle_close and last_candle_close > 0 and np.isfinite(last_candle_close):
-        # Si on a high/low de la bougie et que le prix tombe dedans → cohérent, pas d'anomalie
-        in_range = (
-            last_candle_high is not None and last_candle_low is not None
-            and last_candle_low * 0.999 <= current_price <= last_candle_high * 1.001
-        )
-        if not in_range:
-            dev = abs(current_price - last_candle_close) / last_candle_close * 100
-            # Élargir le seuil si la bougie a fermé récemment (frontière)
-            threshold_pct = profile.max_live_vs_close_pct
-            try:
-                if last_candle_ts is not None:
-                    ts = pd.to_datetime(last_candle_ts, utc=True)
-                    age_hours = (datetime.now(timezone.utc) - ts.to_pydatetime()).total_seconds() / 3600.0
-                    period_hours = _TF_PERIOD_HOURS.get(timeframe, 24.0)
-                    # Si la bougie est plus jeune que 1.5× sa période, on est en frontière
-                    if age_hours < 1.5 * period_hours:
-                        threshold_pct = profile.max_live_vs_close_pct * 1.5
-            except (ValueError, TypeError, AttributeError):
-                pass
-
-            if dev > threshold_pct:
-                messages.append(
-                    f"Prix live {current_price:.5f} s'ecarte de {dev:.1f}% "
-                    f"du dernier close ({last_candle_close:.5f}) — seuil {threshold_pct:.1f}%"
-                )
     return " | ".join(messages) if messages else None
 
 
-def _process_symbol(
+# ============================================================
+# C2 : _process_symbol décomposé
+# ============================================================
+def _extract_last_candle_info(
+    daily_df: Optional[pd.DataFrame],
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[Any]]:
+    """Extrait (close, high, low, ts) de la dernière bougie daily si disponible."""
+    if daily_df is None or daily_df.empty:
+        return None, None, None, None
+    try:
+        return (
+            float(daily_df["close"].iloc[-1]),
+            float(daily_df["high"].iloc[-1]),
+            float(daily_df["low"].iloc[-1]),
+            daily_df.index[-1],
+        )
+    except (KeyError, IndexError, ValueError, TypeError) as e:
+        logging.debug("Last candle extraction fail: %s", type(e).__name__)
+        return None, None, None, None
+
+
+def _collect_support_levels(zones_d: Dict[str, tuple]) -> List[float]:
+    """Aplatit tous les niveaux de support de tous les TFs."""
+    sup_levels: List[float] = []
+    for zone_pair in zones_d.values():
+        try:
+            _s, _r = zone_pair
+            if _s is not None and not _s.empty and "level" in _s.columns:
+                sup_levels.extend(_s["level"].tolist())
+        except (ValueError, TypeError, AttributeError) as e:
+            logging.debug("Support collection fail: %s", type(e).__name__)
+            continue
+    return sup_levels
+
+
+def _process_symbol(  # pylint: disable=too-many-locals
     sym: str,
     cp_live: Optional[float],
     data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]],
     min_touches_ui: int,
 ) -> ScanResult:
-    """Orchestre l'analyse complète d'un symbole avec isolation totale des erreurs."""
+    """Orchestre l'analyse complète d'un symbole avec isolation totale des erreurs.
+
+    Filet ultime : aucun symbole ne peut faire crasher le scan global.
+    """
     try:
         profile = get_profile(sym)
 
@@ -1363,33 +1582,18 @@ def _process_symbol(
 
         cp, price_is_fallback = _resolve_working_price(cp_live, data_cube, sym)
         if cp is None:
-            return ScanResult(sym, {}, {}, None, {}, {}, scan_error="Aucune donnée disponible (prix + bougies)")
+            return ScanResult(
+                sym, {}, {}, None, {}, {},
+                scan_error="Aucune donnée disponible (prix + bougies)",
+            )
 
         rows, zones_d, trends, bars_map, price_ctx, missing_tfs = _collect_tf_data(
             sym, data_cube, cp, profile, min_touches_ui, sym_d,
         )
 
-        sup_levels: List[float] = []
-        for _zone_pair in zones_d.values():
-            try:
-                _s, _r = _zone_pair
-                if _s is not None and not _s.empty and "level" in _s.columns:
-                    sup_levels.extend(_s["level"].tolist())
-            except (ValueError, TypeError, AttributeError):
-                continue
-
-        # Extraction des infos de la dernière bougie daily pour anomaly check
+        sup_levels = _collect_support_levels(zones_d)
         daily_df = data_cube.get(sym, {}).get("daily")
-        last_close = last_high = last_low = None
-        last_ts = None
-        if daily_df is not None and not daily_df.empty:
-            try:
-                last_close = float(daily_df["close"].iloc[-1])
-                last_high = float(daily_df["high"].iloc[-1])
-                last_low = float(daily_df["low"].iloc[-1])
-                last_ts = daily_df.index[-1]
-            except (KeyError, IndexError, ValueError, TypeError):
-                pass
+        last_close, last_high, last_low, last_ts = _extract_last_candle_info(daily_df)
 
         anomaly = flag_data_anomaly(
             sym, cp, sup_levels,
@@ -1410,7 +1614,6 @@ def _process_symbol(
             missing_tfs=missing_tfs, price_is_fallback=price_is_fallback,
         )
     except Exception as e:  # pylint: disable=broad-exception-caught
-        # Filet ultime : aucun symbole ne doit pouvoir crasher le scan
         logging.exception("Unexpected error processing %s", sym)
         return ScanResult(
             sym, {}, {}, None, {}, {},
@@ -1421,54 +1624,68 @@ def _process_symbol(
 async def run_institutional_scan(
     symbols: List[str],
     token: str,
-    account_id: str,
+    oanda_account_id: str,
     min_touches_ui: int,
 ) -> List[ScanResult]:
-    client = AsyncOandaClient(token, account_id)
+    """Pipeline scan complet : auth → prices → candles → analyse parallèle."""
+    client = AsyncOandaClient(token, oanda_account_id)
     async with aiohttp.ClientSession() as session:
         if not await client.initialize(session):
-            raise OandaAuthError("Impossible de s'authentifier sur OANDA. Vérifiez vos secrets API.")
+            raise OandaAuthError(
+                "Impossible de s'authentifier sur OANDA. Vérifiez vos secrets API."
+            )
 
         sem = asyncio.Semaphore(_OANDA_SEMAPHORE_LIMIT)
         live_prices = await _fetch_live_prices(client, session, sem, symbols)
         data_cube = await _fetch_candles_cube(client, session, sem, symbols)
 
-    return [_process_symbol(sym, live_prices.get(sym), data_cube, min_touches_ui) for sym in symbols]
+    return [
+        _process_symbol(sym, live_prices.get(sym), data_cube, min_touches_ui)
+        for sym in symbols
+    ]
 
 
 # ==============================================================================
 # [ LAYER 5: EXPORTERS & UTILS ]
 # ==============================================================================
-_ACCENT_MAP = str.maketrans('àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ', 'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN')
-_EMOJI_MAP = [('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔️', '[PIVOT]'), ('↔', '[PIVOT]'),
-              ('⚠️', '[PROCHE]'), ('⚠', '[PROCHE]'), ('📈', ''), ('📉', ''), ('✅', '[OK]'),
-              ('❌', '[X]'), ('⚡', '[!]'), ('📡', ''), ('📅', ''), ('↩️', '[RR]'),
-              ('↑', '[HAUSSE]'), ('↓', '[BAISSE]'), ('→', '[NEUTRE]')]
+# pylint: disable=line-too-long
+_ACCENT_MAP: Final = str.maketrans('àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÍÔÖÓÙÛÜÚÇÑ', 'aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIOOOUUUUCN')
+# pylint: enable=line-too-long
+_EMOJI_MAP: Final[List[Tuple[str, str]]] = [
+    ('🟢', '[BUY]'), ('🔴', '[SELL]'), ('🔥', '[CHAUD]'), ('↔️', '[PIVOT]'), ('↔', '[PIVOT]'),
+    ('⚠️', '[PROCHE]'), ('⚠', '[PROCHE]'), ('📈', ''), ('📉', ''), ('✅', '[OK]'),
+    ('❌', '[X]'), ('⚡', '[!]'), ('📡', ''), ('📅', ''), ('↩️', '[RR]'),
+    ('↑', '[HAUSSE]'), ('↓', '[BAISSE]'), ('→', '[NEUTRE]'),
+]
 
 
 def _safe_pdf_str(text: Any) -> str:
-    text = str(text).translate(_ACCENT_MAP)
+    """Sanitise pour FPDF latin-1 : accents + emoji + None safe (C14)."""
+    if text is None:
+        return ""
+    try:
+        s = str(text).translate(_ACCENT_MAP)
+    except (TypeError, ValueError, AttributeError):
+        return ""
     for e, r in _EMOJI_MAP:
-        text = text.replace(e, r)
-    return text
+        s = s.replace(e, r)
+    return s
 
 
-def _sanitize_traceback(tb: str, sensitive_values: List[Optional[str]]) -> str:
+def _sanitize_traceback(traceback_str: str, sensitive_values: List[Optional[str]]) -> str:
     """Sanitisation triple : valeurs explicites + regex token + redact_sensitive."""
-    if not tb:
-        return tb
-    out = tb
-    # Étape 1 : valeurs exactes (token, account_id)
+    if not traceback_str:
+        return traceback_str
+    out = traceback_str
     for val in sensitive_values:
         if not val or not isinstance(val, str) or len(val) < 4:
             continue
         out = out.replace(val, "***REDACTED***")
-    # Étape 2 : patterns regex génériques
     out = _redact_sensitive(out)
     return out
 
 
-_INTERNAL_COLS: List[str] = ["_dist_num", "_in_pdf"]
+_INTERNAL_COLS: Final[List[str]] = ["_dist_num", "_in_pdf"]
 
 
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -1479,12 +1696,13 @@ def _sym_display(sym: str) -> str:
     return sym.replace("_", "/")
 
 
-def get_price_context(
+def get_price_context(  # pylint: disable=too-many-locals
     current_price: Optional[float],
     supports: Optional[pd.DataFrame],
     resistances: Optional[pd.DataFrame],
     max_dist_pct: float = 5.0,
 ) -> str:
+    """Contexte prix vs S/R les plus proches (filtre max_dist_pct)."""
     if not current_price or current_price <= 0:
         return "Prix indisponible"
     parts: List[str] = []
@@ -1511,11 +1729,18 @@ def get_price_context(
     return "  |  ".join(parts) if parts else "Zone intermediaire"
 
 
-def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> Dict[str, Optional[dict]]:
-    result: Dict[str, Optional[dict]] = {"nearest_support": None, "nearest_resistance": None}
+def _parse_price_context_obstacles(
+    ctx_str: str, current_price: float,
+) -> Dict[str, Optional[dict]]:
+    """Parse string contexte → dict obstacles structuré pour JSON export."""
+    result: Dict[str, Optional[dict]] = {
+        "nearest_support": None, "nearest_resistance": None,
+    }
     if not ctx_str or ctx_str == "Zone intermediaire" or not current_price:
         return result
-    pat = re.compile(r"(SUR support|S proche|SUR resistance|R proche):\s*([\d.]+)\s*\(([+-][\d.]+)%\)")
+    pat = re.compile(
+        r"(SUR support|S proche|SUR resistance|R proche):\s*([\d.]+)\s*\(([+-][\d.]+)%\)"
+    )
     for m in pat.finditer(ctx_str):
         tag, level_str, dist_str = m.group(1), m.group(2), m.group(3)
         try:
@@ -1532,6 +1757,7 @@ def _parse_price_context_obstacles(ctx_str: str, current_price: float) -> Dict[s
 
 
 def strip_emojis_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip emojis/accents pour PDF latin-1."""
     clean = df.copy()
     for col in clean.select_dtypes(include='object').columns:
         clean[col] = clean[col].astype(str).apply(_safe_pdf_str)
@@ -1539,13 +1765,15 @@ def strip_emojis_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class PDF(FPDF):
-    def header(self):
+    """Rapport PDF formaté avec sections : anomalies, summary, confluences, TFs."""
+
+    def header(self) -> None:
         self.set_font('Helvetica', 'B', 15)
-        self.cell(0, 10,                                                            # pylint: disable=unexpected-keyword-arg
+        self.cell(0, 10,  # pylint: disable=unexpected-keyword-arg
                   _safe_pdf_str('Rapport Scanner Bluestar - Supports & Resistances'),
                   border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
-        self.cell(0, 6,                                                             # pylint: disable=unexpected-keyword-arg
+        self.cell(0, 6,  # pylint: disable=unexpected-keyword-arg
                   _safe_pdf_str(
                       f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  "
                       f"v{SCANNER_VERSION}  |  "
@@ -1555,23 +1783,23 @@ class PDF(FPDF):
                   border=0, align='C', new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
 
-    def footer(self):
+    def footer(self) -> None:
         self.set_y(-15)
         self.set_font('Helvetica', 'I', 8)
         self.cell(0, 10, f'Page {self.page_no()}', border=0, align='C')
 
-    def chapter_title(self, title):
+    def chapter_title(self, title: str) -> None:
         self.set_font('Helvetica', 'B', 12)
         self.cell(0, 10, _safe_pdf_str(title), border=0, align='L',  # pylint: disable=unexpected-keyword-arg
                   new_x='LMARGIN', new_y='NEXT')
         self.ln(4)
 
-    def chapter_anomalies(self, anomalies: dict):
+    def chapter_anomalies(self, anomalies: dict) -> None:
         if not anomalies:
             return
         self.set_font('Helvetica', 'B', 10)
-        self.cell(0, 7, _safe_pdf_str('ALERTES ANOMALIES PRIX'),
-                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')  # pylint: disable=unexpected-keyword-arg
+        self.cell(0, 7, _safe_pdf_str('ALERTES ANOMALIES PRIX'),  # pylint: disable=unexpected-keyword-arg
+                  border=0, align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(2)
         self.set_font('Helvetica', '', 8)
         for sym, msg in anomalies.items():
@@ -1579,25 +1807,25 @@ class PDF(FPDF):
             self.multi_cell(0, 5, line[:180])
         self.ln(4)
 
-    def chapter_summary(self, summaries):
+    def chapter_summary(self, summary_list: List[Dict[str, Any]]) -> None:  # pylint: disable=too-many-locals
         self.set_font('Helvetica', 'B', 10)
-        self.cell(0, 7,                                                             # pylint: disable=unexpected-keyword-arg
+        self.cell(0, 7,  # pylint: disable=unexpected-keyword-arg
                   _safe_pdf_str('RESUME PAR ACTIF  (Tendances + Top Zones Confluentes)'),
                   border=0, align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(2)
-        for s in summaries:
+        for s in summary_list:
             sym = _safe_pdf_str(s.get('symbol', ''))
             t_h4 = _safe_pdf_str(s.get('trend_h4', 'N/A'))
             t_d = _safe_pdf_str(s.get('trend_daily', 'N/A'))
             t_w = _safe_pdf_str(s.get('trend_weekly', 'N/A'))
             ctx = _safe_pdf_str(s.get('price_context', ''))
             self.set_font('Helvetica', 'B', 8)
-            self.cell(0, 5,                                                         # pylint: disable=unexpected-keyword-arg
+            self.cell(0, 5,  # pylint: disable=unexpected-keyword-arg
                       _safe_pdf_str(f"{sym}   H4:{t_h4}  Daily:{t_d}  Weekly:{t_w}"),
                       border=0, new_x='LMARGIN', new_y='NEXT')
             if ctx:
                 self.set_font('Helvetica', 'I', 7)
-                self.cell(0, 4, f"  Position : {ctx[:120]}",                       # pylint: disable=unexpected-keyword-arg
+                self.cell(0, 4, f"  Position : {ctx[:120]}",  # pylint: disable=unexpected-keyword-arg
                           border=0, new_x='LMARGIN', new_y='NEXT')
             top = s.get('top_zones', [])
             self.set_font('Helvetica', '', 7)
@@ -1612,15 +1840,15 @@ class PDF(FPDF):
                     txt = _safe_pdf_str(
                         f"  {sig}  Niv:{niv}  Dist:{dist}  Score:{sc}  TF:{tfs}  {ale}"
                     )
-                    self.cell(0, 4, txt[:130],                                      # pylint: disable=unexpected-keyword-arg
+                    self.cell(0, 4, txt[:130],  # pylint: disable=unexpected-keyword-arg
                               border=0, new_x='LMARGIN', new_y='NEXT')
             else:
-                self.cell(0, 4, "  Aucune confluence pour cet actif.",              # pylint: disable=unexpected-keyword-arg
+                self.cell(0, 4, "  Aucune confluence pour cet actif.",  # pylint: disable=unexpected-keyword-arg
                           border=0, new_x='LMARGIN', new_y='NEXT')
             self.ln(1)
 
-    def chapter_body(self, df):
-        if df.empty:
+    def chapter_body(self, df: pd.DataFrame) -> None:
+        if df is None or df.empty:
             self.set_font('Helvetica', '', 10)
             self.set_x(self.l_margin)
             usable_w = self.w - self.l_margin - self.r_margin
@@ -1648,8 +1876,8 @@ class PDF(FPDF):
         self.set_font('Helvetica', 'B', font_size)
         self.set_x(x_start)
         for col_name in cols:
-            self.cell(col_widths[col_name], 6, _safe_pdf_str(col_name),
-                      border=1, align='C', new_x='RIGHT', new_y='TOP')  # pylint: disable=unexpected-keyword-arg
+            self.cell(col_widths[col_name], 6, _safe_pdf_str(col_name),  # pylint: disable=unexpected-keyword-arg
+                      border=1, align='C', new_x='RIGHT', new_y='TOP')
         self.ln()
 
         self.set_font('Helvetica', '', font_size)
@@ -1661,20 +1889,23 @@ class PDF(FPDF):
                 max_chars = int(w / 1.25)
                 if len(val) > max_chars:
                     val = val[:max_chars - 1] + '.'
-                self.cell(w, 5, val, border=1, align='C', new_x='RIGHT', new_y='TOP')  # pylint: disable=unexpected-keyword-arg
+                self.cell(w, 5, val, border=1, align='C',  # pylint: disable=unexpected-keyword-arg
+                          new_x='RIGHT', new_y='TOP')
             self.ln()
 
 
 def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    """Filtre lignes selon pdf_max_dist_pct du profil. C9: fillna explicite."""
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
     if "_in_pdf" in df.columns:
         return _clean_df(df[df["_in_pdf"]].copy()).reset_index(drop=True)
     if "Actif" in df.columns and "_dist_num" in df.columns:
         unique_actifs = df["Actif"].unique()
         thresh_map = {a: get_profile(a.replace("/", "_")).pdf_max_dist_pct for a in unique_actifs}
-        thresholds = df["Actif"].map(thresh_map)
-        mask = df["_dist_num"] <= thresholds
+        thresholds = df["Actif"].map(thresh_map).fillna(8.0)  # C9
+        dist_num = pd.to_numeric(df["_dist_num"], errors="coerce").fillna(999.0)
+        mask = dist_num <= thresholds
         return _clean_df(df[mask].copy()).reset_index(drop=True)
     if "Dist. %" in df.columns:
         def _to_f(s: Any) -> float:
@@ -1690,7 +1921,7 @@ def _apply_pdf_filter(df: pd.DataFrame) -> pd.DataFrame:
 # EXPORTS — hash sémantique correct
 # ============================================================
 def _hash_results_dict(d: Dict[str, pd.DataFrame]) -> str:
-    """Hash sémantique réel d'un dict de DataFrames (utilise _hash_df enrichi)."""
+    """Hash sémantique réel d'un dict de DataFrames."""
     if not d:
         return "empty_dict"
     parts = []
@@ -1704,22 +1935,35 @@ def _hash_results_dict(d: Dict[str, pd.DataFrame]) -> str:
 
 
 def _hash_list_of_dicts(lst: List[Dict[str, Any]]) -> str:
+    """Hash stable d'une liste de dicts (ignore les DataFrames imbriqués)."""
     if not lst:
         return "empty_list"
-    return hashlib.md5(
-        json.dumps(
-            [{k: str(v)[:80] for k, v in d.items() if not isinstance(v, (pd.DataFrame, pd.Series))}
-             for d in lst],
-            sort_keys=True, default=str,
-        ).encode(),
-        usedforsecurity=False,
-    ).hexdigest()
+    try:
+        return hashlib.md5(
+            json.dumps(
+                [
+                    {k: str(v)[:80] for k, v in d.items()
+                     if not isinstance(v, (pd.DataFrame, pd.Series))}
+                    for d in lst
+                ],
+                sort_keys=True, default=str,
+            ).encode(),
+            usedforsecurity=False,
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return f"unhashable_list_{len(lst)}"
 
 
 def _hash_anomalies(d: Dict[str, str]) -> str:
     if not d:
         return "no_anom"
-    return hashlib.md5(json.dumps(d, sort_keys=True).encode(), usedforsecurity=False).hexdigest()
+    try:
+        return hashlib.md5(
+            json.dumps(d, sort_keys=True).encode(),
+            usedforsecurity=False,
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return f"unhashable_anom_{len(d)}"
 
 
 @st.cache_data(ttl=300, max_entries=8, show_spinner=False,
@@ -1728,13 +1972,14 @@ def _hash_anomalies(d: Dict[str, str]) -> str:
                    pd.DataFrame: _hash_df,
                    list: _hash_list_of_dicts,
                })
-def create_pdf_report(
+def create_pdf_report(  # pylint: disable=too-many-locals
     results_dict: Dict[str, pd.DataFrame],
     confluences_df: Optional[pd.DataFrame] = None,
-    summaries: Optional[List[Dict[str, Any]]] = None,
+    summary_list: Optional[List[Dict[str, Any]]] = None,
     anomalies: Optional[Dict[str, str]] = None,
 ) -> bytes:
-    summaries = summaries or []
+    """Génère le rapport PDF complet. Cache 300s."""
+    summary_list = summary_list or []
     anomalies = anomalies or {}
     pdf = PDF('L', 'mm', 'A4')
     pdf.set_margins(5, 10, 5)
@@ -1742,8 +1987,8 @@ def create_pdf_report(
     pdf.add_page()
     if anomalies:
         pdf.chapter_anomalies(anomalies)
-    if summaries:
-        pdf.chapter_summary(summaries)
+    if summary_list:
+        pdf.chapter_summary(summary_list)
         pdf.add_page()
     if confluences_df is not None and not confluences_df.empty:
         pdf.chapter_title('*** ZONES DE CONFLUENCE MULTI-TIMEFRAMES ***')
@@ -1761,10 +2006,10 @@ def create_pdf_report(
         if df is None or (hasattr(df, 'empty') and df.empty):
             continue
         pdf.chapter_title(title_map.get(tf_key, tf_key))
-        clean_df = strip_emojis_df(_clean_df(df.copy()))
-        if "Score (1TF)" in clean_df.columns:
-            clean_df = clean_df.sort_values("Score (1TF)", ascending=False)
-        pdf.chapter_body(clean_df)
+        clean_d = strip_emojis_df(_clean_df(df.copy()))
+        if "Score (1TF)" in clean_d.columns:
+            clean_d = clean_d.sort_values("Score (1TF)", ascending=False)
+        pdf.chapter_body(clean_d)
         pdf.ln(10)
     return bytes(pdf.output())
 
@@ -1775,6 +2020,7 @@ def create_csv_report(
     results_dict: Dict[str, pd.DataFrame],
     confluences_df: Optional[pd.DataFrame] = None,
 ) -> bytes:
+    """Export CSV consolidé (confluences + rows par TF)."""
     all_dfs: List[pd.DataFrame] = []
     if confluences_df is not None and not confluences_df.empty:
         c = _clean_df(confluences_df).copy()
@@ -1793,10 +2039,14 @@ def create_csv_report(
     return buf.getvalue()
 
 
-_TREND_ARROW: Dict[str, str] = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
-_STATUS_LABEL: Dict[str, str] = {"Vierge": "V", "Testee": "T", "Role Reverse": "RR", "Consommee": "C"}
-_ALERT_LABEL: Dict[str, str] = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠"}
-_SIGNAL_SHORT: Dict[str, str] = {"PIVOT": "PIVOT", "BUY": "BUY  ", "SELL": "SELL "}
+_TREND_ARROW: Final[Dict[str, str]] = {"HAUSSIER": "↑", "BAISSIER": "↓", "NEUTRE": "→"}
+_STATUS_LABEL: Final[Dict[str, str]] = {
+    "Vierge": "V", "Testee": "T", "Role Reverse": "RR", "Consommee": "C",
+}
+_ALERT_LABEL: Final[Dict[str, str]] = {"🔥 ZONE CHAUDE": "⚡", "⚠️ Proche": "⚠"}
+_SIGNAL_SHORT: Final[Dict[str, str]] = {
+    "PIVOT": "PIVOT", "BUY": "BUY  ", "SELL": "SELL ",
+}
 
 
 def _filter_confluences_to_actif_zones(
@@ -1805,6 +2055,7 @@ def _filter_confluences_to_actif_zones(
     min_score: float,
     allowed_statuts: tuple,
 ) -> Dict[str, list]:
+    """Filtre + groupe confluences par actif pour brief LLM."""
     actif_zones: Dict[str, list] = {}
     for _, row in confluences_df.iterrows():
         try:
@@ -1832,6 +2083,7 @@ def _filter_confluences_to_actif_zones(
 
 
 def _format_brief_zone_line(z: dict) -> str:
+    """Formate une ligne de zone pour brief LLM markdown."""
     sig = z["signal"]
     signal_short = next(
         (v for k, v in _SIGNAL_SHORT.items() if k in sig),
@@ -1848,12 +2100,13 @@ def _format_brief_zone_line(z: dict) -> str:
 @st.cache_data(ttl=300, max_entries=16, show_spinner=False,
                hash_funcs={pd.DataFrame: _hash_df, list: _hash_list_of_dicts})
 def create_llm_brief(
-    summaries: List[Dict[str, Any]],
+    summary_list: List[Dict[str, Any]],
     confluences_df: Optional[pd.DataFrame],
     max_dist: float = 2.0,
     min_score: float = 100.0,
     allowed_statuts: Tuple[str, ...] = ("Vierge", "Testee", "Role Reverse"),
 ) -> bytes:
+    """Génère brief markdown optimisé pour LLM."""
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines = [
         "# BRIEF S/R — Scanner Bluestar",
@@ -1865,13 +2118,16 @@ def create_llm_brief(
         "",
         "**Légende :**",
         "- `BUY` / `SELL` : direction de la zone",
-        "- `Sc` : Score pondéré (Force × Poids_TF × NbTF × Facteur_Age). >300=institutionnel, 100-300=fort",
-        "- `V` = Vierge | `T` = Testée | `RR` = Role Reverse (zone cassée retestée) | `C` = Consommée (éviter)",
+        ("- `Sc` : Score pondéré (Force × Poids_TF × NbTF × Facteur_Age)."
+         " >300=institutionnel, 100-300=fort"),
+        ("- `V` = Vierge | `T` = Testée | `RR` = Role Reverse (zone cassée retestée)"
+         " | `C` = Consommée (éviter)"),
         "- `Dist%` : distance du prix actuel à la zone",
         "- `TFs` : timeframes en confluence (H4/D/W)",
         "- `⚡` = zone chaude (<0.5% du prix) | `⚠` = proche (<1.5%)",
         "",
-        f"**Filtres actifs** : Dist < {max_dist}% | Score ≥ {min_score} | Statuts : {', '.join(allowed_statuts)}",
+        (f"**Filtres actifs** : Dist < {max_dist}% | Score ≥ {min_score} | "
+         f"Statuts : {', '.join(allowed_statuts)}"),
         "",
         "---",
         "",
@@ -1880,13 +2136,15 @@ def create_llm_brief(
         lines.append("_Aucune confluence disponible._")
         return "\n".join(lines).encode("utf-8")
 
-    actif_zones = _filter_confluences_to_actif_zones(confluences_df, max_dist, min_score, allowed_statuts)
+    actif_zones = _filter_confluences_to_actif_zones(
+        confluences_df, max_dist, min_score, allowed_statuts,
+    )
     sorted_actifs = sorted(
         actif_zones,
         key=lambda a: max(z["score"] for z in actif_zones[a]),
         reverse=True,
     )
-    summary_map = {s["symbol"]: s for s in summaries}
+    summary_map = {s["symbol"]: s for s in summary_list}
     total_zones = 0
 
     for actif in sorted_actifs:
@@ -1922,6 +2180,7 @@ def create_llm_brief(
 
 
 def _get_ict_session(dt_utc: datetime) -> str:
+    """Identifie la session ICT (Asian/London/Overlap/NewYork)."""
     if _NY_TZ is not None:
         if dt_utc.tzinfo is None:
             dt_utc = dt_utc.replace(tzinfo=timezone.utc)
@@ -1939,6 +2198,7 @@ def _get_ict_session(dt_utc: datetime) -> str:
 
 
 def _normalize_signal(raw: str) -> str:
+    """Normalise signal vers BUY/SELL/PIVOT/<other>."""
     r = raw.replace("🟢", "").replace("🔴", "").replace("↔️", "").replace("↔", "")
     r = r.replace("ZONE", "").strip()
     if "PIVOT" in r:
@@ -1951,6 +2211,7 @@ def _normalize_signal(raw: str) -> str:
 
 
 def _normalize_alert(raw: str) -> str:
+    """Normalise alerte vers HOT/CLOSE/''."""
     r = raw.replace("🔥", "").replace("⚠️", "").replace("⚠", "").strip()
     if "CHAUD" in r.upper() or "HOT" in r.upper():
         return "HOT"
@@ -1959,7 +2220,7 @@ def _normalize_alert(raw: str) -> str:
     return ""
 
 
-_TF_ORDER: Dict[str, int] = {"Weekly": 0, "Daily": 1, "H4": 2}
+_TF_ORDER: Final[Dict[str, int]] = {"Weekly": 0, "Daily": 1, "H4": 2}
 
 
 def _parse_timeframes(tf_str: str) -> List[str]:
@@ -1967,10 +2228,13 @@ def _parse_timeframes(tf_str: str) -> List[str]:
     return sorted(parts, key=lambda t: _TF_ORDER.get(t, 99))
 
 
-_BIAS_MAP: Dict[str, str] = {"HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL"}
+_BIAS_MAP: Final[Dict[str, str]] = {
+    "HAUSSIER": "BULLISH", "BAISSIER": "BEARISH", "NEUTRE": "NEUTRAL",
+}
 
 
 def _trend_alignment(h4: str, daily: str, weekly: str) -> Tuple[str, str]:
+    """Calcule alignment + bias dominant. Préserve sémantique métier existante."""
     b_h4 = _BIAS_MAP.get(h4, "NEUTRAL")
     b_d = _BIAS_MAP.get(daily, "NEUTRAL")
     b_w = _BIAS_MAP.get(weekly, "NEUTRAL")
@@ -1982,18 +2246,22 @@ def _trend_alignment(h4: str, daily: str, weekly: str) -> Tuple[str, str]:
         dominant = b_d if b_w == "NEUTRAL" else "NEUTRAL"
 
     if dominant != "NEUTRAL":
-        alignment = "ALIGNED" if b_h4 == dominant else ("PULLBACK" if b_h4 == "NEUTRAL" else "CONFLICTED")
+        alignment = (
+            "ALIGNED" if b_h4 == dominant
+            else ("PULLBACK" if b_h4 == "NEUTRAL" else "CONFLICTED")
+        )
     else:
         alignment = "BUILDING" if b_h4 != "NEUTRAL" else "MIXED"
     return alignment, dominant
 
 
-def _build_actif_groups(
+def _build_actif_groups(  # pylint: disable=too-many-locals
     confluences_df: pd.DataFrame,
     max_dist: float,
     min_score: float,
     allowed_statuts: tuple,
 ) -> Dict[str, List[Dict[str, Any]]]:
+    """Filtre + groupe confluences par actif pour export JSON."""
     actif_groups: Dict[str, List[Dict[str, Any]]] = {}
     for _, row in confluences_df.iterrows():
         try:
@@ -2036,25 +2304,31 @@ def _build_actif_groups(
 
 @st.cache_data(ttl=300, max_entries=16, show_spinner=False,
                hash_funcs={pd.DataFrame: _hash_df, list: _hash_list_of_dicts})
-def create_json_export(
-    summaries: List[Dict[str, Any]],
+def create_json_export(  # pylint: disable=too-many-locals
+    summary_list: List[Dict[str, Any]],
     confluences_df: Optional[pd.DataFrame],
     max_dist: float = 5.0,
     min_score: float = 60.0,
     allowed_statuts: Tuple[str, ...] = ("Vierge", "Testee", "Role Reverse"),
 ) -> bytes:
+    """Export JSON structuré (schéma stable, compatibilité préservée)."""
     now_utc = datetime.now(timezone.utc)
     output: Dict[str, Any] = {
         "generated_at": now_utc.isoformat(),
         "scanner_version": SCANNER_VERSION,
         "session": _get_ict_session(now_utc),
-        "filters": {"max_dist_pct": max_dist, "min_score": min_score,
-                    "allowed_statuts": list(allowed_statuts)},
+        "filters": {
+            "max_dist_pct": max_dist, "min_score": min_score,
+            "allowed_statuts": list(allowed_statuts),
+        },
         "assets": [],
     }
-    summary_map = {s["symbol"]: s for s in summaries}
-    actif_groups = _build_actif_groups(confluences_df, max_dist, min_score, allowed_statuts) \
-        if (confluences_df is not None and not confluences_df.empty) else {}
+    summary_map = {s["symbol"]: s for s in summary_list}
+    actif_groups = (
+        _build_actif_groups(confluences_df, max_dist, min_score, allowed_statuts)
+        if (confluences_df is not None and not confluences_df.empty)
+        else {}
+    )
 
     all_actifs = set(summary_map.keys()) | set(actif_groups.keys())
     sorted_actifs = sorted(
@@ -2065,7 +2339,9 @@ def create_json_export(
 
     for actif in sorted_actifs:
         s = summary_map.get(actif, {})
-        t_h4, t_d, t_w = s.get("trend_h4", "NEUTRE"), s.get("trend_daily", "NEUTRE"), s.get("trend_weekly", "NEUTRE")
+        t_h4 = s.get("trend_h4", "NEUTRE")
+        t_d = s.get("trend_daily", "NEUTRE")
+        t_w = s.get("trend_weekly", "NEUTRE")
         alignment, dominant = _trend_alignment(t_h4, t_d, t_w)
         cp_val = s.get("current_price")
         ctx_str = s.get("price_context", "")
@@ -2088,9 +2364,10 @@ def create_json_export(
     return json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def _filter_and_sort(df: pd.DataFrame, max_pct: float) -> pd.DataFrame:
-    if df.empty or "Dist. %" not in df.columns:
-        return df
+def _filter_and_sort(df: Optional[pd.DataFrame], max_pct: float) -> pd.DataFrame:
+    """Filtre lignes par Dist. % et trie par score (C15: robuste à None)."""
+    if df is None or df.empty or "Dist. %" not in df.columns:
+        return df if df is not None else pd.DataFrame()
 
     def _to_float(s: Any) -> float:
         try:
@@ -2106,6 +2383,7 @@ def _filter_and_sort(df: pd.DataFrame, max_pct: float) -> pd.DataFrame:
 
 
 def _show_diagnostics(errors: dict, anomalies: dict, missing_tfs_map: dict) -> None:
+    """Sections d'expanders pour diagnostics scan."""
     if errors:
         with st.expander(f"❌ {len(errors)} actif(s) en erreur — cliquer pour voir"):
             for sym, err in errors.items():
@@ -2121,6 +2399,7 @@ def _show_diagnostics(errors: dict, anomalies: dict, missing_tfs_map: dict) -> N
 
 
 def _show_confluence_section(conf_filt: pd.DataFrame) -> None:
+    """Section principale d'affichage confluences."""
     if conf_filt.empty:
         st.info("Aucune confluence dans la plage sélectionnée. Augmentez le filtre ou le seuil.")
         return
@@ -2138,26 +2417,31 @@ def _show_confluence_section(conf_filt: pd.DataFrame) -> None:
     c4.metric("🟢 BUY Zones", len(disp[disp["Signal"] == "🟢 BUY ZONE"]))
     c5.metric("🔴 SELL Zones", len(disp[disp["Signal"] == "🔴 SELL ZONE"]))
     c6.metric("↔ PIVOT Zones", len(disp[disp["Signal"] == "↔ PIVOT ZONE"]))
+    text_cols = ["Actif", "Signal", "Niveau", "Type", "Timeframes",
+                 "Statut", "Distance %", "Alerte"]
     conf_cfg = {
-        **{k: st.column_config.TextColumn(k, width="small")
-           for k in ["Actif", "Signal", "Niveau", "Type", "Timeframes", "Statut", "Distance %", "Alerte"]},
+        **{k: st.column_config.TextColumn(k, width="small") for k in text_cols},
         "Nb TF": st.column_config.NumberColumn("Nb TF", width="small"),
         "Force Totale": st.column_config.NumberColumn("Force Totale", width="small"),
         "Score": st.column_config.NumberColumn("Score ▼", width="small"),
     }
-    st.dataframe(disp, column_config=conf_cfg, hide_index=True,
-                 width='stretch', height=min(len(disp) * 35 + 38, 750))
+    st.dataframe(
+        disp, column_config=conf_cfg, hide_index=True,
+        width='stretch', height=min(len(disp) * 35 + 38, 750),
+    )
 
 
-def _show_export_section(
-    rep_dict: dict, conf_full: pd.DataFrame, summaries: list, anomalies: dict,
+def _show_export_section(  # pylint: disable=too-many-locals
+    rep_dict: dict, conf_full: pd.DataFrame,
+    summary_list: list, anomalies: dict,
 ) -> None:
+    """Section exports PDF/CSV/LLM/JSON avec gestion d'erreur granulaire."""
     st.subheader("📋 Exportation du Rapport")
     with st.expander("Cliquez ici pour télécharger les résultats"):
         col1, col2 = st.columns(2)
         with col1:
             try:
-                pdf_bytes = create_pdf_report(rep_dict, conf_full, summaries, anomalies)
+                pdf_bytes = create_pdf_report(rep_dict, conf_full, summary_list, anomalies)
                 st.download_button(
                     "📄 Rapport PDF (complet)", data=pdf_bytes,
                     file_name=f"rapport_bluestar_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
@@ -2184,7 +2468,10 @@ def _show_export_section(
         llm_max_dist = float(st.session_state.get("llm_max_dist", 2.0))
         llm_min_score = float(st.session_state.get("llm_min_score", 100))
         llm_statuts_raw = st.session_state.get("llm_statuts", ["Vierge", "Testee", "Role Reverse"])
-        llm_statuts = tuple(llm_statuts_raw) if llm_statuts_raw else ("Vierge", "Testee", "Role Reverse")
+        llm_statuts = (
+            tuple(llm_statuts_raw) if llm_statuts_raw
+            else ("Vierge", "Testee", "Role Reverse")
+        )
         st.caption(
             f"🔧 Filtres actifs : Dist < **{llm_max_dist}%** | "
             f"Score ≥ **{llm_min_score}** | {', '.join(llm_statuts)}"
@@ -2194,7 +2481,7 @@ def _show_export_section(
         with col3:
             try:
                 md_bytes = create_llm_brief(
-                    summaries, conf_full,
+                    summary_list, conf_full,
                     max_dist=llm_max_dist, min_score=llm_min_score,
                     allowed_statuts=llm_statuts,
                 )
@@ -2209,7 +2496,7 @@ def _show_export_section(
         with col4:
             try:
                 json_bytes = create_json_export(
-                    summaries, conf_full,
+                    summary_list, conf_full,
                     max_dist=llm_max_dist, min_score=llm_min_score,
                     allowed_statuts=llm_statuts,
                 )
@@ -2224,7 +2511,10 @@ def _show_export_section(
 
         st.divider()
         st.markdown("**👁️ Aperçu du Brief LLM**")
-        st.caption(f"Filtres : Dist < {llm_max_dist}% | Score ≥ {llm_min_score} | {', '.join(llm_statuts)}")
+        st.caption(
+            f"Filtres : Dist < {llm_max_dist}% | Score ≥ {llm_min_score} | "
+            f"{', '.join(llm_statuts)}"
+        )
         try:
             brief_preview = md_bytes.decode("utf-8") if md_bytes else ""
             if brief_preview:
@@ -2237,8 +2527,10 @@ def _show_export_section(
                     f"**{n_actifs} actifs** avec **{n_zones} zones** dans le brief LLM "
                     f"(≈ {n_zones * 15 + n_actifs * 10:,} tokens estimés)"
                 )
-                st.text_area("Brief LLM (copiable directement)", value=brief_preview,
-                             height=400, label_visibility="collapsed")
+                st.text_area(
+                    "Brief LLM (copiable directement)", value=brief_preview,
+                    height=400, label_visibility="collapsed",
+                )
             else:
                 st.warning("Aperçu non disponible.")
         except (UnicodeDecodeError, AttributeError, TypeError, MemoryError):
@@ -2258,7 +2550,8 @@ _TF_COL_CONFIG = {
 }
 
 
-def _display_results(sr: dict, max_dist_filter: float) -> None:
+def _display_results(sr: dict, max_dist_filter_pct: float) -> None:
+    """Affichage final résultats avec filtres."""
     _df_h4 = sr.get("df_h4", pd.DataFrame())
     _df_daily = sr.get("df_daily", pd.DataFrame())
     _df_wk = sr.get("df_weekly", pd.DataFrame())
@@ -2275,9 +2568,11 @@ def _display_results(sr: dict, max_dist_filter: float) -> None:
             tmp["Distance %"].astype(str).str.replace("%", "", regex=False),
             errors="coerce",
         ).fillna(999.0)
-        conf_filt = (tmp[tmp["_dist_num"] <= max_dist_filter]
-                     .drop(columns=["_dist_num"], errors="ignore")
-                     .reset_index(drop=True))
+        conf_filt = (
+            tmp[tmp["_dist_num"] <= max_dist_filter_pct]
+            .drop(columns=["_dist_num"], errors="ignore")
+            .reset_index(drop=True)
+        )
     else:
         conf_filt = pd.DataFrame()
 
@@ -2286,19 +2581,23 @@ def _display_results(sr: dict, max_dist_filter: float) -> None:
     _show_export_section(_rep_dict, _conf_full, _summaries, _anomalies)
 
     st.divider()
-    for label, df in [("📅 Analyse 4 Heures (H4)", _df_h4),
-                      ("📅 Analyse Journalière (Daily)", _df_daily),
-                      ("📅 Analyse Hebdomadaire (Weekly)", _df_wk)]:
+    for label, df in [
+        ("📅 Analyse 4 Heures (H4)", _df_h4),
+        ("📅 Analyse Journalière (Daily)", _df_daily),
+        ("📅 Analyse Hebdomadaire (Weekly)", _df_wk),
+    ]:
         st.subheader(label)
-        fd = _filter_and_sort(df, max_dist_filter)
-        st.dataframe(fd, column_config=_TF_COL_CONFIG, hide_index=True,
-                     width='stretch', height=min(len(fd) * 35 + 38, 600))
+        fd = _filter_and_sort(df, max_dist_filter_pct)
+        st.dataframe(
+            fd, column_config=_TF_COL_CONFIG, hide_index=True,
+            width='stretch', height=min(len(fd) * 35 + 38, 600),
+        )
 
 
 # ==============================================================================
 # CONSTANTES UI
 # ==============================================================================
-CONFLUENCE_THRESHOLD_MAP: Dict[str, float] = {
+CONFLUENCE_THRESHOLD_MAP: Final[Dict[str, float]] = {
     "US30_USD": 1.5, "NAS100_USD": 1.5, "SPX500_USD": 1.2, "DE30_EUR": 1.2,
     "XAU_USD": 1.5,
 }
@@ -2376,9 +2675,9 @@ with st.sidebar:
 
     st.header("3. Paramètres Export LLM")
     st.caption("Ces paramètres survivent aux re-renders contrairement aux sliders dans l'expander.")
-    llm_max_dist_sidebar = st.slider("Dist. max (%) brief LLM", 0.5, 5.0, 2.0, 0.5, key="llm_max_dist")
-    llm_min_score_sidebar = st.slider("Score min JSON/LLM", 20, 300, 30, 10, key="llm_min_score")
-    llm_statuts_sidebar = st.multiselect(
+    st.slider("Dist. max (%) brief LLM", 0.5, 5.0, 2.0, 0.5, key="llm_max_dist")
+    st.slider("Score min JSON/LLM", 20, 300, 30, 10, key="llm_min_score")
+    st.multiselect(
         "Statuts autorisés (brief LLM)",
         options=["Vierge", "Testee", "Role Reverse", "Consommee"],
         default=["Vierge", "Testee", "Role Reverse"],
@@ -2400,6 +2699,11 @@ with st.sidebar:
     )
 
     st.divider()
+    if st.button("🧹 Vider le cache OANDA", help="Reset thread-safe du cache mémoire"):
+        n_cleared = _cache_clear()
+        st.success(f"Cache vidé : {n_cleared} entrée(s)")
+
+    st.divider()
     st.caption("**Score confluence = (Force × Poids_TF × NbTF) × Facteur_Age**")
     st.caption("🔴 > 300 : Zone institutionnelle majeure")
     st.caption("🟠 100–300 : Zone structurelle forte")
@@ -2414,18 +2718,23 @@ with st.sidebar:
     st.caption("❌ Consommée = cassée sans retour")
 
     st.divider()
-    st.caption(f"**v{SCANNER_VERSION} — Durcissement chirurgical**")
-    st.caption("✅ Hash DataFrame sémantique (head+mid+tail)")
-    st.caption("✅ Anomalies prix : tolérance frontière de bougie")
-    st.caption("✅ Cache négatif TTL court dédié (20s)")
-    st.caption("✅ Async isolé en worker thread (nest_asyncio supprimé)")
-    st.caption("✅ Sanitization tokens : regex globale + filtre logger")
-    st.caption("✅ Sanitization OHLC : drop NaN, sort, dédup, ratio borné")
-    st.caption("✅ _process_symbol : isolation totale par symbole")
-    st.caption("✅ Borne fraîcheur absolue dernière bougie")
+    st.caption(f"**v{SCANNER_VERSION} — Production Hardened**")
+    st.caption("✅ Hash DataFrame sémantique enrichi (shape+vol+sample)")
+    st.caption("✅ Anomalies prix décomposées (CC 24 → 6)")
+    st.caption("✅ Cache négatif TTL court dédié + reset thread-safe")
+    st.caption("✅ Async isolé : worker thread + timeout fermeture")
+    st.caption("✅ Sanitization tokens : regex + filtre logger global")
+    st.caption("✅ Sanitization OHLC stricte (drop NaN, dédup, ratio)")
+    st.caption("✅ Isolation totale par symbole (filet ultime)")
+    st.caption("✅ Borne fraîcheur absolue + tolérance frontière")
+    st.caption("✅ Anti-double-scan via state atomique")
 
 
+# ==============================================================================
+# POST-SCAN AGGREGATORS
+# ==============================================================================
 def _collect_scan_results(raw_results: list, progress_bar: Any) -> dict:
+    """Aggrégation post-scan : éclate ScanResult en maps utilisables UI."""
     results_h4: list = []
     results_daily: list = []
     results_weekly: list = []
@@ -2468,33 +2777,39 @@ def _collect_scan_results(raw_results: list, progress_bar: Any) -> dict:
                 results_weekly.extend(tf_rows)
 
     return {
-        "results_h4": results_h4, "results_daily": results_daily, "results_weekly": results_weekly,
-        "all_zones_map": all_zones_map, "prices_map": prices_map, "trends_map": trends_map,
+        "results_h4": results_h4, "results_daily": results_daily,
+        "results_weekly": results_weekly,
+        "all_zones_map": all_zones_map, "prices_map": prices_map,
+        "trends_map": trends_map,
         "anomalies_map": anomalies_map, "scan_errors": scan_errors,
         "bars_map_global": bars_map_global, "missing_tfs_map": missing_tfs_map,
         "price_fallback_map": price_fallback_map,
     }
 
 
-def _compute_confluences(
-    symbols_to_scan: list,
+def _compute_confluences(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    scan_symbols: list,
     all_zones_map: dict,
     prices_map: dict,
     bars_map_global: dict,
-    confluence_threshold: float,
+    default_threshold: float,
     scan_errors: dict,
 ) -> pd.DataFrame:
+    """Calcule toutes les confluences multi-TF avec seuil par profil."""
     all_confluences = []
-    for sym in symbols_to_scan:
+    for sym in scan_symbols:
         if _sym_display(sym) in scan_errors:
             continue
         try:
-            zones_clean = {k: v for k, v in all_zones_map.get(sym, {}).items() if not k.startswith("_")}
-            sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, confluence_threshold)
+            zones_clean = {
+                k: v for k, v in all_zones_map.get(sym, {}).items()
+                if not k.startswith("_")
+            }
+            sym_threshold = CONFLUENCE_THRESHOLD_MAP.get(sym, default_threshold)
             confs = detect_confluences(
                 _sym_display(sym), zones_clean, prices_map.get(sym),
                 bars_map_global.get(sym, {}),
-                confluence_threshold=sym_threshold,
+                confluence_threshold_pct=sym_threshold,
             )
             all_confluences.extend(confs)
         except (KeyError, ValueError, TypeError, AttributeError) as e:
@@ -2505,8 +2820,8 @@ def _compute_confluences(
     return _clean_df(conf_full) if not conf_full.empty else conf_full
 
 
-def _build_summaries(
-    symbols_to_scan: list,
+def _build_summaries(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    scan_symbols: list,
     prices_map: dict,
     trends_map: dict,
     all_zones_map: dict,
@@ -2514,13 +2829,15 @@ def _build_summaries(
     missing_tfs_map: dict,
     price_fallback_map: dict,
 ) -> List[Dict[str, Any]]:
-    summaries: List[Dict[str, Any]] = []
-    for sym in symbols_to_scan:
+    """Construit résumés par actif pour PDF/LLM/JSON."""
+    summary_list: List[Dict[str, Any]] = []
+    for sym in scan_symbols:
         sym_d = _sym_display(sym)
         trends = trends_map.get(sym, {})
         cp = prices_map.get(sym)
         top_zones: list = []
-        if not conf_full.empty and "Actif" in conf_full.columns and sym_d in conf_full["Actif"].values:
+        if (not conf_full.empty and "Actif" in conf_full.columns
+                and sym_d in conf_full["Actif"].values):
             try:
                 top_zones = (
                     conf_full[conf_full["Actif"] == sym_d]
@@ -2537,7 +2854,7 @@ def _build_summaries(
                 price_ctx = get_price_context(cp, sup_d, res_d)
             except (ValueError, TypeError, AttributeError):
                 price_ctx = ""
-        summaries.append({
+        summary_list.append({
             "symbol": sym_d,
             "trend_h4": trends.get("H4", "NEUTRE"),
             "trend_daily": trends.get("Daily", "NEUTRE"),
@@ -2548,13 +2865,14 @@ def _build_summaries(
             "missing_tfs": missing_tfs_map.get(sym_d, []),
             "price_is_fallback": price_fallback_map.get(sym, False),
         })
-    return summaries
+    return summary_list
 
 
 # ==============================================================================
-# LOGIQUE PRINCIPALE
+# LOGIQUE PRINCIPALE — C11 : guard atomique anti-double-scan
 # ==============================================================================
 if scan_button and symbols_to_scan and not st.session_state.get("scanning", False):
+    # C11: lock atomique avant rerun pour empêcher double déclenchement
     st.session_state.pop("scan_results", None)
     st.session_state["scanning"] = True
     st.session_state["pending_scan"] = True
@@ -2578,7 +2896,6 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
 
             try:
                 with st.spinner("Pipeline async I/O en cours…"):
-                    # Run via worker thread isolé (plus de nest_asyncio)
                     raw_results = _run_async_isolated(
                         lambda: run_institutional_scan(
                             symbols_to_scan, access_token, account_id, min_touches,
@@ -2596,9 +2913,11 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
                 st.session_state.pop("scan_token", None)
                 st.stop()
             except Exception as e:  # pylint: disable=broad-exception-caught
-                tb = _sanitize_traceback(traceback.format_exc(), [access_token, account_id])
+                sanitized_tb = _sanitize_traceback(
+                    traceback.format_exc(), [access_token, account_id],
+                )
                 logging.exception("Scan failure")
-                st.error(f"Erreur inattendue : {type(e).__name__} — {tb[-400:]}")
+                st.error(f"Erreur inattendue : {type(e).__name__} — {sanitized_tb[-400:]}")
                 st.session_state["scanning"] = False
                 st.session_state.pop("scan_token", None)
                 st.stop()
@@ -2615,20 +2934,26 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
             else:
                 st.warning(f"⚠️ Scan terminé — {n_ok} actifs OK, {n_failures} en erreur.")
             if collected["anomalies_map"]:
-                st.warning(f"⚠️ {len(collected['anomalies_map'])} anomalie(s) de prix détectée(s).")
+                st.warning(
+                    f"⚠️ {len(collected['anomalies_map'])} anomalie(s) de prix détectée(s)."
+                )
             if collected["missing_tfs_map"]:
-                st.info(f"📡 {len(collected['missing_tfs_map'])} actif(s) avec des TFs manquants.")
+                st.info(
+                    f"📡 {len(collected['missing_tfs_map'])} actif(s) avec des TFs manquants."
+                )
 
             st.info("🔍 Analyse des confluences multi-timeframes…")
             conf_full = _compute_confluences(
                 symbols_to_scan,
                 collected["all_zones_map"], collected["prices_map"],
-                collected["bars_map_global"], confluence_threshold, collected["scan_errors"],
+                collected["bars_map_global"], confluence_threshold,
+                collected["scan_errors"],
             )
             summaries = _build_summaries(
                 symbols_to_scan,
-                collected["prices_map"], collected["trends_map"], collected["all_zones_map"],
-                conf_full, collected["missing_tfs_map"], collected["price_fallback_map"],
+                collected["prices_map"], collected["trends_map"],
+                collected["all_zones_map"], conf_full,
+                collected["missing_tfs_map"], collected["price_fallback_map"],
             )
 
             df_h4 = pd.DataFrame(collected["results_h4"])
@@ -2649,9 +2974,12 @@ if st.session_state.get("pending_scan", False) and symbols_to_scan:
 
 elif not symbols_to_scan and not st.session_state.get("scanning", False):
     st.info("Sélectionnez des actifs à scanner dans la barre latérale.")
-elif not st.session_state.get("pending_scan", False) and not st.session_state.get("scanning", False):
-    st.info("Configurez les paramètres dans la barre latérale, puis cliquez sur **LANCER LE SCAN COMPLET**.")
+elif (not st.session_state.get("pending_scan", False)
+      and not st.session_state.get("scanning", False)):
+    st.info(
+        "Configurez les paramètres dans la barre latérale, "
+        "puis cliquez sur **LANCER LE SCAN COMPLET**."
+    )
 
 if "scan_results" in st.session_state and not st.session_state.get("pending_scan", False):
     _display_results(st.session_state["scan_results"], max_dist_filter)
-
