@@ -48,7 +48,7 @@ from scipy.signal import find_peaks
 # ==============================================================================
 # [ LAYER 0: CONFIG & LOGGING ]
 # ==============================================================================
-SCANNER_VERSION: Final[str] = "8.6.2-PROD"
+SCANNER_VERSION: Final[str] = "8.6.3-PROD"
 
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
@@ -351,19 +351,19 @@ _PROFILES: Final[Dict[str, InstrumentProfile]] = {
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
     "US30_USD":   InstrumentProfile("US30_USD",   "INDEX", 1.0,    2.5,  1.5,  0.4,  2.5, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=25000.0, price_max=60000.0, major_pivot_mult=1.5,
+                                     price_min=25000.0, price_max=60000.0, major_pivot_mult=1.0,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
     "NAS100_USD": InstrumentProfile("NAS100_USD", "INDEX", 1.0,    2.5,  1.5,  0.4,  2.5, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=10000.0, price_max=50000.0, major_pivot_mult=1.5,
+                                     price_min=10000.0, price_max=50000.0, major_pivot_mult=1.0,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
     "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    2.2,  1.2,  0.35, 2.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=3000.0,  price_max=12000.0, major_pivot_mult=1.5,
+                                     price_min=3000.0,  price_max=12000.0, major_pivot_mult=1.0,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
     "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    2.2,  1.2,  0.35, 2.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=10000.0, price_max=30000.0, major_pivot_mult=1.5,
+                                     price_min=10000.0, price_max=30000.0, major_pivot_mult=1.0,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
 }
 
@@ -388,7 +388,7 @@ def get_profile(symbol: str) -> InstrumentProfile:
             min_touches_h4=1,
             min_touches_daily=1,
             min_touches_weekly=1,
-            major_pivot_mult=2.0,
+            major_pivot_mult=1.0,
         )
     if base in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF", "USD"):
         return InstrumentProfile(
@@ -1201,6 +1201,16 @@ def find_strong_sr_zones(
         ascending=[True, True, True],
     ).reset_index(drop=True)
 
+    # Reclassifier les zones orphelines (type incompatible avec position prix)
+    # pour eviter qu'elles ne disparaissent silencieusement
+    for idx, row in df_zones.iterrows():
+        lvl = row["level"]
+        ztype = row["zone_type"]
+        if ztype == "Resistance" and lvl < current_price:
+            df_zones.at[idx, "zone_type"] = "Pivot"
+        elif ztype == "Support" and lvl >= current_price:
+            df_zones.at[idx, "zone_type"] = "Pivot"
+
     df_zones["near_price"] = (
         np.abs(df_zones["level"] - current_price) / current_price * 100
     ) <= 0.50
@@ -1213,6 +1223,22 @@ def find_strong_sr_zones(
         (df_zones["level"] >= current_price)
         & (df_zones["zone_type"].isin(["Resistance", "Pivot"]))
     ].copy()
+
+    # Si le DataFrame final est vide mais des zones existaient, activer trend-mode
+    # (securite: le mode trend a deja du s'activer, mais si des zones orphelines
+    #  ont bloque l'activation, on force un second essai)
+    if supports.empty and resistances.empty and profile.asset_class in ("INDEX", "METAL"):
+        _LOG.info("Trend-mode safety net for %s %s (orphan zones blocked output)", symbol, timeframe)
+        tr_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Support") +                    _detect_trend_structure_zones(df, current_price, profile, atr_val, "Resistance")
+        if tr_zones:
+            tr_df = pd.DataFrame(tr_zones)
+            tr_df["near_price"] = (np.abs(tr_df["level"] - current_price) / current_price * 100) <= 0.50
+            supports = tr_df[
+                (tr_df["level"] < current_price) & (tr_df["zone_type"].isin(["Support", "Pivot"]))
+            ].copy()
+            resistances = tr_df[
+                (tr_df["level"] >= current_price) & (tr_df["zone_type"].isin(["Resistance", "Pivot"]))
+            ].copy()
 
     return supports, resistances
 
@@ -1960,4 +1986,4 @@ if "scan_results" in st.session_state:
     with col3:
         llm_b = create_llm_brief(res["summaries"], res["conf_full"], llm_max_dist, llm_min_score, tuple(llm_statuts))
         st.download_button("🤖 LLM Brief", data=llm_b, file_name="brief_llm.md")
-    
+       
