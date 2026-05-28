@@ -345,23 +345,23 @@ _PROFILES: Final[Dict[str, InstrumentProfile]] = {
     "EUR_USD":    InstrumentProfile("EUR_USD",    "FOREX", 0.0001, 1.2,  0.8,  0.6,  1.5, False),
     "GBP_USD":    InstrumentProfile("GBP_USD",    "FOREX", 0.0001, 1.3,  0.85, 0.65, 1.5, False),
     "USD_JPY":    InstrumentProfile("USD_JPY",    "FOREX", 0.01,   0.9,  0.5,  0.5,  1.5, False),
-    "XAU_USD":    InstrumentProfile("XAU_USD",    "METAL", 0.01,   2.5,  1.5,  1.0,  3.0, True,
+    "XAU_USD":    InstrumentProfile("XAU_USD",    "METAL", 0.01,   2.5,  1.5,  0.5,  3.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=1500.0, price_max=6000.0, major_pivot_mult=1.5,
+                                     price_min=1500.0, price_max=6000.0, major_pivot_mult=1.0,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
-    "US30_USD":   InstrumentProfile("US30_USD",   "INDEX", 1.0,    2.5,  1.5,  0.7,  2.5, True,
+    "US30_USD":   InstrumentProfile("US30_USD",   "INDEX", 1.0,    2.5,  1.5,  0.4,  2.5, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
                                      price_min=25000.0, price_max=60000.0, major_pivot_mult=1.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
-    "NAS100_USD": InstrumentProfile("NAS100_USD", "INDEX", 1.0,    2.5,  1.5,  0.8,  2.5, True,
+    "NAS100_USD": InstrumentProfile("NAS100_USD", "INDEX", 1.0,    2.5,  1.5,  0.4,  2.5, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
                                      price_min=10000.0, price_max=50000.0, major_pivot_mult=1.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
-    "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    2.2,  1.2,  0.65, 2.0, True,
+    "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    2.2,  1.2,  0.35, 2.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
                                      price_min=3000.0,  price_max=12000.0, major_pivot_mult=1.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
-    "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    2.2,  1.2,  0.65, 2.0, True,
+    "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    2.2,  1.2,  0.35, 2.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
                                      price_min=10000.0, price_max=30000.0, major_pivot_mult=1.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
@@ -382,7 +382,7 @@ def get_profile(symbol: str) -> InstrumentProfile:
     quote = parts[1] if len(parts) >= 2 else ""
     if quote == "JPY":
         return InstrumentProfile(
-            sym, "FOREX", 0.01, 0.9, 0.5, 0.3, 1.5, False,
+            sym, "FOREX", 0.01, 0.9, 0.5, 0.2, 1.5, False,
             max_high_low_ratio=1.8,
             ignore_wick_filter=True,
         )
@@ -671,7 +671,9 @@ def _pivot_prominence_threshold(df: pd.DataFrame, profile: InstrumentProfile, at
     current_p = float(df["close"].iloc[-1])
     if current_p <= 0 or not np.isfinite(current_p):
         return atr_val * profile.pivot_prominence_atr
-    return float(min(atr_val * profile.pivot_prominence_atr, current_p * 0.008))
+    # Cap relatif: 0.8% pour Forex, 1.2% pour INDEX/METAL (plus permissif)
+    cap_pct = 0.012 if profile.asset_class in ("INDEX", "METAL") else 0.008
+    return float(min(atr_val * profile.pivot_prominence_atr, current_p * cap_pct))
 
 
 def detect_swing_pivots_meta(
@@ -784,11 +786,15 @@ def _get_pivots_with_fallback_meta(
     pivots = detect_swing_pivots_meta(df, profile, atr_val, timeframe)
     if len(pivots) >= 3:
         return pivots
-    # Fallback calibration: si zero pivot, essayer avec 50% du seuil de prominence
-    if not pivots and profile.asset_class in ("INDEX", "METAL"):
-        pivots = detect_swing_pivots_meta(df, profile, atr_val * 0.5, timeframe)
+    # Fallback calibration: si zero pivot sur INDEX/METAL/JPY, essayer avec 50% du seuil
+    if not pivots and profile.asset_class in ("INDEX", "METAL", "FOREX"):
+        # Creer un profil temporaire avec prominence reduite
+        fallback_profile = replace(profile, pivot_prominence_atr=profile.pivot_prominence_atr * 0.5)
+        pivots = detect_swing_pivots_meta(df, fallback_profile, atr_val, timeframe)
         if pivots:
-            _LOG.info("Index/Metal fallback pivot recovery: %s %s -> %d pivots", profile.symbol, timeframe, len(pivots))
+            _LOG.info("Fallback pivot recovery: %s %s -> %d pivots (prominence %.2f -> %.2f)", 
+                     profile.symbol, timeframe, len(pivots), 
+                     profile.pivot_prominence_atr, fallback_profile.pivot_prominence_atr)
     try:
         n_total = len(df)
         dist = _PIVOT_FALLBACK_DIST.get(timeframe.lower(), 5)
