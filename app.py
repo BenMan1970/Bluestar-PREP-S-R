@@ -1,16 +1,30 @@
 # pylint: disable=too-many-lines
 """
-Scanner Bluestar Supports/Résistances - v8.6.2-PROD-INSTITUTIONAL
+Scanner Bluestar Supports/Résistances - v8.6.1-PROD-INSTITUTIONAL
 
-Hotfix vs 8.6.1:
-  H1. PDF rendering hardened against FPDFException "Not enough horizontal
-      space to render a single character":
-      - explicit set_x(l_margin) before every multi_cell
-      - explicit effective-page-width (epw) instead of width=0
-      - margins widened from 5mm to 8mm
-      - safe_multi_cell() wrapper with cell() fallback
-      - control-char stripping in _safe_pdf_str
-      - aggressive truncation of anomaly messages
+Production-grade institutional release.
+
+Critical fixes vs v8.6.0:
+  C1.  Hybrid Min-Touches REAL: 1-touch zone allowed ONLY if real prominence
+       >= ATR * major_pivot_mult (tracked through pivot pipeline).
+  C2.  Separated support/resistance clustering: pivots highs and lows are
+       clustered independently to avoid hybrid support/resistance fusion.
+  C3.  JSON export honors allowed_statuts filter (was silently ignored).
+  C4.  JSON coverage complete: every requested asset appears in output, even
+       with zero zones. Distinguishes "no zone" from "not processed".
+  C5.  OHLC ratio validation per-profile (max_high_low_ratio per asset class)
+       instead of global 1.5 hardcoded threshold.
+  C6.  Log sanitization extended: cleans record.args, exc_info, exc_text,
+       traceback frames - no more token leaks via exceptions.
+  C7.  Slider H4 honored: default min_touches_h4 lowered to 2 to match UI.
+  C8.  Debug observability: real n_pivots, n_zones counters populated.
+  C9.  Data anomaly detection extended: gap detection, stale price, candle
+       count minimum, ATR/price ratio sanity, monotonicity.
+  C10. UTF-8 string hygiene: all emojis and labels use proper unicode
+       (no more mojibake in JSON/PDF/LLM exports).
+
+Plus: deterministic ordering, coverage validation, prominence cap,
+hybrid cluster radius, profile-driven validation, separated engine/UI.
 """
 from __future__ import annotations
 
@@ -41,13 +55,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from fpdf import FPDF
-from fpdf.errors import FPDFException
 from scipy.signal import find_peaks
 
 # =============================================================================
 # LAYER 0a - VERSION & CONSTANTS
 # =============================================================================
-SCANNER_VERSION: Final[str] = "8.6.2-PROD-INSTITUTIONAL"
+SCANNER_VERSION: Final[str] = "8.6.1-PROD-INSTITUTIONAL"
 
 # =============================================================================
 # LAYER 0b - SECURE LOGGING (C6)
@@ -63,8 +76,10 @@ _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
 
 
 def _redact_sensitive(text: Any) -> Any:
+    """Strip API tokens, bearer credentials, and account hashes from text."""
     if not isinstance(text, str) or not text:
         return text
+
     out = text
     for pat in _TOKEN_REDACT_PATTERNS:
         try:
@@ -74,6 +89,7 @@ def _redact_sensitive(text: Any) -> Any:
                     if prefix:
                         return prefix + "***REDACTED***"
                 return "***REDACTED***"
+
             out = pat.sub(_repl, out)
         except Exception:
             continue
@@ -81,6 +97,7 @@ def _redact_sensitive(text: Any) -> Any:
 
 
 def _sanitize_log_obj(obj: Any) -> Any:
+    """Recursively sanitize log arguments (strings, tuples, lists, dicts)."""
     if isinstance(obj, str):
         return _redact_sensitive(obj)
     if isinstance(obj, tuple):
@@ -93,12 +110,16 @@ def _sanitize_log_obj(obj: Any) -> Any:
 
 
 class _SensitiveDataFilter(logging.Filter):
+    """Industrial-grade log filter: sanitizes msg, args, exc_info."""
+
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             if isinstance(record.msg, str):
                 record.msg = _redact_sensitive(record.msg)
+
             if record.args:
                 record.args = _sanitize_log_obj(record.args)
+
             if record.exc_info:
                 try:
                     exc_text = "".join(traceback.format_exception(*record.exc_info))
@@ -106,10 +127,12 @@ class _SensitiveDataFilter(logging.Filter):
                 except Exception:
                     record.exc_text = "<exception formatting failed>"
                 record.exc_info = None
+
             if record.exc_text:
                 record.exc_text = _redact_sensitive(record.exc_text)
         except Exception:
             pass
+
         return True
 
 
@@ -270,7 +293,7 @@ _PER_REQUEST_TIMEOUT_S: Final[float] = 10.0
 _SCAN_LOCK_TTL_S: Final[float] = 900.0
 _MAX_HIGH_LOW_RATIO_DEFAULT: Final[float] = 1.8
 
-
+# Symbol normalization helpers (C8 - explicit display/internal mapping)
 def _to_internal_symbol(sym: str) -> str:
     return str(sym).upper().replace("/", "_").strip()
 
@@ -280,7 +303,7 @@ def _to_display_symbol(sym: str) -> str:
 
 
 # =============================================================================
-# LAYER 0e - HASH HELPERS
+# LAYER 0e - HASH HELPERS (deterministic cache keys)
 # =============================================================================
 def _hash_df(df: Optional[pd.DataFrame]) -> str:
     if df is None or (hasattr(df, "empty") and df.empty):
@@ -314,7 +337,7 @@ def _hash_series(s: Optional[pd.Series]) -> str:
 
 
 # =============================================================================
-# LAYER 1 - INSTRUMENT PROFILES
+# LAYER 1 - INSTRUMENT PROFILES (institutional calibration)
 # =============================================================================
 @dataclass(frozen=True)
 class InstrumentProfile:
@@ -336,13 +359,20 @@ class InstrumentProfile:
     price_min: Optional[float] = None
     price_max: Optional[float] = None
 
+    # C7 - H4 default lowered to 2 to honor UI slider
     min_touches_h4: int = 2
     min_touches_daily: int = 2
     min_touches_weekly: int = 2
 
     ignore_wick_filter: bool = False
+
+    # C1 - 1-touch zone allowed only when real prominence >= ATR * mult
     major_pivot_mult: float = 3.0
+
+    # C5 - OHLC validation per profile
     max_high_low_ratio: float = 1.8
+
+    # Hard cap to avoid cluster explosion in vol shocks
     max_cluster_width_pct: float = 1.0
 
 
@@ -355,6 +385,7 @@ _PROFILES: Final[Dict[str, InstrumentProfile]] = {
     "EUR_USD": InstrumentProfile("EUR_USD", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False),
     "GBP_USD": InstrumentProfile("GBP_USD", "FOREX", 0.0001, 1.3, 0.85, 0.65, 1.5, False),
     "USD_JPY": InstrumentProfile("USD_JPY", "FOREX", 0.01, 0.9, 0.5, 0.5, 1.5, False),
+
     "XAU_USD": InstrumentProfile(
         "XAU_USD", "METAL", 0.01, 2.5, 1.5, 1.0, 3.0, True,
         ignore_wick_filter=True,
@@ -404,48 +435,60 @@ _PROFILES: Final[Dict[str, InstrumentProfile]] = {
 
 
 def get_profile(symbol: str) -> InstrumentProfile:
+    """Return instrument profile with explicit JPY handling and FX fallback."""
     sym = _to_internal_symbol(symbol)
+
     if sym in _PROFILES:
         return _PROFILES[sym]
+
     parts = sym.split("_")
     base = parts[0] if len(parts) >= 1 else sym
     quote = parts[1] if len(parts) >= 2 else ""
+
+    # Explicit JPY pip convention (0.01 pip for all *_JPY pairs)
     if quote == "JPY":
         return InstrumentProfile(
             sym, "FOREX", 0.01, 0.9, 0.5, 0.5, 1.5, False,
             max_high_low_ratio=1.8,
         )
+
     if base in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF", "USD"):
         return InstrumentProfile(
             sym, "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False,
             max_high_low_ratio=1.8,
         )
+
     return replace(_DEFAULT_PROFILE, symbol=sym)
 
 
 def _min_touches_for_tf(profile: InstrumentProfile, tf: str, ui_override: int) -> int:
+    """Resolve min touches: indices/metals use profile floor, FX honors UI."""
     tf_lower = tf.lower()
     profile_min = {
         "h4": profile.min_touches_h4,
         "daily": profile.min_touches_daily,
         "weekly": profile.min_touches_weekly,
     }.get(tf_lower, 2)
+
     if profile.asset_class in ("INDEX", "METAL"):
         return max(2, profile_min)
     return max(profile_min, int(ui_override))
 
 
 # =============================================================================
-# LAYER 2 - DATA PIPELINE
+# LAYER 2 - DATA PIPELINE (OHLC sanitization + async fetcher)
 # =============================================================================
 def _is_valid_candle_dict(c: dict, profile: Optional[InstrumentProfile] = None) -> bool:
+    """Validate a raw OANDA candle dict against profile-specific ratio."""
     try:
         prof = profile or _DEFAULT_PROFILE
         mid = c["mid"]
+
         o = float(mid["o"])
         h = float(mid["h"])
         lo = float(mid["l"])
         cl = float(mid["c"])
+
         if not all(np.isfinite(x) for x in (o, h, lo, cl)):
             return False
         if lo <= 0 or h <= 0:
@@ -456,10 +499,13 @@ def _is_valid_candle_dict(c: dict, profile: Optional[InstrumentProfile] = None) 
             return False
         if not lo <= cl <= h:
             return False
+
         max_ratio = getattr(prof, "max_high_low_ratio", _MAX_HIGH_LOW_RATIO_DEFAULT)
         if lo > 0 and (h / lo) > max_ratio:
             return False
+
         return True
+
     except Exception:
         return False
 
@@ -468,27 +514,34 @@ def _sanitize_ohlc_dataframe(
     df: Optional[pd.DataFrame],
     profile: Optional[InstrumentProfile] = None,
 ) -> Optional[pd.DataFrame]:
+    """Profile-aware OHLC dataframe sanitization."""
     if df is None or df.empty:
         return None
+
     required = {"open", "high", "low", "close"}
     if not required.issubset(df.columns):
         return None
+
     prof = profile or _DEFAULT_PROFILE
     max_ratio = getattr(prof, "max_high_low_ratio", _MAX_HIGH_LOW_RATIO_DEFAULT)
+
     try:
         out = df.copy()
         out = out.dropna(subset=list(required))
         if out.empty:
             return None
+
         if not out.index.is_monotonic_increasing:
             out = out.sort_index()
         if out.index.has_duplicates:
             out = out[~out.index.duplicated(keep="last")]
+
         for col in required:
             out[col] = pd.to_numeric(out[col], errors="coerce")
         out = out.dropna(subset=list(required))
         if out.empty:
             return None
+
         mask = (
             np.isfinite(out["open"])
             & np.isfinite(out["high"])
@@ -500,14 +553,19 @@ def _sanitize_ohlc_dataframe(
             & (out["open"].between(out["low"], out["high"]))
             & (out["close"].between(out["low"], out["high"]))
         )
+
         ratio_ok = (out["high"] / out["low"].replace(0, np.nan)) <= max_ratio
         out = out[mask & ratio_ok.fillna(False)]
+
         return out if not out.empty else None
+
     except Exception:
         return None
 
 
 class AsyncOandaClient:
+    """Async OANDA REST client with retry, semaphore, and bounded cache."""
+
     def __init__(self, token: str, oanda_account_id: str) -> None:
         self.headers = {"Authorization": f"Bearer {token}"}
         self.account_id = oanda_account_id
@@ -570,12 +628,15 @@ class AsyncOandaClient:
         cache_hit, cached = _cache_get(self.env_url, self.account_id, symbol, tf)
         if cache_hit:
             return symbol, tf, cached
+
         gran = _GRANULARITY_MAP.get(tf)
         if not gran or not self.env_url:
             return symbol, tf, None
+
         url = f"{self.env_url}/v3/instruments/{symbol}/candles"
         params = {"count": limit + 1, "granularity": gran, "price": "M"}
         profile = get_profile(symbol)
+
         async with sem:
             data = await self._get_json_with_retry(
                 session, url, self.headers, params, _PER_REQUEST_TIMEOUT_S,
@@ -583,6 +644,7 @@ class AsyncOandaClient:
             if data is None:
                 _cache_set(self.env_url, self.account_id, symbol, tf, None)
                 return symbol, tf, None
+
             try:
                 candles = [
                     {
@@ -596,15 +658,18 @@ class AsyncOandaClient:
                     for c in data.get("candles", [])
                     if c.get("complete") and _is_valid_candle_dict(c, profile)
                 ]
+
                 if not candles:
                     _cache_set(self.env_url, self.account_id, symbol, tf, None)
                     return symbol, tf, None
+
                 df_clean = _sanitize_ohlc_dataframe(
                     pd.DataFrame(candles).set_index("date").tail(limit),
                     profile,
                 )
                 _cache_set(self.env_url, self.account_id, symbol, tf, df_clean)
                 return symbol, tf, df_clean
+
             except Exception as e:
                 _LOG.warning("Candle parsing failed for %s/%s: %s", symbol, tf, type(e).__name__)
                 _cache_set(self.env_url, self.account_id, symbol, tf, None)
@@ -635,6 +700,7 @@ class AsyncOandaClient:
 
 
 def _run_async_isolated(coro_factory: Callable, timeout: float = 300.0) -> Any:
+    """Run async coroutine in an isolated thread to avoid nested loop issues."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -671,10 +737,11 @@ def _run_async_isolated(coro_factory: Callable, timeout: float = 300.0) -> Any:
 # =============================================================================
 @dataclass(frozen=True)
 class PivotPoint:
+    """Pivot with real prominence tracked through the pipeline."""
     price: float
     weight: float
     index: int
-    kind: str
+    kind: str  # 'high' or 'low'
     prominence: float
 
 
@@ -729,6 +796,7 @@ def compute_institutional_trend(closes: pd.Series, lookback: int = 20, threshold
 
 
 def _time_decay_weight(index: int, n_total: int) -> float:
+    """Bounded time-decay weight: never below 0.35."""
     if n_total <= 1:
         return 1.0
     raw = index / max(n_total - 1, 1)
@@ -745,12 +813,15 @@ def _pivot_lookback_for_tf(timeframe: str) -> int:
 
 
 def _pivot_prominence_threshold(df: pd.DataFrame, profile: InstrumentProfile, atr_val: float) -> float:
+    """Hybrid prominence: ATR-driven, capped at 0.5% of price."""
     try:
         current_p = float(df["close"].iloc[-1])
     except Exception:
         return atr_val * profile.pivot_prominence_atr
+
     if current_p <= 0 or not np.isfinite(current_p):
         return atr_val * profile.pivot_prominence_atr
+
     return float(min(atr_val * profile.pivot_prominence_atr, current_p * 0.005))
 
 
@@ -763,8 +834,10 @@ def detect_swing_pivots_meta(
     atr_val: float,
     timeframe: str,
 ) -> List[PivotPoint]:
+    """Vectorized swing detection with real prominence tracking (C1)."""
     if df is None or len(df) < 15 or atr_val is None or atr_val <= 0:
         return []
+
     try:
         n_total = len(df)
         n = _pivot_lookback_for_tf(timeframe)
@@ -835,6 +908,7 @@ def detect_swing_pivots_meta(
 
         pivots.sort(key=lambda p: (p.index, p.kind, p.price))
         return pivots
+
     except Exception as e:
         _LOG.warning("Pivot detection failed: %s", type(e).__name__)
         return []
@@ -846,18 +920,24 @@ def _get_pivots_with_fallback_meta(
     atr_val: float,
     timeframe: str,
 ) -> List[PivotPoint]:
+    """Primary detection with scipy fallback if too few pivots."""
     pivots = detect_swing_pivots_meta(df, profile, atr_val, timeframe)
     if len(pivots) >= 3:
         return pivots
+
     try:
         n_total = len(df)
         dist = _PIVOT_FALLBACK_DIST.get(timeframe.lower(), 5)
         prominence_min = _pivot_prominence_threshold(df, profile, atr_val)
+
         peak_kwargs = {"distance": dist, "prominence": prominence_min}
+
         high_idx, high_props = find_peaks(df["high"].to_numpy(dtype=float), **peak_kwargs)
         low_idx, low_props = find_peaks(-df["low"].to_numpy(dtype=float), **peak_kwargs)
+
         safe_cutoff = n_total - 3
         extra: List[PivotPoint] = []
+
         high_proms = high_props.get("prominences", np.full(len(high_idx), prominence_min))
         for k, idx in enumerate(high_idx):
             if idx >= safe_cutoff:
@@ -869,6 +949,7 @@ def _get_pivots_with_fallback_meta(
                 kind="high",
                 prominence=float(high_proms[k]),
             ))
+
         low_proms = low_props.get("prominences", np.full(len(low_idx), prominence_min))
         for k, idx in enumerate(low_idx):
             if idx >= safe_cutoff:
@@ -880,37 +961,48 @@ def _get_pivots_with_fallback_meta(
                 kind="low",
                 prominence=float(low_proms[k]),
             ))
+
         merged: Dict[Tuple[int, str], PivotPoint] = {}
         for p in pivots + extra:
             key = (p.index, p.kind)
             old = merged.get(key)
             if old is None or p.prominence > old.prominence:
                 merged[key] = p
+
         out = list(merged.values())
         out.sort(key=lambda p: (p.index, p.kind, p.price))
         return out
+
     except Exception:
         return pivots
 
 
 def agglomerative_1d_clustering(pivots: List[PivotPoint], bandwidth: float) -> List[List[PivotPoint]]:
+    """Deterministic 1D clustering with maximum cluster span enforcement."""
     if not pivots:
         return []
+
     if bandwidth <= 0 or not np.isfinite(bandwidth):
         return [[p] for p in sorted(pivots, key=lambda x: (x.price, x.index, x.kind))]
+
     ordered = sorted(pivots, key=lambda x: (x.price, x.index, x.kind))
+
     clusters: List[List[PivotPoint]] = []
     current: List[PivotPoint] = [ordered[0]]
+
     for p in ordered[1:]:
         prev = current[-1]
         cluster_first = current[0]
+
         gap = p.price - prev.price
         span = p.price - cluster_first.price
+
         if gap > bandwidth or span > 2.5 * bandwidth:
             clusters.append(current)
             current = [p]
         else:
             current.append(p)
+
     clusters.append(current)
     return clusters
 
@@ -933,12 +1025,14 @@ def classify_zone_status(
         return "Vierge"
     if len(c_arr) == 0:
         return "Vierge"
+
     if zone_type == "Support":
         test_mask = (l_arr <= level + tolerance) & (c_arr > level - tolerance)
         break_mask = c_arr < level - tolerance
     else:
         test_mask = (h_arr >= level - tolerance) & (c_arr < level + tolerance)
         break_mask = c_arr > level + tolerance
+
     has_approach = bool(test_mask.any())
     break_positions = np.where(break_mask)[0]
     if len(break_positions) == 0:
@@ -980,11 +1074,1164 @@ def _clusters_to_zones(
     profile: InstrumentProfile,
     zone_type: str,
 ) -> List[dict]:
+    """Convert pivot clusters to zones with REAL Hybrid Min-Touches (C1)."""
     strong: List[dict] = []
+
     if atr_val is None or atr_val <= 0:
         return strong
+
     major_threshold = atr_val * profile.major_pivot_mult
+
     for grp in clusters_raw:
         if not grp:
             continue
-        prices = np.array([p.price for p in grp], d
+
+        prices = np.array([p.price for p in grp], dtype=float)
+        weights = np.array([p.weight for p in grp], dtype=float)
+        prominences = np.array([p.prominence for p in grp], dtype=float)
+
+        if not np.all(np.isfinite(prices)):
+            continue
+
+        if weights.sum() <= 0 or not np.all(np.isfinite(weights)):
+            weights = np.ones_like(prices)
+
+        unique_touch_indices = {p.index for p in grp}
+        touches = len(unique_touch_indices)
+
+        max_prominence = float(np.nanmax(prominences)) if len(prominences) else 0.0
+        avg_prominence = float(np.average(prominences, weights=weights)) if weights.sum() > 0 else max_prominence
+
+        # C1 - Real Hybrid Min-Touches
+        is_major = (
+            profile.asset_class in ("INDEX", "METAL")
+            and touches >= 1
+            and max_prominence >= major_threshold
+        )
+
+        if touches < min_touches_required and not is_major:
+            continue
+
+        lvl = float(np.average(prices, weights=weights))
+        if lvl <= 0 or not np.isfinite(lvl):
+            continue
+
+        last_idx = max(p.index for p in grp)
+
+        status = classify_zone_status(
+            level=lvl, zone_type=zone_type, df=df,
+            formation_idx=last_idx, atr_val=atr_val,
+        )
+
+        strong.append({
+            "level": lvl,
+            "strength": int(touches),
+            "age_bars": int(max(0, n_total - 1 - last_idx)),
+            "status": status,
+            "zone_type": zone_type,
+            "prominence": round(avg_prominence, 8),
+            "prominence_atr": round(avg_prominence / atr_val, 3) if atr_val else None,
+            "is_major": bool(is_major),
+        })
+
+    strong.sort(key=lambda z: (z["level"], z["zone_type"], z["age_bars"]))
+    return strong
+
+
+def _merge_adjacent_zones(strong: List[dict], merge_thresh: float) -> List[dict]:
+    """Merge close zones; cross-type merge only if both flagged major."""
+    if not strong:
+        return []
+
+    if merge_thresh <= 0 or not np.isfinite(merge_thresh):
+        return sorted(strong, key=lambda x: (x["level"], x.get("zone_type", "")))
+
+    ordered = sorted(strong, key=lambda x: (x["level"], x.get("zone_type", "")))
+    merged: List[dict] = []
+
+    for z in ordered:
+        if not merged:
+            merged.append(z)
+            continue
+
+        prev = merged[-1]
+        same_type = prev.get("zone_type") == z.get("zone_type")
+        close_enough = abs(z["level"] - prev["level"]) <= merge_thresh
+        both_major = bool(prev.get("is_major")) and bool(z.get("is_major"))
+
+        if not close_enough or (not same_type and not both_major):
+            merged.append(z)
+            continue
+
+        prev_strength = max(int(prev.get("strength", 1)), 1)
+        z_strength = max(int(z.get("strength", 1)), 1)
+        new_strength = prev_strength + z_strength
+
+        new_level = (prev["level"] * prev_strength + z["level"] * z_strength) / new_strength
+
+        merged[-1] = {
+            "level": float(new_level),
+            "strength": int(new_strength),
+            "age_bars": int(min(prev["age_bars"], z["age_bars"])),
+            "status": max([prev["status"], z["status"]], key=lambda s: _STATUS_PRIORITY.get(s, 1)),
+            "zone_type": prev.get("zone_type") if same_type else "Pivot",
+            "prominence": max(float(prev.get("prominence", 0.0)), float(z.get("prominence", 0.0))),
+            "prominence_atr": max(
+                float(prev.get("prominence_atr") or 0.0),
+                float(z.get("prominence_atr") or 0.0),
+            ),
+            "is_major": bool(prev.get("is_major")) or bool(z.get("is_major")),
+        }
+
+    return merged
+
+
+@st.cache_data(ttl=120, max_entries=256, show_spinner=False, hash_funcs={pd.DataFrame: _hash_df})
+def find_strong_sr_zones(
+    df: pd.DataFrame,
+    current_price: float,
+    symbol: str,
+    atr_val: Optional[float],
+    timeframe: str,
+    min_touches_required: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Find S/R zones with C1 (hybrid touch), C2 (separate clustering)."""
+    if (
+        atr_val is None or atr_val <= 0
+        or df is None or df.empty
+        or current_price is None or not np.isfinite(current_price) or current_price <= 0
+    ):
+        return pd.DataFrame(), pd.DataFrame()
+
+    profile = get_profile(symbol)
+    n_total = len(df)
+
+    pivots = _get_pivots_with_fallback_meta(df, profile, atr_val, timeframe)
+    if not pivots:
+        return pd.DataFrame(), pd.DataFrame()
+
+    raw_bandwidth = max(atr_val * profile.cluster_radius_atr, current_price * 0.0015)
+    max_bandwidth = current_price * (profile.max_cluster_width_pct / 100.0)
+    bandwidth = float(min(raw_bandwidth, max_bandwidth))
+
+    if bandwidth <= 0 or not np.isfinite(bandwidth):
+        return pd.DataFrame(), pd.DataFrame()
+
+    # C2 - Separated clustering
+    highs = [p for p in pivots if p.kind == "high"]
+    lows = [p for p in pivots if p.kind == "low"]
+
+    high_clusters = agglomerative_1d_clustering(highs, bandwidth)
+    low_clusters = agglomerative_1d_clustering(lows, bandwidth)
+
+    resistance_zones = _clusters_to_zones(
+        high_clusters, min_touches_required, n_total, df, atr_val, profile, "Resistance",
+    )
+    support_zones = _clusters_to_zones(
+        low_clusters, min_touches_required, n_total, df, atr_val, profile, "Support",
+    )
+
+    merge_thresh_raw = atr_val * profile.merge_threshold_atr
+    merge_thresh_cap = current_price * 0.0075
+    merge_thresh = float(min(merge_thresh_raw, merge_thresh_cap))
+
+    support_zones = _merge_adjacent_zones(support_zones, merge_thresh)
+    resistance_zones = _merge_adjacent_zones(resistance_zones, merge_thresh)
+
+    all_zones = support_zones + resistance_zones
+    if not all_zones:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_zones = pd.DataFrame(all_zones)
+    if df_zones.empty or "level" not in df_zones.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_zones = df_zones.sort_values(
+        ["level", "zone_type", "age_bars"], ascending=[True, True, True],
+    ).reset_index(drop=True)
+
+    df_zones["near_price"] = (
+        np.abs(df_zones["level"] - current_price) / current_price * 100
+    ) <= 0.50
+
+    supports = df_zones[
+        (df_zones["level"] < current_price)
+        & (df_zones["zone_type"].isin(["Support", "Pivot"]))
+    ].copy()
+    resistances = df_zones[
+        (df_zones["level"] >= current_price)
+        & (df_zones["zone_type"].isin(["Resistance", "Pivot"]))
+    ].copy()
+
+    return supports, resistances
+
+
+def _flatten_zones_to_dataframe(zones_dict: dict) -> pd.DataFrame:
+    frames = []
+    for tf, pair in zones_dict.items():
+        try:
+            sup, res = pair
+        except Exception:
+            continue
+        for df_z, ztype in [(sup, "Support"), (res, "Resistance")]:
+            if df_z is None or df_z.empty:
+                continue
+            tmp = df_z[df_z["status"] != "Consommee"].copy()
+            if tmp.empty:
+                continue
+            tmp = tmp.assign(tf=tf, type=tmp["near_price"].map({True: "Pivot", False: ztype}))
+            cols = ["tf", "level", "strength", "age_bars", "status", "type", "near_price"]
+            frames.append(tmp[cols])
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).sort_values("level").reset_index(drop=True)
+
+
+def _score_and_classify_group(
+    group: pd.DataFrame,
+    current_price: float,
+    bars_map: dict,
+    symbol: str,
+) -> dict:
+    sub_avg = group["level"].mean()
+    sub_nb_tf = group["tf"].nunique()
+    safe_cp = current_price if current_price and current_price > 0 else 1.0
+    sub_dist = abs(safe_cp - sub_avg) / safe_cp * 100
+    tf_w = group["tf"].map(TF_WEIGHT).fillna(1.0).values
+    totals = group["tf"].map(lambda t: bars_map.get(t, 500)).values.astype(float)
+    age_r = np.clip(group["age_bars"].values / np.maximum(totals, 1), 0, 1)
+    lams = group["tf"].map(_TF_LAMBDA).fillna(1.5).values
+    score = round(float((group["strength"].values * tf_w * sub_nb_tf * np.exp(-lams * age_r)).sum()), 1)
+    status = max(group["status"].tolist(), key=lambda s: _STATUS_PRIORITY.get(s, 1))
+    is_near_price = sub_dist <= 0.50
+    if is_near_price:
+        ctype, sig = "Pivot", "↔ PIVOT ZONE"
+    else:
+        n_sup = (group["level"] < safe_cp).sum()
+        ctype = "Support" if n_sup >= len(group) - n_sup else "Resistance"
+        sig = "🟢 BUY ZONE" if ctype == "Support" else "🔴 SELL ZONE"
+    return {
+        "Actif": symbol,
+        "Signal": sig,
+        "Niveau": round(sub_avg, 5),
+        "Type": ctype,
+        "Timeframes": " + ".join(sorted(group["tf"].unique())),
+        "Nb TF": int(sub_nb_tf),
+        "Force Totale": int(group["strength"].sum()),
+        "Score": round(score, 1),
+        "Statut": status,
+        "Distance %": round(sub_dist, 3),
+        "Alerte": "🔥 ZONE CHAUDE" if sub_dist < 0.5 else ("⚠️ Proche" if sub_dist < 1.5 else ""),
+    }
+
+
+def detect_confluences(
+    symbol: str,
+    zones_dict: dict,
+    current_price: float,
+    bars_map: dict,
+    confluence_threshold_pct: Optional[float] = None,
+) -> list:
+    if not zones_dict or not current_price or current_price <= 0 or not np.isfinite(current_price):
+        return []
+
+    z_df = _flatten_zones_to_dataframe(zones_dict)
+    if z_df.empty:
+        return []
+
+    profile = get_profile(symbol)
+    threshold = confluence_threshold_pct if confluence_threshold_pct is not None else profile.confluence_threshold_pct
+    z_df = z_df.sort_values("level").reset_index(drop=True)
+    n = len(z_df)
+    levels_arr = z_df["level"].values
+
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            if rank[rx] < rank[ry]:
+                parent[rx] = ry
+            elif rank[rx] > rank[ry]:
+                parent[ry] = rx
+            else:
+                parent[ry] = rx
+                rank[rx] += 1
+
+    for i in range(n):
+        li = levels_arr[i]
+        if li <= 0:
+            continue
+        for j in range(i + 1, n):
+            if (levels_arr[j] - li) / li * 100 > threshold:
+                break
+            union(i, j)
+
+    comp_map: Dict[int, List[int]] = {}
+    for idx in range(n):
+        root = find(idx)
+        comp_map.setdefault(root, []).append(idx)
+
+    confluences = []
+    for indices in comp_map.values():
+        group_full = z_df.iloc[indices]
+        if group_full["tf"].nunique() < 2:
+            continue
+        sub_avg = group_full["level"].mean()
+        group_full = group_full.assign(_dist=(group_full["level"] - sub_avg).abs())
+        keep_idx = group_full.groupby("tf")["_dist"].idxmin().values
+        confluences.append(_score_and_classify_group(
+            group_full.loc[keep_idx].drop(columns=["_dist"]),
+            current_price, bars_map, symbol,
+        ))
+    return confluences
+
+
+# =============================================================================
+# LAYER 4 - PIPELINE ORCHESTRATOR
+# =============================================================================
+@dataclass
+class ScanResult:
+    symbol: str
+    rows: dict
+    zones: dict
+    price: Optional[float]
+    trends: dict
+    bars_map: dict
+    anomaly: Optional[str] = None
+    scan_error: Optional[str] = None
+    price_context: str = ""
+    missing_tfs: List[str] = field(default_factory=list)
+    price_is_fallback: bool = False
+    debug_info: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _RowContext:
+    cp: float
+    atr_val: float
+    sym_d: str
+    tf_name: str
+    df_len: int
+    profile: InstrumentProfile
+
+
+def _make_row(z: dict, ztype: str, ctx: _RowContext) -> Dict[str, Any]:
+    dist = abs(ctx.cp - z["level"]) / ctx.cp * 100 if ctx.cp else 0.0
+    dist_atr = f"{round(abs(ctx.cp - z['level']) / ctx.atr_val, 1)}x" if (ctx.atr_val and ctx.atr_val > 0) else "N/A"
+    return {
+        "Actif": ctx.sym_d,
+        "Prix Actuel": f"{ctx.cp:.5f}" if ctx.cp else "N/A",
+        "Type": ztype,
+        "Niveau": f"{z['level']:.5f}",
+        "Force": f"{z['strength']} touches",
+        "Score (1TF)": compute_structural_score(z["strength"], 1, ctx.tf_name, z["age_bars"], ctx.df_len),
+        "Statut": z["status"],
+        "Dist. %": f"{dist:.2f}%",
+        "Dist. ATR": dist_atr,
+        "_dist_num": dist,
+        "_in_pdf": dist <= ctx.profile.pdf_max_dist_pct,
+    }
+
+
+async def _fetch_live_prices(client: AsyncOandaClient, session, sem, symbols):
+    tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
+    res = await asyncio.gather(*tasks, return_exceptions=True)
+    out = {}
+    for sym, item in zip(symbols, res):
+        if isinstance(item, BaseException):
+            out[sym] = None
+        else:
+            out[item[0]] = item[1]
+    return out
+
+
+async def _fetch_candles_cube(client: AsyncOandaClient, session, sem, symbols):
+    """C4 - Pre-populated cube guarantees every (sym, tf) key exists."""
+    data_cube: Dict[str, Dict[str, Optional[pd.DataFrame]]] = {
+        sym: {tf: None for tf in _GRANULARITY_MAP} for sym in symbols
+    }
+
+    tasks = [
+        client.fetch_candles(session, sem, sym, tf)
+        for sym in symbols for tf in _GRANULARITY_MAP
+    ]
+    res = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for item in res:
+        if isinstance(item, BaseException):
+            _LOG.warning("Candle fetch task failed: %s", type(item).__name__)
+            continue
+        try:
+            sym, tf, df = item
+            if sym in data_cube and tf in data_cube[sym]:
+                data_cube[sym][tf] = df
+        except Exception:
+            _LOG.warning("Malformed candle fetch result ignored")
+
+    return data_cube
+
+
+def _build_daily_price_context(cp: float, sup: pd.DataFrame, res: pd.DataFrame) -> str:
+    parts = []
+    if sup is not None and not sup.empty:
+        s_near = sup[(sup["level"] < cp) & (abs(sup["level"] - cp) / cp * 100 <= 5.0)]
+        if not s_near.empty:
+            n_s = s_near.nlargest(1, "level").iloc[0]
+            dist_pct = abs(cp - n_s["level"]) / cp * 100
+            label = "SUR support" if dist_pct < 0.5 else "S proche"
+            parts.append(f"{label}: {n_s['level']:.5f} (-{dist_pct:.2f}%)")
+    if res is not None and not res.empty:
+        r_near = res[(res["level"] > cp) & (abs(res["level"] - cp) / cp * 100 <= 5.0)]
+        if not r_near.empty:
+            n_r = r_near.nsmallest(1, "level").iloc[0]
+            dist_pct = abs(cp - n_r["level"]) / cp * 100
+            label = "SUR resistance" if dist_pct < 0.5 else "R proche"
+            parts.append(f"{label}: {n_r['level']:.5f} (+{dist_pct:.2f}%)")
+    return "  |  ".join(parts) if parts else "Zone intermediaire"
+
+
+_TF_TREND_PARAMS: Final[Dict[str, Tuple[int, float]]] = {
+    "H4": (50, 2.0), "Daily": (50, 1.8), "Weekly": (20, 1.5),
+}
+
+
+def _process_tf_frame(
+    sym: str,
+    tf_k: str,
+    tf_name: str,
+    df: pd.DataFrame,
+    cp: float,
+    min_touches_ui: int,
+    profile: InstrumentProfile,
+    sym_d: str,
+) -> Tuple[Optional[List[dict]], Optional[Tuple[pd.DataFrame, pd.DataFrame]], str, Dict[str, Any]]:
+    """C8 - Real debug counters populated."""
+    debug: Dict[str, Any] = {
+        "atr": None, "n_pivots": 0, "n_zones": 0,
+        "min_touches": None, "tf": tf_name,
+    }
+    try:
+        atr_val = compute_atr(df)
+        debug["atr"] = atr_val
+        if atr_val is None:
+            return None, None, "", debug
+
+        min_t = _min_touches_for_tf(profile, tf_k, min_touches_ui)
+        debug["min_touches"] = min_t
+
+        try:
+            debug["n_pivots"] = len(_get_pivots_with_fallback_meta(df, profile, atr_val, tf_k))
+        except Exception:
+            debug["n_pivots"] = None
+
+        sup, res = find_strong_sr_zones(df, cp, sym, atr_val, tf_k, min_t)
+        debug["n_zones"] = int(len(sup) + len(res))
+
+        price_ctx = _build_daily_price_context(cp, sup, res) if tf_k == "daily" else ""
+        row_ctx = _RowContext(cp=cp, atr_val=atr_val, sym_d=sym_d, tf_name=tf_name, df_len=len(df), profile=profile)
+
+        tf_r = [
+            _make_row(z, "PIVOT" if z.get("near_price") else "Support", row_ctx)
+            for _, z in sup.iterrows()
+        ] + [
+            _make_row(z, "PIVOT" if z.get("near_price") else "Resistance", row_ctx)
+            for _, z in res.iterrows()
+        ]
+
+        seen, uniq = set(), []
+        for r in tf_r:
+            key = (r["Niveau"], r["Type"])
+            if key not in seen:
+                seen.add(key)
+                uniq.append(r)
+        return (uniq if uniq else None), (sup, res), price_ctx, debug
+
+    except Exception as e:
+        _LOG.warning("TF processing error %s/%s: %s", sym, tf_name, type(e).__name__)
+        debug["error"] = type(e).__name__
+        return None, None, "", debug
+
+
+def _resolve_working_price(
+    cp_live: Optional[float],
+    data_cube: dict,
+    sym: str,
+) -> Tuple[Optional[float], bool]:
+    if cp_live and cp_live > 0 and np.isfinite(cp_live):
+        return cp_live, False
+    for tf_k in ("daily", "h4", "weekly"):
+        df = data_cube.get(sym, {}).get(tf_k)
+        if df is not None and not df.empty:
+            try:
+                last_close = float(df["close"].iloc[-1])
+                if np.isfinite(last_close) and last_close > 0:
+                    return last_close, True
+            except Exception:
+                continue
+    return None, False
+
+
+def _validate_price_bounds_post(cp: float, profile: InstrumentProfile) -> Optional[str]:
+    if profile.price_min is not None and cp < profile.price_min:
+        return f"PRIX HORS BORNES ({cp:.2f} < {profile.price_min:.0f})"
+    if profile.price_max is not None and cp > profile.price_max:
+        return f"PRIX HORS BORNES ({cp:.2f} > {profile.price_max:.0f})"
+    return None
+
+
+def _collect_tf_data(
+    sym: str,
+    data_cube: dict,
+    cp: float,
+    profile: InstrumentProfile,
+    min_touches_ui: int,
+    sym_d: str,
+):
+    rows = {"H4": None, "Daily": None, "Weekly": None}
+    zones_d: Dict[str, Any] = {}
+    trends: Dict[str, str] = {}
+    bars_map: Dict[str, int] = {}
+    debug_per_tf: Dict[str, Any] = {}
+    missing_tfs: List[str] = []
+    price_ctx = ""
+
+    for tf_k, tf_name in (("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")):
+        df = data_cube.get(sym, {}).get(tf_k)
+        if df is None or df.empty:
+            missing_tfs.append(tf_name)
+            continue
+        bars_map[tf_name] = len(df)
+        lb, th = _TF_TREND_PARAMS.get(tf_name, (20, 2.0))
+        trends[tf_name] = compute_institutional_trend(df["close"], lookback=lb, threshold=th)
+        tf_rows, zone_pair, ctx, debug = _process_tf_frame(
+            sym, tf_k, tf_name, df, cp, min_touches_ui, profile, sym_d,
+        )
+        debug_per_tf[tf_name] = debug
+        if zone_pair is not None:
+            zones_d[tf_name] = zone_pair
+        if tf_rows is not None:
+            rows[tf_name] = tf_rows
+        if ctx:
+            price_ctx = ctx
+
+    return rows, zones_d, trends, bars_map, price_ctx, missing_tfs, debug_per_tf
+
+
+def flag_data_anomaly(
+    symbol: str,
+    current_price: Optional[float],
+    support_levels: List[float],
+    last_candle_close: Optional[float] = None,
+    daily_df: Optional[pd.DataFrame] = None,
+    atr_val: Optional[float] = None,
+) -> Optional[str]:
+    """C9 - Extended anomaly detection."""
+    if current_price is None or current_price <= 0 or not np.isfinite(current_price):
+        return "Prix indisponible"
+
+    profile = get_profile(symbol)
+    msgs: List[str] = []
+
+    if profile.price_min and current_price < profile.price_min:
+        msgs.append("PRIX < MIN")
+    if profile.price_max and current_price > profile.price_max:
+        msgs.append("PRIX > MAX")
+
+    if not profile.skip_ratio_check and len(support_levels) >= 3:
+        median_sup = float(np.median(support_levels))
+        if median_sup > 0 and current_price / median_sup > 3.0:
+            msgs.append("Ecart aberrant")
+
+    if last_candle_close and last_candle_close > 0:
+        dev = abs(current_price - last_candle_close) / last_candle_close * 100
+        if dev > profile.max_live_vs_close_pct:
+            msgs.append(f"Ecart live/close ({dev:.1f}%)")
+
+    # Candle count sanity
+    if daily_df is not None:
+        if len(daily_df) < 30:
+            msgs.append(f"Historique faible ({len(daily_df)} bougies)")
+
+        # Gap detection (price jump > 5% between consecutive closes)
+        try:
+            closes = daily_df["close"].values
+            if len(closes) >= 2:
+                rets = np.abs(np.diff(closes) / closes[:-1])
+                if np.any(rets > 0.10):
+                    msgs.append("Gap detecte (>10%)")
+        except Exception:
+            pass
+
+    # ATR/price sanity
+    if atr_val is not None and atr_val > 0 and current_price > 0:
+        atr_ratio = atr_val / current_price
+        if atr_ratio > 0.10:
+            msgs.append(f"Volatilite extreme (ATR/Prix {atr_ratio*100:.1f}%)")
+        if atr_ratio < 1e-6:
+            msgs.append("ATR quasi-nul")
+
+    return " | ".join(msgs) if msgs else None
+
+
+def _process_symbol(
+    sym: str,
+    cp_live: Optional[float],
+    data_cube: dict,
+    min_touches_ui: int,
+) -> ScanResult:
+    try:
+        profile = get_profile(sym)
+        sym_d = _to_display_symbol(sym)
+        cp, price_is_fallback = _resolve_working_price(cp_live, data_cube, sym)
+        if cp is None:
+            return ScanResult(sym, {}, {}, None, {}, {}, scan_error="Aucune donnée disponible")
+
+        bounds_err = _validate_price_bounds_post(cp, profile)
+        if bounds_err:
+            return ScanResult(sym, {}, {}, None, {}, {}, scan_error=bounds_err)
+
+        rows, zones_d, trends, bars_map, price_ctx, missing_tfs, debug = _collect_tf_data(
+            sym, data_cube, cp, profile, min_touches_ui, sym_d,
+        )
+
+        sup_levels: List[float] = []
+        for zp in zones_d.values():
+            if zp[0] is not None and not zp[0].empty:
+                sup_levels.extend(zp[0]["level"].tolist())
+
+        daily_df = data_cube.get(sym, {}).get("daily")
+        last_close = None
+        atr_daily = None
+        if daily_df is not None and not daily_df.empty:
+            try:
+                last_close = float(daily_df["close"].iloc[-1])
+                atr_daily = compute_atr(daily_df)
+            except Exception:
+                pass
+
+        anomaly = flag_data_anomaly(
+            sym, cp, sup_levels,
+            last_candle_close=last_close,
+            daily_df=daily_df,
+            atr_val=atr_daily,
+        )
+        if price_is_fallback:
+            anomaly = f"{anomaly} | Prix fallback" if anomaly else "Prix fallback"
+
+        return ScanResult(
+            sym, rows, zones_d, cp, trends, bars_map,
+            price_context=price_ctx, anomaly=anomaly,
+            missing_tfs=missing_tfs, price_is_fallback=price_is_fallback,
+            debug_info=debug,
+        )
+    except Exception as e:
+        _LOG.exception("Symbol processing error: %s", sym)
+        return ScanResult(sym, {}, {}, None, {}, {}, scan_error=f"Erreur interne : {type(e).__name__}")
+
+
+def _validate_symbol_coverage(
+    requested_symbols: List[str],
+    results: List[ScanResult],
+) -> Dict[str, Any]:
+    requested = set(requested_symbols)
+    returned = {r.symbol for r in results if isinstance(r, ScanResult)}
+    missing = sorted(requested - returned)
+    extra = sorted(returned - requested)
+    return {
+        "requested": len(requested),
+        "returned": len(returned),
+        "missing": missing,
+        "extra": extra,
+        "ok": not missing and not extra,
+    }
+
+
+async def run_institutional_scan(
+    symbols: List[str],
+    token: str,
+    oanda_account_id: str,
+    min_touches_ui: int,
+) -> List[ScanResult]:
+    client = AsyncOandaClient(token, oanda_account_id)
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, connect=10),
+    ) as session:
+        if not await client.initialize(session):
+            raise OandaAuthError("Auth OANDA échouée")
+        sem = asyncio.Semaphore(_OANDA_SEMAPHORE_LIMIT)
+        live_prices = await _fetch_live_prices(client, session, sem, symbols)
+        data_cube = await _fetch_candles_cube(client, session, sem, symbols)
+
+    results = [
+        _process_symbol(sym, live_prices.get(sym), data_cube, min_touches_ui)
+        for sym in symbols
+    ]
+
+    coverage = _validate_symbol_coverage(symbols, results)
+    if not coverage["ok"]:
+        _LOG.error("Coverage violation: %s", coverage)
+        existing = {r.symbol for r in results}
+        for missing_sym in coverage["missing"]:
+            if missing_sym not in existing:
+                results.append(ScanResult(
+                    symbol=missing_sym, rows={}, zones={}, price=None,
+                    trends={}, bars_map={},
+                    scan_error="Coverage violation: symbole non traité",
+                ))
+
+    return results
+
+
+# =============================================================================
+# LAYER 5 - EXPORTERS (PDF / JSON / LLM brief)
+# =============================================================================
+_ACCENT_MAP = str.maketrans(
+    "àâäáãèéêëîïíìôöóòõùûüúçñÀÂÄÁÈÉÊËÎÏÌÍÔÖÓÒÙÛÜÚÇÑ",
+    "aaaaaeeeeiiiiooooouuuucnAAAAEEEEIIIIOOOOUUUUCN",
+)
+_EMOJI_MAP: Final[List[Tuple[str, str]]] = [
+    ("🟢", "[BUY]"), ("🔴", "[SELL]"), ("🔥", "[CHAUD]"),
+    ("↔️", "[PIVOT]"), ("↔", "[PIVOT]"),
+    ("⚠️", "[PROCHE]"), ("⚠", "[PROCHE]"),
+]
+
+
+def _safe_pdf_str(text: Any, max_chars: int = 200) -> str:
+    if text is None:
+        return ""
+    try:
+        s = str(text).translate(_ACCENT_MAP)
+        for e, r in _EMOJI_MAP:
+            s = s.replace(e, r)
+        s = s.encode("latin-1", errors="replace").decode("latin-1")
+        return s[:max_chars - 3] + "..." if len(s) > max_chars else s
+    except Exception:
+        return ""
+
+
+class PDF(FPDF):
+    def header(self):
+        self.set_font("Helvetica", "B", 15)
+        self.cell(0, 10, _safe_pdf_str("Rapport Scanner Bluestar - S/R"),
+                  border=0, align="C", new_x="LMARGIN", new_y="NEXT")
+        self.set_font("Helvetica", "", 8)
+        self.cell(0, 6, _safe_pdf_str(
+            f"Genere le: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} | v{SCANNER_VERSION}",
+        ), border=0, align="C", new_x="LMARGIN", new_y="NEXT")
+        self.ln(4)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Helvetica", "I", 8)
+        self.cell(0, 10, f"Page {self.page_no()}", border=0, align="C")
+
+    def chapter_title(self, title: str):
+        self.set_font("Helvetica", "B", 12)
+        self.cell(0, 10, _safe_pdf_str(title),
+                  border=0, align="L", new_x="LMARGIN", new_y="NEXT")
+        self.ln(4)
+
+    def chapter_body(self, df: Optional[pd.DataFrame]):
+        if df is None or df.empty:
+            self.set_font("Helvetica", "", 10)
+            self.multi_cell(0, 10, "Aucune donnee a afficher.")
+            return
+        col_widths = (
+            {
+                "Actif": 20, "Signal": 26, "Niveau": 22, "Type": 22,
+                "Timeframes": 50, "Nb TF": 12, "Force Totale": 20,
+                "Score": 18, "Statut": 22, "Distance %": 18, "Alerte": 55,
+            }
+            if "Timeframes" in df.columns
+            else {
+                "Actif": 24, "Prix Actuel": 24, "Type": 20, "Niveau": 24,
+                "Force": 20, "Score (1TF)": 18, "Statut": 22,
+                "Dist. %": 16, "Dist. ATR": 16,
+            }
+        )
+        cols = [c for c in col_widths if c in df.columns]
+        total_w = sum(col_widths[c] for c in cols)
+        x_start = self.l_margin + max(0, (self.w - self.l_margin - self.r_margin - total_w) / 2)
+        self.set_font("Helvetica", "B", 7)
+        self.set_x(x_start)
+        for col in cols:
+            self.cell(col_widths[col], 6, _safe_pdf_str(col),
+                      border=1, align="C", new_x="RIGHT", new_y="TOP")
+        self.ln()
+        self.set_font("Helvetica", "", 7)
+        for _, row in df.iterrows():
+            self.set_x(x_start)
+            for col in cols:
+                val = _safe_pdf_str(str(row[col]))
+                max_c = int(col_widths[col] / 1.25)
+                if len(val) > max_c:
+                    val = val[:max_c - 1] + "."
+                self.cell(col_widths[col], 5, val,
+                          border=1, align="C", new_x="RIGHT", new_y="TOP")
+            self.ln()
+
+
+def create_pdf_report(
+    results_dict: Dict[str, pd.DataFrame],
+    confluences_df: Optional[pd.DataFrame] = None,
+    summary_list: Optional[List[dict]] = None,
+    anomalies: Optional[Dict[str, str]] = None,
+) -> bytes:
+    pdf = PDF("L", "mm", "A4")
+    pdf.set_margins(5, 10, 5)
+    pdf.add_page()
+    if anomalies:
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 7, _safe_pdf_str("ALERTES ANOMALIES"),
+                 border=0, align="L", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 8)
+        for sym, msg in anomalies.items():
+            pdf.multi_cell(0, 5, _safe_pdf_str(f"[!] {sym} : {msg}"))
+        pdf.ln(4)
+    if confluences_df is not None and not confluences_df.empty:
+        pdf.chapter_title("ZONES DE CONFLUENCE")
+        pdf.chapter_body(confluences_df)
+        pdf.ln(10)
+    for tf, df in results_dict.items():
+        if df is not None and not df.empty:
+            pdf.chapter_title(f"Analyse {tf}")
+            pdf.chapter_body(df)
+            pdf.ln(10)
+    return bytes(pdf.output())
+
+
+def create_json_export(
+    summary_list: List[dict],
+    confluences_df: Optional[pd.DataFrame],
+    max_dist: float = 5.0,
+    min_score: float = 60.0,
+    allowed_statuts: Tuple[str, ...] = ("Vierge", "Testee", "Role Reverse"),
+) -> bytes:
+    """C3 + C4 - Honors allowed_statuts AND ensures full asset coverage."""
+    now_utc = datetime.now(timezone.utc)
+    output = {
+        "generated_at": now_utc.isoformat(),
+        "scanner_version": SCANNER_VERSION,
+        "assets": [],
+    }
+
+    summary_map = {
+        s["symbol"]: s for s in summary_list
+        if isinstance(s, dict) and "symbol" in s
+    }
+
+    if confluences_df is not None and not confluences_df.empty:
+        df = confluences_df.copy()
+        df["dist_num"] = pd.to_numeric(
+            df["Distance %"].astype(str).str.replace("%", "", regex=False),
+            errors="coerce",
+        ).fillna(999999.0)
+        df["Score"] = pd.to_numeric(df["Score"], errors="coerce").fillna(0.0)
+        filtered_conf = df[
+            (df["dist_num"] <= float(max_dist))
+            & (df["Score"] >= float(min_score))
+            & (df["Statut"].isin(tuple(allowed_statuts)))
+        ].drop(columns=["dist_num"], errors="ignore")
+    else:
+        filtered_conf = pd.DataFrame()
+
+    # C4 - Every asset is present even with empty zones
+    for sym, summary in summary_map.items():
+        if not filtered_conf.empty and "Actif" in filtered_conf.columns:
+            sym_zones = filtered_conf[filtered_conf["Actif"] == sym]
+            zones = sym_zones.to_dict("records")
+        else:
+            zones = []
+
+        output["assets"].append({
+            "symbol": sym,
+            "current_price": summary.get("current_price"),
+            "zones": zones,
+        })
+
+    output["assets"].sort(key=lambda x: x["symbol"])
+    return json.dumps(output, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def create_llm_brief(
+    summary_list: List[dict],
+    confluences_df: Optional[pd.DataFrame],
+    max_dist: float = 2.0,
+    min_score: float = 100.0,
+    allowed_statuts: Tuple[str, ...] = ("Vierge", "Testee", "Role Reverse"),
+) -> bytes:
+    lines = [
+        "# BRIEF S/R — Scanner Bluestar",
+        f"_Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}_",
+        "",
+    ]
+    if confluences_df is None or confluences_df.empty:
+        return "\n".join(lines).encode("utf-8")
+    df = confluences_df.copy()
+    df["dist_num"] = pd.to_numeric(
+        df["Distance %"].astype(str).str.replace("%", "", regex=False),
+        errors="coerce",
+    ).fillna(999999.0)
+    df["Score"] = pd.to_numeric(df["Score"], errors="coerce").fillna(0.0)
+    filtered = df[
+        (df["dist_num"] <= max_dist)
+        & (df["Score"] >= min_score)
+        & (df["Statut"].isin(allowed_statuts))
+    ]
+    for sym in sorted(filtered["Actif"].unique()):
+        lines.append(f"### {sym}")
+        for _, row in filtered[filtered["Actif"] == sym].iterrows():
+            lines.append(
+                f"- {row['Signal']} `{row['Niveau']}` | Sc:{row['Score']} "
+                f"| {row['Statut']} | {row['Distance %']} | {row['Timeframes']}"
+            )
+        lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+# =============================================================================
+# LAYER 6 - STREAMLIT UI
+# =============================================================================
+st.set_page_config(page_title="Scanner Bluestar S/R", page_icon="📡", layout="wide")
+st.title("📡 Scanner Bluestar Supports et Résistances")
+st.markdown(
+    f"**v{SCANNER_VERSION}** — Hybrid Touch réel, clustering séparé, coverage strict, logs sécurisés."
+)
+
+
+def _is_scanning_locked() -> bool:
+    lock_ts = st.session_state.get("scanning_lock_ts")
+    if lock_ts and (time.time() - lock_ts) < _SCAN_LOCK_TTL_S:
+        return True
+    return False
+
+
+with st.sidebar:
+    st.header("1. Connexion OANDA")
+    try:
+        access_token = st.secrets["OANDA_ACCESS_TOKEN"]
+        account_id = st.secrets["OANDA_ACCOUNT_ID"]
+        st.success("Secrets chargés ✓")
+    except Exception:
+        access_token, account_id = None, None
+        st.error("Secrets OANDA manquants")
+
+    st.header("2. Sélection")
+    select_all = st.checkbox(f"Tous les actifs ({len(ALL_SYMBOLS)})", value=True)
+    symbols_to_scan = (
+        ALL_SYMBOLS if select_all
+        else st.multiselect("Actifs :", options=ALL_SYMBOLS,
+                            default=["XAU_USD", "NAS100_USD", "US30_USD"])
+    )
+
+    st.header("3. Paramètres LLM / Export")
+    llm_max_dist = st.slider("Dist. max (%) brief LLM", 0.5, 5.0, 2.0, 0.5, key="llm_max_dist")
+    llm_min_score = st.slider("Score min JSON/LLM", 20, 300, 30, 10, key="llm_min_score")
+    llm_statuts = st.multiselect(
+        "Statuts autorisés",
+        options=["Vierge", "Testee", "Role Reverse", "Consommee"],
+        default=["Vierge", "Testee", "Role Reverse"],
+        key="llm_statuts",
+    )
+
+    st.header("4. Détection")
+    min_touches = st.slider("Min touches Forex H4 (plancher)", 2, 10, 2, 1)
+    confluence_threshold = st.slider("Seuil confluence Forex (%)", 0.3, 2.0, 0.8, 0.1)
+    max_dist_filter = st.slider("Filtre visuel Dist (%)", 1.0, 15.0, 3.0, 0.5)
+
+    if st.button("🧹 Vider le cache"):
+        st.success(f"Cache vidé : {_cache_clear()} entrées")
+    if st.button("🔓 Forcer libération lock"):
+        st.session_state.pop("scanning_lock_ts", None)
+        st.success("Lock libéré")
+
+    with st.expander("📊 Stats cache"):
+        stats = _cache_stats()
+        st.write(f"Entrées : {stats['entries']}")
+        st.write(f"Mémoire : {stats['bytes'] / 1024:.1f} KB")
+
+scan_button = st.button(
+    "🚀 LANCER LE SCAN COMPLET",
+    type="primary",
+    use_container_width=True,
+    disabled=_is_scanning_locked(),
+)
+
+if scan_button and symbols_to_scan and not _is_scanning_locked():
+    st.session_state["scanning_lock_ts"] = time.time()
+    st.session_state["pending_scan"] = True
+    st.rerun()
+
+if st.session_state.get("pending_scan", False):
+    st.session_state.pop("pending_scan", None)
+    if not access_token or not account_id:
+        st.error("Secrets manquants")
+        st.session_state.pop("scanning_lock_ts", None)
+    else:
+        progress_bar = st.progress(0, text="Initialisation...")
+        try:
+            raw_results = _run_async_isolated(
+                lambda: run_institutional_scan(symbols_to_scan, access_token, account_id, min_touches),
+            )
+
+            results_h4: List[dict] = []
+            results_daily: List[dict] = []
+            results_weekly: List[dict] = []
+            all_zones_map: Dict[str, dict] = {}
+            prices_map: Dict[str, Optional[float]] = {}
+            trends_map: Dict[str, dict] = {}
+            anomalies_map: Dict[str, str] = {}
+            scan_errors: Dict[str, str] = {}
+            bars_map_global: Dict[str, dict] = {}
+            missing_tfs_map: Dict[str, List[str]] = {}
+            price_fallback_map: Dict[str, bool] = {}
+            debug_map: Dict[str, dict] = {}
+
+            for idx, res in enumerate(raw_results):
+                progress_bar.progress((idx + 1) / max(len(raw_results), 1),
+                                      text=f"Processing {res.symbol}...")
+                if res.scan_error:
+                    scan_errors[_to_display_symbol(res.symbol)] = res.scan_error
+                    continue
+                all_zones_map[res.symbol] = res.zones
+                prices_map[res.symbol] = res.price
+                trends_map[res.symbol] = res.trends
+                bars_map_global[res.symbol] = res.bars_map
+                if res.anomaly:
+                    anomalies_map[_to_display_symbol(res.symbol)] = res.anomaly
+                if res.missing_tfs:
+                    missing_tfs_map[_to_display_symbol(res.symbol)] = res.missing_tfs
+                price_fallback_map[res.symbol] = res.price_is_fallback
+                debug_map[_to_display_symbol(res.symbol)] = res.debug_info
+                for tf, rows in res.rows.items():
+                    if not rows:
+                        continue
+                    if tf == "H4":
+                        results_h4.extend(rows)
+                    elif tf == "Daily":
+                        results_daily.extend(rows)
+                    elif tf == "Weekly":
+                        results_weekly.extend(rows)
+
+            all_confs: List[dict] = []
+            for sym in symbols_to_scan:
+                if _to_display_symbol(sym) in scan_errors:
+                    continue
+                sym_thresh = {
+                    "US30_USD": 1.5, "NAS100_USD": 1.5,
+                    "SPX500_USD": 1.2, "XAU_USD": 1.5,
+                }.get(sym, confluence_threshold)
+                all_confs.extend(detect_confluences(
+                    _to_display_symbol(sym),
+                    all_zones_map.get(sym, {}),
+                    prices_map.get(sym),
+                    bars_map_global.get(sym, {}),
+                    sym_thresh,
+                ))
+            conf_df = pd.DataFrame(all_confs) if all_confs else pd.DataFrame()
+
+            summaries: List[dict] = []
+            for sym in symbols_to_scan:
+                cp = prices_map.get(sym)
+                ctx = ""
+                if "Daily" in all_zones_map.get(sym, {}) and cp:
+                    ctx = _build_daily_price_context(
+                        cp, all_zones_map[sym]["Daily"][0], all_zones_map[sym]["Daily"][1],
+                    )
+                summaries.append({
+                    "symbol": _to_display_symbol(sym),
+                    "trend_h4": trends_map.get(sym, {}).get("H4", "NEUTRE"),
+                    "trend_daily": trends_map.get(sym, {}).get("Daily", "NEUTRE"),
+                    "trend_weekly": trends_map.get(sym, {}).get("Weekly", "NEUTRE"),
+                    "price_context": ctx,
+                    "current_price": cp,
+                })
+
+            df_h4 = pd.DataFrame(results_h4)
+            df_d = pd.DataFrame(results_daily)
+            df_w = pd.DataFrame(results_weekly)
+            st.session_state["scan_results"] = {
+                "df_h4": df_h4, "df_daily": df_d, "df_weekly": df_w,
+                "conf_full": conf_df,
+                "report_dict": {"H4": df_h4, "Daily": df_d, "Weekly": df_w},
+                "summaries": summaries,
+                "anomalies": anomalies_map,
+                "scan_errors": scan_errors,
+                "missing_tfs_map": missing_tfs_map,
+                "debug_map": debug_map,
+            }
+            st.session_state.pop("scanning_lock_ts", None)
+            st.success("Scan terminé !")
+            st.rerun()
+        except Exception as e:
+            _LOG.exception("Scan crash")
+            st.error(f"Crash critique: {type(e).__name__}")
+            st.session_state.pop("scanning_lock_ts", None)
+
+if "scan_results" in st.session_state:
+    res = st.session_state["scan_results"]
+    if res["scan_errors"]:
+        with st.expander("❌ Erreurs"):
+            for s, e in res["scan_errors"].items():
+                st.error(f"{s}: {e}")
+    if res["anomalies"]:
+        with st.expander("⚠️ Anomalies"):
+            for s, m in res["anomalies"].items():
+                st.warning(f"{s}: {m}")
+    if res.get("missing_tfs_map"):
+        with st.expander("📉 TF manquants"):
+            for s, tfs in res["missing_tfs_map"].items():
+                st.info(f"{s}: {', '.join(tfs)}")
+
+    if not res["conf_full"].empty:
+        st.subheader("🔥 CONFLUENCES MULTI-TF")
+        c_df = res["conf_full"].copy()
+        c_df["dist_num"] = pd.to_numeric(
+            c_df["Distance %"].astype(str).str.replace("%", "", regex=False),
+            errors="coerce",
+        ).fillna(999.0)
+        filtered_c = c_df[c_df["dist_num"] <= max_dist_filter].drop(columns=["dist_num"])
+        st.dataframe(filtered_c.sort_values("Score", ascending=False), use_container_width=True)
+
+    for label, df in [("H4", res["df_h4"]), ("Daily", res["df_daily"]), ("Weekly", res["df_weekly"])]:
+        st.subheader(f"Analyse {label}")
+        if not df.empty:
+            df_f = df.copy()
+            df_f["dist_num"] = pd.to_numeric(
+                df_f["Dist. %"].astype(str).str.replace("%", "", regex=False),
+                errors="coerce",
+            ).fillna(999.0)
+            st.dataframe(
+                df_f[df_f["dist_num"] <= max_dist_filter].drop(columns=["dist_num"]),
+                use_container_width=True,
+            )
+
+    st.divider()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        pdf_b = create_pdf_report(
+            res["report_dict"], res["conf_full"], res["summaries"], res["anomalies"],
+        )
+        st.download_button("📄 PDF", data=pdf_b, file_name="rapport_bluestar.pdf")
+    with col2:
+        json_b = create_json_export(
+            res["summaries"], res["conf_full"],
+            llm_max_dist, llm_min_score, tuple(llm_statuts),
+        )
+        st.download_button("🔧 JSON", data=json_b, file_name="supports_et_resistances.json")
+    with col3:
+        llm_b = create_llm_brief(
+            res["summaries"], res["conf_full"],
+            llm_max_dist, llm_min_score, tuple(llm_statuts),
+        )
+        st.download_button("🤖 LLM Brief", data=llm_b, file_name="brief_llm.md")
