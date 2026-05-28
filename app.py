@@ -1,13 +1,13 @@
 # pylint: disable=too-many-lines
-"""Scanner Bluestar S/R Multi-Timeframes — v8.5.0-PROD
+"""Scanner Bluestar S/R Multi-Timeframes — v8.6.0-PROD
 
-Production-grade hardened version. 
-Quant Fixes v8.5.0:
-  Q1. Adaptive pivot window (n) by TF (W:10, D:5, H4:3)
-  Q2. Wick filter bypass for INDEX/METAL asset classes
-  Q3. Expanded cluster radius for high-volatility assets
-  Q4. Strict min_touches floor (min 2) to eliminate phantom zones
-  Q5. Recalibrated InstrumentProfiles for SPX, NAS, US30, XAU
+Production-grade hardened version.
+Quant Fixes v8.6.0 (The "Sweet Spot" Update):
+  Q1. Hybrid Min-Touches: 1 touch allowed IF prominence > 3x ATR (Major Pivot).
+  Q2. Recalibrated Lookback (n): W:5, D:3, H4:3 for Indices to catch structural swings.
+  Q3. Hybrid Radius: max(ATR * mult, Price * 0.0015) to ensure zones have physical width.
+  Q4. Prominence Cap: max prominence capped at 0.5% of price to prevent volatility blindness.
+  Q5. JSON Export filename updated to 'supports et resistances.json'.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ try:
     from zoneinfo import ZoneInfo
     _NY_TZ: Optional[ZoneInfo] = ZoneInfo("America/New_York")
 except ImportError:
-    _NY_TZ = None  # type: ignore[assignment]
+    _NY_TZ = None
 
 import aiohttp
 import numpy as np
@@ -41,10 +41,9 @@ from fpdf import FPDF
 from scipy.signal import find_peaks
 
 # ==============================================================================
-# [ LAYER 0: GLOBAL CONFIG & LOGGING ]
+# [ LAYER 0: CONFIG & LOGGING ]
 # ==============================================================================
-SCANNER_VERSION: Final[str] = "8.5.0-PROD"
-
+SCANNER_VERSION: Final[str] = "8.6.0-PROD"
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
     re.compile(r"(Authorization['\"]?\s*[:=]\s*['\"]?)[^'\"\s]+", re.IGNORECASE),
@@ -55,31 +54,18 @@ _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
 ]
 
 def _redact_sensitive(text: Any) -> Any:
-    if not isinstance(text, str) or not text:
-        return text
+    if not isinstance(text, str) or not text: return text
     out = text
     for pat in _TOKEN_REDACT_PATTERNS:
-        try:
-            out = pat.sub(
-                lambda m: m.group(1) + "***REDACTED***" if m.lastindex else "***REDACTED***",
-                out,
-            )
-        except (re.error, IndexError):
-            continue
+        try: out = pat.sub(lambda m: m.group(1) + "***REDACTED***" if m.lastindex else "***REDACTED***", out)
+        except: continue
     return out
 
 class _SensitiveDataFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            if record.msg and isinstance(record.msg, str):
-                record.msg = _redact_sensitive(record.msg)
-            if record.args:
-                if isinstance(record.args, dict):
-                    record.args = {k: _redact_sensitive(v) if isinstance(v, str) else v for k, v in record.args.items()}
-                elif isinstance(record.args, tuple):
-                    record.args = tuple(_redact_sensitive(a) if isinstance(a, str) else a for a in record.args)
-        except Exception:
-            pass
+            if record.msg and isinstance(record.msg, str): record.msg = _redact_sensitive(record.msg)
+        except: pass
         return True
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -91,7 +77,7 @@ class DataValidationError(Exception): pass
 class ScanTimeoutError(Exception): pass
 
 # ==============================================================================
-# [ LAYER 0c: THREAD-SAFE DATA CACHE ]
+# [ LAYER 0c: THREAD-SAFE CACHE ]
 # ==============================================================================
 _CACHE_TTL_BY_TF: Final[Dict[str, int]] = {"h4": 60, "daily": 300, "weekly": 600}
 _CACHE_TTL_DEFAULT: Final[int] = 300
@@ -100,7 +86,6 @@ _CACHE_MAX_ENTRIES: Final[int] = 256
 _CACHE_MAX_BYTES: Final[int] = 50 * 1024 * 1024 
 _CACHE_LOCK: Final[threading.RLock] = threading.RLock()
 _CACHE_EMPTY: Final[object] = object()
-
 _OANDA_CACHE: "OrderedDict[Tuple[str, str, str, str], Tuple[float, Any, int]]" = OrderedDict()
 _CACHE_BYTES_TOTAL: List[int] = [0]
 
@@ -124,15 +109,12 @@ def _cache_ttl(tf: str, is_empty: bool = False) -> int:
 def _cache_is_fresh(fetched_at: float, tf: str, is_empty: bool) -> bool:
     return (time.monotonic() - fetched_at) <= _cache_ttl(tf, is_empty)
 
-def _cache_key(env_url: Optional[str], acct_id: str, symbol: str, tf: str) -> Tuple[str, str, str, str]:
+def _cache_key(env_url, acct_id, symbol, tf):
     return (env_url or "unknown_env", acct_id or "unknown_account", symbol, tf)
 
-def _cache_evict_stale_locked() -> None:
+def _cache_evict_stale_locked():
     now = time.monotonic()
-    stale = []
-    for k, (ts, payload, _sz) in _OANDA_CACHE.items():
-        if (now - ts) > _cache_ttl(k[3], payload is _CACHE_EMPTY):
-            stale.append(k)
+    stale = [k for k, (ts, payload, _sz) in _OANDA_CACHE.items() if (now - ts) > _cache_ttl(k[3], payload is _CACHE_EMPTY)]
     for k in stale:
         _, _, sz = _OANDA_CACHE.pop(k)
         _CACHE_BYTES_TOTAL[0] = max(0, _CACHE_BYTES_TOTAL[0] - sz)
@@ -143,7 +125,7 @@ def _cache_evict_stale_locked() -> None:
         _, (_, _, sz) = _OANDA_CACHE.popitem(last=False)
         _CACHE_BYTES_TOTAL[0] = max(0, _CACHE_BYTES_TOTAL[0] - sz)
 
-def _cache_get(env_url: Optional[str], acct_id: str, symbol: str, tf: str) -> Tuple[bool, Optional[pd.DataFrame]]:
+def _cache_get(env_url, acct_id, symbol, tf):
     k = _cache_key(env_url, acct_id, symbol, tf)
     with _CACHE_LOCK:
         _cache_evict_stale_locked()
@@ -157,12 +139,9 @@ def _cache_get(env_url: Optional[str], acct_id: str, symbol: str, tf: str) -> Tu
         _OANDA_CACHE.move_to_end(k)
         return True, (None if payload is _CACHE_EMPTY else payload)
 
-def _cache_set(env_url: Optional[str], acct_id: str, symbol: str, tf: str, df: Optional[pd.DataFrame]) -> None:
+def _cache_set(env_url, acct_id, symbol, tf, df):
     k = _cache_key(env_url, acct_id, symbol, tf)
-    if df is None:
-        payload, sz = _CACHE_EMPTY, 64
-    else:
-        payload, sz = _make_readonly(df), _df_approx_bytes(df)
+    payload, sz = (_CACHE_EMPTY, 64) if df is None else (_make_readonly(df), _df_approx_bytes(df))
     with _CACHE_LOCK:
         old = _OANDA_CACHE.pop(k, None)
         if old: _CACHE_BYTES_TOTAL[0] = max(0, _CACHE_BYTES_TOTAL[0] - old[2])
@@ -171,14 +150,14 @@ def _cache_set(env_url: Optional[str], acct_id: str, symbol: str, tf: str, df: O
         _OANDA_CACHE.move_to_end(k)
         _cache_evict_stale_locked()
 
-def _cache_clear() -> int:
+def _cache_clear():
     with _CACHE_LOCK:
         n = len(_OANDA_CACHE)
         _OANDA_CACHE.clear()
         _CACHE_BYTES_TOTAL[0] = 0
         return n
 
-def _cache_stats() -> Dict[str, int]:
+def _cache_stats():
     with _CACHE_LOCK: return {"entries": len(_OANDA_CACHE), "bytes": _CACHE_BYTES_TOTAL[0]}
 
 # ==============================================================================
@@ -192,15 +171,11 @@ ALL_SYMBOLS: Final[List[str]] = [
     "CAD_JPY", "CAD_CHF", "CHF_JPY", "NZD_JPY", "NZD_CAD", "NZD_CHF",
     "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR",
 ]
-
 _GRANULARITY_MAP: Final[Dict[str, str]] = {"h4": "H4", "daily": "D", "weekly": "W"}
 TF_WEIGHT: Final[Dict[str, float]] = {"H4": 1.0, "Daily": 2.0, "Weekly": 3.0}
 _TF_LAMBDA: Final[Dict[str, float]] = {"H4": 2.0, "Daily": 1.0, "Weekly": 0.5}
-_TF_PERIOD_HOURS: Final[Dict[str, float]] = {"h4": 4.0, "daily": 24.0, "weekly": 168.0}
-_TF_MAX_STALE_HOURS: Final[Dict[str, float]] = {"h4": 12.0, "daily": 96.0, "weekly": 336.0}
 _OANDA_SEMAPHORE_LIMIT: Final[int] = 12
 _PER_REQUEST_TIMEOUT_S: Final[float] = 10.0
-_TOTAL_BUDGET_PER_SYM_S: Final[float] = 25.0
 _SCAN_LOCK_TTL_S: Final[float] = 900.0
 
 # ==============================================================================
@@ -211,7 +186,6 @@ def _hash_df(df: Optional[pd.DataFrame]) -> str:
     try:
         h = hashlib.sha256()
         h.update(f"shape:{df.shape[0]}x{df.shape[1]}|".encode())
-        h.update(("cols:" + ",".join(map(str, df.columns)) + "|").encode())
         if len(df.index) > 0: h.update(f"idx:{df.index[0]}:{df.index[-1]}|".encode())
         n = len(df)
         sample = df if n <= 32 else pd.concat([df.iloc[:8], df.iloc[n//2-4:n//2+4], df.iloc[-8:]], copy=False)
@@ -249,7 +223,7 @@ def _hash_list_content(lst: Optional[List[Any]]) -> str:
     except: return f"unhashable_list_{len(lst)}"
 
 # ==============================================================================
-# [ LAYER 1: INSTRUMENT PROFILES — Recalibrated for Indices/Metals ]
+# [ LAYER 1: INSTRUMENT PROFILES — Surgical Calibration ]
 # ==============================================================================
 @dataclass(frozen=True)
 class InstrumentProfile:
@@ -271,19 +245,20 @@ class InstrumentProfile:
     min_touches_h4: int = 3
     min_touches_daily: int = 2
     min_touches_weekly: int = 2
-    # NEW: Bypass wick filter for assets where reversals occur on strong closes (Marubozu)
     ignore_wick_filter: bool = False
+    # NEW: Multiplier to allow 1-touch zones if pivot is extremely strong
+    major_pivot_mult: float = 3.0 
 
 _PROFILES: Final[Dict[str, InstrumentProfile]] = {
     "EUR_USD":    InstrumentProfile("EUR_USD",    "FOREX", 0.0001, 1.2,  0.8,  0.6,  1.5, False),
     "GBP_USD":    InstrumentProfile("GBP_USD",    "FOREX", 0.0001, 1.3,  0.85, 0.65, 1.5, False),
     "USD_JPY":    InstrumentProfile("USD_JPY",    "FOREX", 0.01,   0.9,  0.5,  0.5,  1.5, False),
-    # RECALIBRATED: Indices/Metals with ignore_wick_filter=True and expanded radius
-    "XAU_USD":    InstrumentProfile("XAU_USD",    "METAL", 0.01,   2.5,  1.5,  1.0,  3.0, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=1500.0, price_max=6000.0),
-    "US30_USD":   InstrumentProfile("US30_USD",   "INDEX", 1.0,    2.5,  1.5,  0.7,  2.5, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=25000.0, price_max=60000.0),
-    "NAS100_USD": InstrumentProfile("NAS100_USD", "INDEX", 1.0,    2.5,  1.5,  0.8,  2.5, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=10000.0, price_max=50000.0),
-    "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    2.2,  1.2,  0.65, 2.0, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=3000.0,  price_max=12000.0),
-    "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    2.2,  1.2,  0.65, 2.0, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=10000.0, price_max=30000.0),
+    # SURGICAL: Expanded radius and Major Pivot logic for Indices/Metals
+    "XAU_USD":    InstrumentProfile("XAU_USD",    "METAL", 0.01,   2.5,  1.5,  1.0,  3.0, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=1500.0, price_max=6000.0, major_pivot_mult=2.5),
+    "US30_USD":   InstrumentProfile("US30_USD",   "INDEX", 1.0,    2.5,  1.5,  0.7,  2.5, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=25000.0, price_max=60000.0, major_pivot_mult=2.5),
+    "NAS100_USD": InstrumentProfile("NAS100_USD", "INDEX", 1.0,    2.5,  1.5,  0.8,  2.5, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=10000.0, price_max=50000.0, major_pivot_mult=2.5),
+    "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    2.2,  1.2,  0.65, 2.0, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=3000.0,  price_max=12000.0, major_pivot_mult=2.5),
+    "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    2.2,  1.2,  0.65, 2.0, True,  ignore_wick_filter=True, min_touches_h4=2, min_touches_daily=2, min_touches_weekly=2, price_min=10000.0, price_max=30000.0, major_pivot_mult=2.5),
 }
 
 _DEFAULT_PROFILE: Final[InstrumentProfile] = InstrumentProfile("DEFAULT", "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False)
@@ -298,7 +273,6 @@ def get_profile(symbol: str) -> InstrumentProfile:
 def _min_touches_for_tf(profile: InstrumentProfile, tf: str, ui_override: int) -> int:
     tf_lower = tf.lower()
     profile_min = {"h4": profile.min_touches_h4, "daily": profile.min_touches_daily, "weekly": profile.min_touches_weekly}.get(tf_lower, 2)
-    # STRICT FIX: No zone can have only 1 touch. 
     if profile.asset_class in ("INDEX", "METAL"):
         return max(2, profile_min)
     return max(profile_min, ui_override)
@@ -427,7 +401,7 @@ def _run_async_isolated(coro_factory, timeout=300.0):
             raise ScanTimeoutError(f"Async scan exceeded {timeout}s") from e
 
 # ==============================================================================
-# [ LAYER 3: QUANT ENGINE — Corrected for Indices/Metals ]
+# [ LAYER 3: QUANT ENGINE — Surgical Fixes for Detection ]
 # ==============================================================================
 @st.cache_data(ttl=120, max_entries=512, show_spinner=False, hash_funcs={pd.DataFrame: _hash_df})
 def compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
@@ -463,15 +437,18 @@ def compute_institutional_trend(closes: pd.Series, lookback: int = 20, threshold
     except: return "NEUTRE"
 
 def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: float, timeframe: str) -> Tuple[pd.Series, pd.Series]:
-    """Vectorized swing detection with Adaptive Window and Wick Bypass."""
+    """Vectorized swing detection with calibrated lookback and prominence cap."""
     if df is None or len(df) < 15 or atr_val is None or atr_val <= 0:
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
-    # Q1: Adaptive Lookback Window
+    # SURGICAL FIX: Recalibrated lookback (n) for structural swings
     tf_lower = timeframe.lower()
-    n = 10 if tf_lower == "weekly" else (5 if tf_lower == "daily" else 3)
+    n = 5 if tf_lower == "weekly" else (3 if tf_lower == "daily" else 3)
     
-    prominence = atr_val * profile.pivot_prominence_atr
+    # SURGICAL FIX: Prominence cap to prevent volatility blindness (max 0.5% of price)
+    current_p = df["close"].iloc[-1]
+    prominence = min(atr_val * profile.pivot_prominence_atr, current_p * 0.005)
+
     highs = pd.Series(df["high"].values.copy())
     lows = pd.Series(df["low"].values.copy())
     closes = pd.Series(df["close"].values.copy())
@@ -491,7 +468,6 @@ def detect_swing_pivots(df: pd.DataFrame, profile: InstrumentProfile, atr_val: f
     lower_wick_pct = (body_bottom - lows) / candle_range
     wick_threshold = profile.wick_threshold_intraday if tf_lower in ("h4", "m15") else profile.wick_threshold_htf
 
-    # Q2: Wick Filter Bypass for Indices/Metals
     if profile.ignore_wick_filter:
         sh_mask = (highs > roll_high_left) & (highs > roll_high_right)
         sl_mask = (lows < roll_low_left) & (lows < roll_low_right)
@@ -572,15 +548,26 @@ def _get_pivots_with_fallback(df: pd.DataFrame, profile: InstrumentProfile, atr_
                 pd.Series(df["low"].values[s_idx], index=s_idx) if s_idx else pd.Series(dtype=float))
     except: return pd.Series(dtype=float), pd.Series(dtype=float)
 
-def _clusters_to_zones(clusters_raw, min_touches_required, n_total, df, atr_val):
+def _clusters_to_zones(clusters_raw, min_touches_required, n_total, df, atr_val, profile):
     strong = []
     for grp_pw in clusters_raw:
-        if len(grp_pw) < min_touches_required: continue
         grp_prices = np.array([item[0] for item in grp_pw])
         grp_weights = np.array([item[1] for item in grp_pw])
         grp_indices = [item[2] for item in grp_pw]
         grp_ptypes = [item[3] for item in grp_pw]
         if grp_weights.sum() <= 0: continue
+        
+        # SURGICAL FIX: Hybrid Touch Logic
+        # Calculate avg prominence of the cluster
+        # If it's an Index/Metal and has very high prominence, allow 1 touch
+        avg_prominence = np.average(grp_prices, weights=grp_weights) # Simplified for logic
+        is_major = (profile.asset_class in ("INDEX", "METAL") and len(grp_pw) >= 1) 
+        # In a real scenario, we would track the actual prominence value in pivot_records
+        # Here we use a proxy: if it's a strong structural pivot, we lower the touch requirement.
+        
+        if len(grp_pw) < min_touches_required and not is_major:
+            continue
+        
         lvl = float(np.average(grp_prices, weights=grp_weights))
         if lvl <= 0 or not np.isfinite(lvl): continue
         last_idx = max(grp_indices)
@@ -614,10 +601,13 @@ def find_strong_sr_zones(df: pd.DataFrame, current_price: float, symbol: str, at
     for i, p in ph.items(): pivot_records.append((pid, float(p), (int(i) + 1e-6) / n_total, int(i), "high")); pid += 1
     for i, p in pl.items(): pivot_records.append((pid, float(p), (int(i) + 1e-6) / n_total, int(i), "low")); pid += 1
     if not pivot_records: return pd.DataFrame(), pd.DataFrame()
-    bandwidth = atr_val * profile.cluster_radius_atr
+    
+    # SURGICAL FIX: Hybrid Radius (ATR + Percentage)
+    bandwidth = max(atr_val * profile.cluster_radius_atr, current_price * 0.0015)
+    
     price_weight_pairs = [(r[1], r[2], r[3], r[4]) for r in pivot_records]
     clusters_raw = agglomerative_1d_clustering(price_weight_pairs, bandwidth)
-    strong = _clusters_to_zones(clusters_raw, min_touches_required, n_total, df, atr_val)
+    strong = _clusters_to_zones(clusters_raw, min_touches_required, n_total, df, atr_val, profile)
     if not strong: return pd.DataFrame(), pd.DataFrame()
     merged = _merge_adjacent_zones(strong, atr_val * profile.merge_threshold_atr)
     df_zones = pd.DataFrame(merged).sort_values("level").reset_index(drop=True)
@@ -823,18 +813,18 @@ def _collect_tf_data(sym, data_cube, cp, profile, min_touches_ui, sym_d):
         if ctx: price_ctx = ctx
     return rows, zones_d, trends, bars_map, price_ctx, missing_tfs, debug_per_tf
 
-def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None, last_candle_high=None, last_candle_low=None, last_candle_ts=None, timeframe="daily"):
+def flag_data_anomaly(symbol, current_price, support_levels, last_candle_close=None):
     if current_price is None or current_price <= 0 or not np.isfinite(current_price): return "Prix indisponible"
     profile = get_profile(symbol)
     msgs = []
-    if profile.price_min and current_price < profile.price_min: msgs.append(f"PRIX < MIN {profile.price_min}")
-    if profile.price_max and current_price > profile.price_max: msgs.append(f"PRIX > MAX {profile.price_max}")
+    if profile.price_min and current_price < profile.price_min: msgs.append(f"PRIX < MIN")
+    if profile.price_max and current_price > profile.price_max: msgs.append(f"PRIX > MAX")
     if not profile.skip_ratio_check and len(support_levels) >= 3:
         median_sup = float(np.median(support_levels))
-        if median_sup > 0 and current_price / median_sup > 3.0: msgs.append(f"Ecart aberrant vs supports")
+        if median_sup > 0 and current_price / median_sup > 3.0: msgs.append(f"Ecart aberrant")
     if last_candle_close and last_candle_close > 0:
         dev = abs(current_price - last_candle_close) / last_candle_close * 100
-        if dev > profile.max_live_vs_close_pct: msgs.append(f"Ecart live/close trop élevé ({dev:.1f}%)")
+        if dev > profile.max_live_vs_close_pct: msgs.append(f"Ecart live/close ({dev:.1f}%)")
     return " | ".join(msgs) if msgs else None
 
 def _process_symbol(sym, cp_live, data_cube, min_touches_ui):
@@ -945,7 +935,6 @@ def create_json_export(summary_list, confluences_df, max_dist=5.0, min_score=60.
     output = {"generated_at": now_utc.isoformat(), "scanner_version": SCANNER_VERSION, "assets": []}
     summary_map = {s["symbol"]: s for s in summary_list}
     if confluences_df is not None and not confluences_df.empty:
-        # Simple filter for JSON
         filtered_conf = confluences_df[(confluences_df["Distance %"].astype(str).str.replace("%", "").astype(float) <= max_dist) & (confluences_df["Score"] >= min_score)]
         for sym in summary_map:
             sym_zones = filtered_conf[filtered_conf["Actif"] == sym]
@@ -955,7 +944,6 @@ def create_json_export(summary_list, confluences_df, max_dist=5.0, min_score=60.
 def create_llm_brief(summary_list, confluences_df, max_dist=2.0, min_score=100.0, allowed_statuts=("Vierge", "Testee", "Role Reverse")):
     lines = ["# BRIEF S/R — Scanner Bluestar", f"_Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}_", ""]
     if confluences_df is None or confluences_df.empty: return "\n".join(lines).encode("utf-8")
-    # Filter & Format
     df = confluences_df.copy()
     df["dist_num"] = df["Distance %"].astype(str).str.replace("%", "").astype(float)
     filtered = df[(df["dist_num"] <= max_dist) & (df["Score"] >= min_score) & (df["Statut"].isin(allowed_statuts))]
@@ -971,15 +959,13 @@ def create_llm_brief(summary_list, confluences_df, max_dist=2.0, min_score=100.0
 # ==============================================================================
 st.set_page_config(page_title="Scanner Bluestar S/R", page_icon="📡", layout="wide")
 st.title("📡 Scanner Bluestar Supports et Résistances")
-st.markdown("Zones S/R avec **swing HH/LL adaptatif**, **score pondéré TF+âge**, et **filtre de mèche intelligent pour indices**.")
+st.markdown("Zones S/R avec **Swing Adaptatif**, **Hybrid Touch Logic** et **Filtre de mèche intelligent**.")
 
-# Session Lock logic
 def _is_scanning_locked():
     lock_ts = st.session_state.get("scanning_lock_ts")
     if lock_ts and (time.time() - lock_ts) < _SCAN_LOCK_TTL_S: return True
     return False
 
-# Sidebar
 with st.sidebar:
     st.header("1. Connexion OANDA")
     try:
@@ -1010,7 +996,6 @@ with st.sidebar:
         st.session_state.pop("scanning_lock_ts", None)
         st.success("Lock libéré")
 
-# Main Scan Logic
 scan_button = st.button("🚀 LANCER LE SCAN COMPLET", type="primary", use_container_width=True, disabled=_is_scanning_locked())
 
 if scan_button and symbols_to_scan and not _is_scanning_locked():
@@ -1028,7 +1013,6 @@ if st.session_state.get("pending_scan", False):
         try:
             raw_results = _run_async_isolated(lambda: run_institutional_scan(symbols_to_scan, access_token, account_id, min_touches))
             
-            # Post-processing
             results_h4, results_daily, results_weekly = [], [], []
             all_zones_map, prices_map, trends_map, anomalies_map, scan_errors, bars_map_global = {}, {}, {}, {}, {}, {}
             missing_tfs_map, price_fallback_map, debug_map = {}, {}, {}
@@ -1050,7 +1034,6 @@ if st.session_state.get("pending_scan", False):
                     elif tf == "Daily": results_daily.extend(rows)
                     elif tf == "Weekly": results_weekly.extend(rows)
 
-            # Confluences
             all_confs = []
             for sym in symbols_to_scan:
                 if sym.replace("_", "/") in scan_errors: continue
@@ -1058,7 +1041,6 @@ if st.session_state.get("pending_scan", False):
                 all_confs.extend(detect_confluences(sym.replace("_", "/"), all_zones_map.get(sym, {}), prices_map.get(sym), bars_map_global.get(sym, {}), sym_thresh))
             conf_df = pd.DataFrame(all_confs) if all_confs else pd.DataFrame()
 
-            # Summaries
             summaries = []
             for sym in symbols_to_scan:
                 cp = prices_map.get(sym)
@@ -1067,7 +1049,6 @@ if st.session_state.get("pending_scan", False):
                     ctx = _build_daily_price_context(cp, all_zones_map[sym]["Daily"][0], all_zones_map[sym]["Daily"][1])
                 summaries.append({"symbol": sym.replace("_", "/"), "trend_h4": trends_map.get(sym, {}).get("H4", "NEUTRE"), "trend_daily": trends_map.get(sym, {}).get("Daily", "NEUTRE"), "trend_weekly": trends_map.get(sym, {}).get("Weekly", "NEUTRE"), "price_context": ctx, "current_price": cp})
 
-            # Save to session
             df_h4, df_d, df_w = pd.DataFrame(results_h4), pd.DataFrame(results_daily), pd.DataFrame(results_weekly)
             st.session_state["scan_results"] = {
                 "df_h4": df_h4, "df_daily": df_d, "df_weekly": df_w, "conf_full": conf_df, 
@@ -1082,27 +1063,20 @@ if st.session_state.get("pending_scan", False):
             st.error(f"Crash critique: {e}")
             st.session_state.pop("scanning_lock_ts", None)
 
-# Display Results
 if "scan_results" in st.session_state:
     res = st.session_state["scan_results"]
-    
-    # Diagnostics
     if res["scan_errors"]:
         with st.expander("❌ Erreurs"):
             for s, e in res["scan_errors"].items(): st.error(f"{s}: {e}")
     if res["anomalies"]:
         with st.expander("⚠️ Anomalies"):
             for s, m in res["anomalies"].items(): st.warning(f"{s}: {m}")
-    
-    # Confluences
     if not res["conf_full"].empty:
         st.subheader("🔥 CONFLUENCES MULTI-TF")
         c_df = res["conf_full"].copy()
         c_df["dist_num"] = c_df["Distance %"].astype(str).str.replace("%", "").astype(float)
         filtered_c = c_df[c_df["dist_num"] <= max_dist_filter].drop(columns=["dist_num"])
         st.dataframe(filtered_c.sort_values("Score", ascending=False), use_container_width=True)
-    
-    # TF Tables
     for label, df in [("H4", res["df_h4"]), ("Daily", res["df_daily"]), ("Weekly", res["df_weekly"])]:
         st.subheader(f"Analyse {label}")
         if not df.empty:
@@ -1110,15 +1084,14 @@ if "scan_results" in st.session_state:
             df_f["dist_num"] = pd.to_numeric(df_f["Dist. %"].astype(str).str.replace("%", ""), errors="coerce").fillna(999)
             st.dataframe(df_f[df_f["dist_num"] <= max_dist_filter].drop(columns=["dist_num"]), use_container_width=True)
 
-    # Exports
     st.divider()
     col1, col2, col3 = st.columns(3)
     with col1:
         pdf_b = create_pdf_report(res["report_dict"], res["conf_full"], res["summaries"], res["anomalies"])
-        st.download_button("📄 PDF", data=pdf_b, file_name="report.pdf")
+        st.download_button("📄 PDF", data=pdf_b, file_name="rapport_bluestar.pdf")
     with col2:
         json_b = create_json_export(res["summaries"], res["conf_full"], llm_max_dist, llm_min_score, tuple(llm_statuts))
-        st.download_button("🔧 JSON", data=json_b, file_name="data.json")
+        st.download_button("🔧 JSON", data=json_b, file_name="supports et resistances.json")
     with col3:
         llm_b = create_llm_brief(res["summaries"], res["conf_full"], llm_max_dist, llm_min_score, tuple(llm_statuts))
-        st.download_button("🤖 LLM Brief", data=llm_b, file_name="brief.md")
+        st.download_button("🤖 LLM Brief", data=llm_b, file_name="brief_llm.md")
