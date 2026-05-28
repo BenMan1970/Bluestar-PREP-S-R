@@ -1,18 +1,21 @@
 # pylint: disable=too-many-lines
-"""Scanner Bluestar S/R Multi-Timeframes — v8.6.1-PROD
+"""Scanner Bluestar S/R Multi-Timeframes — v8.7.0-PROD
 
 Production-grade hardened version.
-Quant Fixes v8.6.1 (The "Institutional Integrity" Update):
-  F1. classify_zone_status: condition second_break corrigee pour Resistance (level - tolerance).
-  F2. PivotPoint dataclass: prominence reelle transportee du pivot au cluster.
-  F3. Clustering separe high/low: plus de fusion aberrante Support/Resistance.
-  F4. Hybrid Min-Touches reel: 1 touch autorise uniquement si prominence >= ATR * major_pivot_mult.
-  F5. Profils JPY: ignore_wick_filter=True pour recuperer les pivots tendanciels.
-  F6. OHLC validation profilee: max_high_low_ratio par asset class (1.8 Forex, 2.5 Index/Metal).
-  F7. JSON Export: coverage complet (tous les actifs), allowed_statuts branche, ensure_ascii=False.
-  F8. Logging: sanitization etendue aux args et traceback.
-  F9. Debug quantitatif: n_pivots, n_zones, min_touches remplis correctement.
-  F10. Coverage strict: validation post-scan que tous les symboles demandes sont retournes.
+Quant Fixes v8.7.0 (The "Trend-Structure Integrity" Update):
+  G1. _detect_trend_structure_zones: FIX du bug de signe des residus.
+      En tendance propre, resid(lows) > 0 => quantile bas positif => Support
+      au-dessus du prix => rejete. On ancre desormais le niveau en descendant
+      sous la regression d'une fraction d'ecart-type, garantissant lvl < prix.
+      Symetrique pour Resistance. Zones trend marquees is_major=True + strength
+      rehausse pour passer min_score et la confluence 1-TF.
+  G2. InstrumentProfile.min_touches_h4: defaut 3 -> 2 (debloque GBP/USD, AUD/CAD
+      sans toucher aux profils INDEX/METAL/JPY qui surchargent deja la valeur).
+  G3. Observabilite: debug_info enrichi (n_pivots, n_zones, trend zones count).
+
+Heritage v8.6.x (conserve):
+  F1. classify_zone_status: condition second_break corrigee pour Resistance.
+  F2-F10. Voir historique.
 """
 from __future__ import annotations
 
@@ -48,7 +51,7 @@ from scipy.signal import find_peaks
 # ==============================================================================
 # [ LAYER 0: CONFIG & LOGGING ]
 # ==============================================================================
-SCANNER_VERSION: Final[str] = "8.6.6-PROD"
+SCANNER_VERSION: Final[str] = "8.7.0-PROD"
 
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
@@ -337,7 +340,10 @@ class InstrumentProfile:
     pdf_max_dist_pct: float = 5.0
     price_min: Optional[float] = None
     price_max: Optional[float] = None
-    min_touches_h4: int = 3
+    # FIX G2: defaut abaisse de 3 -> 2. Debloque GBP/USD et AUD/CAD (marches
+    # directionnels ou chaque niveau n'est touche qu'une fois). Les profils
+    # INDEX/METAL/JPY surchargent deja explicitement cette valeur a 1.
+    min_touches_h4: int = 2
     min_touches_daily: int = 2
     min_touches_weekly: int = 2
     ignore_wick_filter: bool = False
@@ -348,7 +354,10 @@ class InstrumentProfile:
 
 _PROFILES: Final[Dict[str, InstrumentProfile]] = {
     "EUR_USD":    InstrumentProfile("EUR_USD",    "FOREX", 0.0001, 1.2,  0.8,  0.6,  1.5, False),
-    "GBP_USD":    InstrumentProfile("GBP_USD",    "FOREX", 0.0001, 1.3,  0.85, 0.65, 1.5, False),
+    "GBP_USD":    InstrumentProfile(
+        "GBP_USD", "FOREX", 0.0001, 1.3, 0.85, 0.65, 1.5, False,
+        min_touches_h4=2, min_touches_daily=2, min_touches_weekly=1,
+    ),
     "USD_JPY":    InstrumentProfile(
         "USD_JPY", "FOREX", 0.01, 0.9, 0.5, 0.2, 1.5, False,
         ignore_wick_filter=True,
@@ -404,8 +413,10 @@ def get_profile(symbol: str) -> InstrumentProfile:
             major_pivot_mult=0.5,
         )
     if base in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF", "USD"):
+        # Crosses Forex generiques: prominence calibree pour cross calmes (0.5)
+        # et min_touches herites du defaut dataclass (2).
         return InstrumentProfile(
-            sym, "FOREX", 0.0001, 1.2, 0.8, 0.6, 1.5, False,
+            sym, "FOREX", 0.0001, 1.2, 0.8, 0.5, 1.5, False,
             max_high_low_ratio=1.8,
         )
     return _DEFAULT_PROFILE
@@ -668,13 +679,26 @@ def _detect_trend_structure_zones(
     atr_val: float,
     zone_type: str,
 ) -> List[dict]:
-    """Detection alternative par regression log-prix pour marches en tendance parabolique.
+    """Detection alternative par regression log-prix pour marches en tendance.
 
-    Utilise les quantiles de residus de regression log-prix comme proxies
-    de supports/resistances structurels. Plus robuste que moyenne+sigma
-    pour les series non-stationnaires.
+    FIX G1 (bug de signe des residus):
+      En tendance haussiere propre, TOUS les lows restent au-dessus de la droite
+      de regression log => resid = log(lows) - fitted est majoritairement POSITIF
+      => quantile bas positif => niveau projete AU-DESSUS du prix => Support rejete.
+      C'est pourquoi SPX500/US30 (tendances propres) etaient vides alors que
+      NAS100 (volatil, lows perforant la regression) survivait.
+
+    Solution robuste: on ancre le niveau en descendant SOUS la regression projetee
+    d'une fraction de l'ecart-type des residus. Cela garantit lvl < prix pour un
+    Support et lvl > prix pour une Resistance, independamment du signe du quantile.
+
+    Zones marquees is_major=True + strength rehausse pour:
+      - passer le filtre min_score (export JSON / brief LLM)
+      - debloquer la confluence 1-TF (test nb_tf < 2 and not has_trend_zone)
     """
     if df is None or len(df) < 30 or atr_val is None or atr_val <= 0:
+        return []
+    if current_price is None or not np.isfinite(current_price) or current_price <= 0:
         return []
     try:
         n = min(len(df), 100)
@@ -686,6 +710,8 @@ def _detect_trend_structure_zones(
 
         if not np.all(np.isfinite(close)) or np.any(close <= 0):
             return []
+        if np.any(highs <= 0) or np.any(lows <= 0):
+            return []
 
         x = np.arange(n, dtype=float)
         y = np.log(close)
@@ -694,50 +720,86 @@ def _detect_trend_structure_zones(
         fitted = slope * x + intercept
         last_fit = fitted[-1]
 
+        max_dist_pct = 15.0 if profile.asset_class == "INDEX" else 8.0
+
         zones: List[dict] = []
 
         if zone_type == "Support":
             resid = np.log(lows) - fitted
-            quantiles = [(0.20, 1.5), (0.08, 2.5)]
-        else:
-            resid = np.log(highs) - fitted
-            quantiles = [(0.80, 1.5), (0.92, 2.5)]
+            if not np.all(np.isfinite(resid)):
+                return []
+            # Ancre: quantile bas des residus (peut etre > 0 en tendance propre).
+            resid_anchor = float(np.quantile(resid, 0.10))
+            band = float(np.std(resid))
+            if not np.isfinite(band) or band <= 0:
+                band = abs(resid_anchor) if abs(resid_anchor) > 0 else (atr_val / max(current_price, 1e-9))
 
-        if not np.all(np.isfinite(resid)):
-            return []
-
-        max_dist_pct = 15.0 if profile.asset_class == "INDEX" else 8.0
-
-        for q, mult in quantiles:
-            lvl = float(np.exp(last_fit + np.quantile(resid, q)))
-
-            if lvl <= 0 or not np.isfinite(lvl):
-                continue
-
-            if zone_type == "Support":
-                if not (lvl < current_price):
+            # On descend SOUS la regression d'une fraction d'ecart-type pour
+            # GARANTIR un support sous le prix, meme si resid_anchor >= 0.
+            for mult in (1.0, 2.0):
+                lvl = float(np.exp(last_fit + resid_anchor - mult * band))
+                if lvl <= 0 or not np.isfinite(lvl):
                     continue
+                if lvl >= current_price:
+                    # Garde-fou supplementaire: forcer sous le prix si la bande
+                    # n'a pas suffi (cas pathologique de tendance ultra-lisse).
+                    lvl = float(current_price * (1.0 - (0.004 * mult)))
+                    if lvl <= 0 or lvl >= current_price:
+                        continue
                 dist_pct = (current_price - lvl) / current_price * 100
-            else:
-                if not (lvl > current_price):
+                if dist_pct > max_dist_pct:
                     continue
+                zones.append({
+                    "level": round(lvl, 5),
+                    "strength": int(mult * 10 + 5),  # 15 puis 25
+                    "age_bars": 0,
+                    "status": "Vierge",
+                    "zone_type": "Support",
+                    "prominence": round(abs(current_price - lvl), 8),
+                    "prominence_atr": round(abs(current_price - lvl) / atr_val, 3),
+                    "is_major": True,
+                })
+        else:  # Resistance
+            resid = np.log(highs) - fitted
+            if not np.all(np.isfinite(resid)):
+                return []
+            resid_anchor = float(np.quantile(resid, 0.90))
+            band = float(np.std(resid))
+            if not np.isfinite(band) or band <= 0:
+                band = abs(resid_anchor) if abs(resid_anchor) > 0 else (atr_val / max(current_price, 1e-9))
+
+            for mult in (1.0, 2.0):
+                lvl = float(np.exp(last_fit + resid_anchor + mult * band))
+                if lvl <= 0 or not np.isfinite(lvl):
+                    continue
+                if lvl <= current_price:
+                    lvl = float(current_price * (1.0 + (0.004 * mult)))
+                    if lvl <= current_price:
+                        continue
                 dist_pct = (lvl - current_price) / current_price * 100
+                if dist_pct > max_dist_pct:
+                    continue
+                zones.append({
+                    "level": round(lvl, 5),
+                    "strength": int(mult * 10 + 5),
+                    "age_bars": 0,
+                    "status": "Vierge",
+                    "zone_type": "Resistance",
+                    "prominence": round(abs(current_price - lvl), 8),
+                    "prominence_atr": round(abs(current_price - lvl) / atr_val, 3),
+                    "is_major": True,
+                })
 
-            if dist_pct > max_dist_pct:
+        # Deduplication par niveau arrondi (les deux mults peuvent converger)
+        seen_levels: Set[float] = set()
+        deduped: List[dict] = []
+        for z in zones:
+            key = round(z["level"], 5)
+            if key in seen_levels:
                 continue
-
-            zones.append({
-                "level": round(lvl, 5),
-                "strength": int(mult * 10),
-                "age_bars": 0,
-                "status": "Vierge",
-                "zone_type": zone_type,
-                "prominence": round(abs(current_price - lvl), 8),
-                "prominence_atr": round(abs(current_price - lvl) / atr_val, 3),
-                "is_major": False,
-            })
-
-        return zones
+            seen_levels.add(key)
+            deduped.append(z)
+        return deduped
 
     except Exception:
         return []
@@ -894,7 +956,7 @@ def _get_pivots_with_fallback_meta(
         fp = detect_swing_pivots_meta(df, fallback_profile, atr_val, timeframe)
         if len(fp) > len(pivots):
             pivots = fp
-            _LOG.info("Soft-fallback pivot recovery: %s %s -> %d pivots", 
+            _LOG.info("Soft-fallback pivot recovery: %s %s -> %d pivots",
                      profile.symbol, timeframe, len(pivots))
 
     if len(pivots) >= 3:
@@ -924,7 +986,7 @@ def _get_pivots_with_fallback_meta(
             # Validation: extremum strict sur n barres gauche/droite
             if idx < n or idx + n >= len(high_arr):
                 continue
-            if not (high_arr[idx] > np.nanmax(high_arr[idx - n:idx]) and 
+            if not (high_arr[idx] > np.nanmax(high_arr[idx - n:idx]) and
                     high_arr[idx] > np.nanmax(high_arr[idx + 1:idx + n + 1])):
                 continue
             extra.append(
@@ -941,7 +1003,7 @@ def _get_pivots_with_fallback_meta(
                 continue
             if idx < n or idx + n >= len(low_arr):
                 continue
-            if not (low_arr[idx] < np.nanmin(low_arr[idx - n:idx]) and 
+            if not (low_arr[idx] < np.nanmin(low_arr[idx - n:idx]) and
                     low_arr[idx] < np.nanmin(low_arr[idx + 1:idx + n + 1])):
                 continue
             extra.append(
@@ -1261,7 +1323,10 @@ def find_strong_sr_zones(
     #  ont bloque l'activation, on force un second essai)
     if supports.empty and resistances.empty and profile.asset_class in ("INDEX", "METAL"):
         _LOG.info("Trend-mode safety net for %s %s (orphan zones blocked output)", symbol, timeframe)
-        tr_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Support") +                    _detect_trend_structure_zones(df, current_price, profile, atr_val, "Resistance")
+        tr_zones = (
+            _detect_trend_structure_zones(df, current_price, profile, atr_val, "Support")
+            + _detect_trend_structure_zones(df, current_price, profile, atr_val, "Resistance")
+        )
         if tr_zones:
             tr_df = pd.DataFrame(tr_zones)
             tr_df["near_price"] = (np.abs(tr_df["level"] - current_price) / current_price * 100) <= 0.50
@@ -1498,7 +1563,7 @@ _TF_TREND_PARAMS: Final[Dict[str, Tuple[int, float]]] = {"H4": (50, 2.0), "Daily
 
 
 def _process_tf_frame(sym, tf_k, tf_name, df, cp, min_touches_ui, profile, sym_d):
-    debug = {"atr": None, "n_pivots": 0, "n_zones": 0, "min_touches": None, "tf": tf_name}
+    debug = {"atr": None, "n_pivots": 0, "n_zones": 0, "n_trend_zones": 0, "min_touches": None, "tf": tf_name}
     try:
         atr_val = compute_atr(df)
         debug["atr"] = atr_val
@@ -1513,6 +1578,17 @@ def _process_tf_frame(sym, tf_k, tf_name, df, cp, min_touches_ui, profile, sym_d
             debug["n_pivots"] = len(pivots_meta)
         except Exception:
             debug["n_pivots"] = None
+
+        # Debug: compter les zones trend-structure si applicable
+        if profile.asset_class in ("INDEX", "METAL"):
+            try:
+                tr_count = (
+                    len(_detect_trend_structure_zones(df, cp, profile, atr_val, "Support"))
+                    + len(_detect_trend_structure_zones(df, cp, profile, atr_val, "Resistance"))
+                )
+                debug["n_trend_zones"] = tr_count
+            except Exception:
+                debug["n_trend_zones"] = None
 
         sup, res = find_strong_sr_zones(df, cp, sym, atr_val, tf_k, min_t)
         debug["n_zones"] = int(len(sup) + len(res))
@@ -1849,7 +1925,7 @@ def create_llm_brief(summary_list, confluences_df, max_dist=2.0, min_score=100.0
 # ==============================================================================
 st.set_page_config(page_title="Scanner Bluestar S/R", page_icon="📡", layout="wide")
 st.title("📡 Scanner Bluestar Supports et Resistances")
-st.markdown("Zones S/R avec **Swing Adaptatif**, **Hybrid Touch Logic** et **Filtre de meche intelligent**.")
+st.markdown("Zones S/R avec **Swing Adaptatif**, **Hybrid Touch Logic** et **Trend-Structure (fix signe v8.7)**.")
 
 
 def _is_scanning_locked():
@@ -1887,6 +1963,7 @@ with st.sidebar:
     min_touches = st.slider("Min touches Forex H4", 2, 10, 2, 1)
     confluence_threshold = st.slider("Seuil confluence Forex (%)", 0.3, 2.0, 0.8, 0.1)
     max_dist_filter = st.slider("Filtre visuel Dist (%)", 1.0, 15.0, 3.0, 0.5)
+    show_debug = st.checkbox("Afficher debug pipeline", value=False)
 
     if st.button("🧹 Vider le cache"):
         st.success(f"Cache vide : {_cache_clear()} entrees")
@@ -2007,6 +2084,10 @@ if "scan_results" in st.session_state:
         with st.expander("⚠️ Anomalies"):
             for s, m in res["anomalies"].items():
                 st.warning(f"{s}: {m}")
+    if show_debug and res.get("debug_map"):
+        with st.expander("🔍 Debug pipeline (n_pivots / n_zones / n_trend_zones par TF)"):
+            for s, dbg in res["debug_map"].items():
+                st.write(f"**{s}**", dbg)
     if not res["conf_full"].empty:
         st.subheader("🔥 CONFLUENCES MULTI-TF")
         c_df = res["conf_full"].copy()
