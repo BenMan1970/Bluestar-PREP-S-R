@@ -48,7 +48,7 @@ from scipy.signal import find_peaks
 # ==============================================================================
 # [ LAYER 0: CONFIG & LOGGING ]
 # ==============================================================================
-SCANNER_VERSION: Final[str] = "8.6.4-PROD"
+SCANNER_VERSION: Final[str] = "8.6.5-PROD"
 
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
@@ -355,28 +355,28 @@ _PROFILES: Final[Dict[str, InstrumentProfile]] = {
         min_touches_h4=1,
         min_touches_daily=1,
         min_touches_weekly=1,
-        major_pivot_mult=1.0,
+        major_pivot_mult=0.5,
         max_high_low_ratio=1.8,
     ),
-    "XAU_USD":    InstrumentProfile("XAU_USD",    "METAL", 0.01,   2.5,  1.5,  0.5,  3.0, True,
+    "XAU_USD":    InstrumentProfile("XAU_USD",    "METAL", 0.01,   2.5,  1.5,  0.3,  3.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=1500.0, price_max=6000.0, major_pivot_mult=1.0,
+                                     price_min=1500.0, price_max=6000.0, major_pivot_mult=0.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
     "US30_USD":   InstrumentProfile("US30_USD",   "INDEX", 1.0,    2.5,  1.5,  0.4,  2.5, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=25000.0, price_max=60000.0, major_pivot_mult=1.0,
+                                     price_min=25000.0, price_max=60000.0, major_pivot_mult=0.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
     "NAS100_USD": InstrumentProfile("NAS100_USD", "INDEX", 1.0,    2.5,  1.5,  0.4,  2.5, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=10000.0, price_max=50000.0, major_pivot_mult=1.0,
+                                     price_min=10000.0, price_max=50000.0, major_pivot_mult=0.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
     "SPX500_USD": InstrumentProfile("SPX500_USD", "INDEX", 0.1,    2.2,  1.2,  0.35, 2.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=3000.0,  price_max=12000.0, major_pivot_mult=1.0,
+                                     price_min=3000.0,  price_max=12000.0, major_pivot_mult=0.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
     "DE30_EUR":   InstrumentProfile("DE30_EUR",   "INDEX", 0.1,    2.2,  1.2,  0.35, 2.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
-                                     price_min=10000.0, price_max=30000.0, major_pivot_mult=1.0,
+                                     price_min=10000.0, price_max=30000.0, major_pivot_mult=0.5,
                                      max_high_low_ratio=2.5, max_cluster_width_pct=1.5),
 }
 
@@ -401,7 +401,7 @@ def get_profile(symbol: str) -> InstrumentProfile:
             min_touches_h4=1,
             min_touches_daily=1,
             min_touches_weekly=1,
-            major_pivot_mult=1.0,
+            major_pivot_mult=0.5,
         )
     if base in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF", "USD"):
         return InstrumentProfile(
@@ -1072,14 +1072,11 @@ def _clusters_to_zones(
         touches = len(unique_touch_indices)
         max_prominence = float(np.nanmax(prominences)) if len(prominences) else 0.0
         avg_prominence = float(np.average(prominences, weights=weights)) if weights.sum() > 0 else max_prominence
-        # CORRECTION CRITIQUE: 1 touch = pivot majeur OBLIGATOIRE
+        # is_major: information pour scoring, pas garde-fou absolu
         is_major = (
             touches == 1
             and max_prominence >= major_threshold
         )
-        # Garde-fou: si le profil autorise 1 touch, ce touch DOIT etre majeur
-        if touches == 1 and min_touches_required <= 1 and not is_major:
-            continue
         # Garde-fou standard: moins de touches que requis, sauf pivot majeur
         if touches < min_touches_required and not is_major:
             continue
@@ -1202,18 +1199,16 @@ def find_strong_sr_zones(
             zone_type="Support",
         )
 
-    # Phase 2: MODE TREND-STRUCTURE — si aucune zone swing valide sur INDEX/METAL/JPY
-    use_trend_mode = (
-        not resistance_zones
-        and not support_zones
-        and profile.asset_class in ("INDEX", "METAL", "FOREX")
-    )
-
-    if use_trend_mode:
-        _LOG.info("Trend-structure mode for %s %s (swing zones empty, %d pivots found)", 
-                 symbol, timeframe, len(pivots))
-        resistance_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Resistance")
-        support_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Support")
+    # Phase 2: MODE TREND-STRUCTURE — complement pour INDEX/METAL (union, pas fallback)
+    if profile.asset_class in ("INDEX", "METAL"):
+        tr_res = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Resistance")
+        tr_sup = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Support")
+        if tr_res:
+            resistance_zones.extend(tr_res)
+            _LOG.info("Trend-structure union: %s %s added %d resistance zones", symbol, timeframe, len(tr_res))
+        if tr_sup:
+            support_zones.extend(tr_sup)
+            _LOG.info("Trend-structure union: %s %s added %d support zones", symbol, timeframe, len(tr_sup))
 
     if not resistance_zones and not support_zones:
         return pd.DataFrame(), pd.DataFrame()
