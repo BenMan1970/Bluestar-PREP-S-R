@@ -48,7 +48,7 @@ from scipy.signal import find_peaks
 # ==============================================================================
 # [ LAYER 0: CONFIG & LOGGING ]
 # ==============================================================================
-SCANNER_VERSION: Final[str] = "8.6.3-PROD"
+SCANNER_VERSION: Final[str] = "8.6.4-PROD"
 
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
@@ -107,8 +107,13 @@ class _SensitiveDataFilter(logging.Filter):
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logging.getLogger().addFilter(_SensitiveDataFilter())
+_sensitive_filter = _SensitiveDataFilter()
+root_logger = logging.getLogger()
+root_logger.addFilter(_sensitive_filter)
+for handler in root_logger.handlers:
+    handler.addFilter(_sensitive_filter)
 _LOG = logging.getLogger("bluestar")
+_LOG.addFilter(_sensitive_filter)
 
 
 class OandaAuthError(Exception):
@@ -344,7 +349,15 @@ class InstrumentProfile:
 _PROFILES: Final[Dict[str, InstrumentProfile]] = {
     "EUR_USD":    InstrumentProfile("EUR_USD",    "FOREX", 0.0001, 1.2,  0.8,  0.6,  1.5, False),
     "GBP_USD":    InstrumentProfile("GBP_USD",    "FOREX", 0.0001, 1.3,  0.85, 0.65, 1.5, False),
-    "USD_JPY":    InstrumentProfile("USD_JPY",    "FOREX", 0.01,   0.9,  0.5,  0.5,  1.5, False),
+    "USD_JPY":    InstrumentProfile(
+        "USD_JPY", "FOREX", 0.01, 0.9, 0.5, 0.2, 1.5, False,
+        ignore_wick_filter=True,
+        min_touches_h4=1,
+        min_touches_daily=1,
+        min_touches_weekly=1,
+        major_pivot_mult=1.0,
+        max_high_low_ratio=1.8,
+    ),
     "XAU_USD":    InstrumentProfile("XAU_USD",    "METAL", 0.01,   2.5,  1.5,  0.5,  3.0, True,
                                      ignore_wick_filter=True, min_touches_h4=1, min_touches_daily=2, min_touches_weekly=2,
                                      price_min=1500.0, price_max=6000.0, major_pivot_mult=1.0,
@@ -405,9 +418,9 @@ def _min_touches_for_tf(profile: InstrumentProfile, tf: str, ui_override: int) -
         "daily": profile.min_touches_daily,
         "weekly": profile.min_touches_weekly,
     }.get(tf_lower, 2)
-    # Pour INDEX/METAL : le profil a ete calibre intentionnellement (min_touches_h4=1).
-    # Le garde-fou anti-bruit est is_major dans _clusters_to_zones, pas ici.
-    if profile.asset_class in ("INDEX", "METAL"):
+    is_jpy_cross = profile.symbol.upper().endswith("_JPY")
+    # Profils calibres explicitement : ne pas ecraser par l'UI Forex.
+    if profile.asset_class in ("INDEX", "METAL") or is_jpy_cross:
         return profile_min
     return max(profile_min, ui_override)
 
@@ -655,10 +668,11 @@ def _detect_trend_structure_zones(
     atr_val: float,
     zone_type: str,
 ) -> List[dict]:
-    """Detection alternative par deviation std pour marches en tendance parabolique.
+    """Detection alternative par regression log-prix pour marches en tendance parabolique.
 
-    Utilise les deviations 1-sigma et 2-sigma du prix sur les 100 dernieres bougies
-    comme proxies de supports/resistances structurels.
+    Utilise les quantiles de residus de regression log-prix comme proxies
+    de supports/resistances structurels. Plus robuste que moyenne+sigma
+    pour les series non-stationnaires.
     """
     if df is None or len(df) < 30 or atr_val is None or atr_val <= 0:
         return []
@@ -666,63 +680,65 @@ def _detect_trend_structure_zones(
         n = min(len(df), 100)
         recent = df.tail(n)
 
-        if zone_type == "Support":
-            prices = recent["low"].values.astype(float)
-        else:
-            prices = recent["high"].values.astype(float)
+        close = recent["close"].to_numpy(dtype=float)
+        highs = recent["high"].to_numpy(dtype=float)
+        lows = recent["low"].to_numpy(dtype=float)
 
-        if not np.all(np.isfinite(prices)) or len(prices) < 10:
+        if not np.all(np.isfinite(close)) or np.any(close <= 0):
             return []
 
-        mean_p = float(np.mean(prices))
-        std_p = float(np.std(prices, ddof=1))
+        x = np.arange(n, dtype=float)
+        y = np.log(close)
 
-        if std_p <= 0 or mean_p <= 0:
-            return []
+        slope, intercept = np.polyfit(x, y, 1)
+        fitted = slope * x + intercept
+        last_fit = fitted[-1]
 
-        # Niveaux: mean +/- 1.5 sigma et mean +/- 2.5 sigma
-        # Pour Support: on veut les niveaux sous le prix
-        # Pour Resistance: on veut les niveaux au-dessus
-        zones = []
+        zones: List[dict] = []
 
         if zone_type == "Support":
-            candidates = [
-                (mean_p - 1.5 * std_p, 1.5),
-                (mean_p - 2.5 * std_p, 2.5),
-            ]
-            for lvl, mult in candidates:
-                max_dist_pct = 15.0 if profile.asset_class == "INDEX" else 8.0
-                if lvl > 0 and lvl < current_price and (current_price - lvl) / current_price * 100 <= max_dist_pct:
-                    zones.append({
-                        "level": round(lvl, 5),
-                        "strength": int(mult * 10),
-                        "age_bars": 0,
-                        "status": "Vierge",
-                        "zone_type": "Support",
-                        "prominence": round(std_p * mult, 8),
-                        "prominence_atr": round(std_p * mult / atr_val, 3) if atr_val else None,
-                        "is_major": False,
-                    })
+            resid = np.log(lows) - fitted
+            quantiles = [(0.20, 1.5), (0.08, 2.5)]
         else:
-            candidates = [
-                (mean_p + 1.5 * std_p, 1.5),
-                (mean_p + 2.5 * std_p, 2.5),
-            ]
-            for lvl, mult in candidates:
-                max_dist_pct = 15.0 if profile.asset_class == "INDEX" else 8.0
-                if lvl > current_price and (lvl - current_price) / current_price * 100 <= max_dist_pct:
-                    zones.append({
-                        "level": round(lvl, 5),
-                        "strength": int(mult * 10),
-                        "age_bars": 0,
-                        "status": "Vierge",
-                        "zone_type": "Resistance",
-                        "prominence": round(std_p * mult, 8),
-                        "prominence_atr": round(std_p * mult / atr_val, 3) if atr_val else None,
-                        "is_major": False,
-                    })
+            resid = np.log(highs) - fitted
+            quantiles = [(0.80, 1.5), (0.92, 2.5)]
+
+        if not np.all(np.isfinite(resid)):
+            return []
+
+        max_dist_pct = 15.0 if profile.asset_class == "INDEX" else 8.0
+
+        for q, mult in quantiles:
+            lvl = float(np.exp(last_fit + np.quantile(resid, q)))
+
+            if lvl <= 0 or not np.isfinite(lvl):
+                continue
+
+            if zone_type == "Support":
+                if not (lvl < current_price):
+                    continue
+                dist_pct = (current_price - lvl) / current_price * 100
+            else:
+                if not (lvl > current_price):
+                    continue
+                dist_pct = (lvl - current_price) / current_price * 100
+
+            if dist_pct > max_dist_pct:
+                continue
+
+            zones.append({
+                "level": round(lvl, 5),
+                "strength": int(mult * 10),
+                "age_bars": 0,
+                "status": "Vierge",
+                "zone_type": zone_type,
+                "prominence": round(abs(current_price - lvl), 8),
+                "prominence_atr": round(abs(current_price - lvl) / atr_val, 3),
+                "is_major": False,
+            })
 
         return zones
+
     except Exception:
         return []
 
@@ -885,39 +901,56 @@ def _get_pivots_with_fallback_meta(
         return pivots
     try:
         n_total = len(df)
+        n = _pivot_lookback_for_tf(timeframe)
         dist = _PIVOT_FALLBACK_DIST.get(timeframe.lower(), 5)
         # Utiliser le seuil reduit si on en est au stade fallback
         eff_profile = replace(profile, pivot_prominence_atr=profile.pivot_prominence_atr * 0.5)
         prominence_min = _pivot_prominence_threshold(df, eff_profile, atr_val)
-        peak_kwargs = {"distance": dist, "prominence": prominence_min}
+        wlen = min(2 * n + 1, n_total if n_total % 2 == 1 else n_total - 1)
+        wlen = max(3, wlen)
+        peak_kwargs = {"distance": max(1, dist), "prominence": prominence_min, "wlen": wlen}
 
-        high_idx, high_props = find_peaks(df["high"].to_numpy(dtype=float), **peak_kwargs)
-        low_idx, low_props = find_peaks(-df["low"].to_numpy(dtype=float), **peak_kwargs)
+        high_arr = df["high"].to_numpy(dtype=float)
+        low_arr = df["low"].to_numpy(dtype=float)
 
-        safe_cutoff = n_total - 3
+        high_idx, high_props = find_peaks(high_arr, **peak_kwargs)
+        low_idx, low_props = find_peaks(-low_arr, **peak_kwargs)
+
+        safe_cutoff = n_total - n
         extra: List[PivotPoint] = []
         for k, idx in enumerate(high_idx):
             if idx >= safe_cutoff:
                 continue
+            # Validation: extremum strict sur n barres gauche/droite
+            if idx < n or idx + n >= len(high_arr):
+                continue
+            if not (high_arr[idx] > np.nanmax(high_arr[idx - n:idx]) and 
+                    high_arr[idx] > np.nanmax(high_arr[idx + 1:idx + n + 1])):
+                continue
             extra.append(
                 PivotPoint(
-                    price=float(df["high"].iloc[idx]),
+                    price=float(high_arr[idx]),
                     weight=_time_decay_weight(int(idx), n_total),
                     index=int(idx),
                     kind="high",
-                    prominence=float(high_props.get("prominences", [prominence_min])[k]),
+                    prominence=float(high_props["prominences"][k]),
                 )
             )
         for k, idx in enumerate(low_idx):
             if idx >= safe_cutoff:
                 continue
+            if idx < n or idx + n >= len(low_arr):
+                continue
+            if not (low_arr[idx] < np.nanmin(low_arr[idx - n:idx]) and 
+                    low_arr[idx] < np.nanmin(low_arr[idx + 1:idx + n + 1])):
+                continue
             extra.append(
                 PivotPoint(
-                    price=float(df["low"].iloc[idx]),
+                    price=float(low_arr[idx]),
                     weight=_time_decay_weight(int(idx), n_total),
                     index=int(idx),
                     kind="low",
-                    prominence=float(low_props.get("prominences", [prominence_min])[k]),
+                    prominence=float(low_props["prominences"][k]),
                 )
             )
 
@@ -1039,11 +1072,15 @@ def _clusters_to_zones(
         touches = len(unique_touch_indices)
         max_prominence = float(np.nanmax(prominences)) if len(prominences) else 0.0
         avg_prominence = float(np.average(prominences, weights=weights)) if weights.sum() > 0 else max_prominence
+        # CORRECTION CRITIQUE: 1 touch = pivot majeur OBLIGATOIRE
         is_major = (
-            profile.asset_class in ("INDEX", "METAL")
-            and touches == 1
+            touches == 1
             and max_prominence >= major_threshold
         )
+        # Garde-fou: si le profil autorise 1 touch, ce touch DOIT etre majeur
+        if touches == 1 and min_touches_required <= 1 and not is_major:
+            continue
+        # Garde-fou standard: moins de touches que requis, sauf pivot majeur
         if touches < min_touches_required and not is_major:
             continue
         lvl = float(np.average(prices, weights=weights))
@@ -1257,7 +1294,11 @@ def _flatten_zones_to_dataframe(zones_dict: dict) -> pd.DataFrame:
             if tmp.empty:
                 continue
             tmp = tmp.assign(tf=tf, type=tmp["near_price"].map({True: "Pivot", False: ztype}))
-            frames.append(tmp[["tf", "level", "strength", "age_bars", "status", "type", "near_price"]])
+            cols = ["tf", "level", "strength", "age_bars", "status", "type", "near_price"]
+            for c in ["prominence_atr", "is_major"]:
+                if c in tmp.columns:
+                    cols.append(c)
+            frames.append(tmp[[c for c in cols if c in tmp.columns]])
     return pd.concat(frames, ignore_index=True).sort_values("level").reset_index(drop=True) if frames else pd.DataFrame()
 
 
@@ -1986,4 +2027,3 @@ if "scan_results" in st.session_state:
     with col3:
         llm_b = create_llm_brief(res["summaries"], res["conf_full"], llm_max_dist, llm_min_score, tuple(llm_statuts))
         st.download_button("🤖 LLM Brief", data=llm_b, file_name="brief_llm.md")
-       
