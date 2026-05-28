@@ -1118,25 +1118,15 @@ def find_strong_sr_zones(
     n_total = len(df)
     pivots = _get_pivots_with_fallback_meta(df, profile, atr_val, timeframe)
 
-    # MODE TREND-STRUCTURE: si aucun swing pivot valide sur INDEX/METAL/JPY tendanciel
-    use_trend_mode = (
-        not pivots
-        and profile.asset_class in ("INDEX", "METAL")
-    )
+    # Phase 1: Essayer le clustering swing classique
+    raw_bandwidth = max(atr_val * profile.cluster_radius_atr, current_price * 0.0015)
+    max_bandwidth = current_price * (profile.max_cluster_width_pct / 100.0)
+    bandwidth = float(min(raw_bandwidth, max_bandwidth))
 
-    if use_trend_mode:
-        _LOG.info("Trend-structure mode activated for %s %s (no swing pivots found)", symbol, timeframe)
-        resistance_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Resistance")
-        support_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Support")
-    elif not pivots:
-        return pd.DataFrame(), pd.DataFrame()
-    else:
-        raw_bandwidth = max(atr_val * profile.cluster_radius_atr, current_price * 0.0015)
-        max_bandwidth = current_price * (profile.max_cluster_width_pct / 100.0)
-        bandwidth = float(min(raw_bandwidth, max_bandwidth))
-        if bandwidth <= 0 or not np.isfinite(bandwidth):
-            return pd.DataFrame(), pd.DataFrame()
+    resistance_zones: List[dict] = []
+    support_zones: List[dict] = []
 
+    if pivots and bandwidth > 0 and np.isfinite(bandwidth):
         highs = [p for p in pivots if p.kind == "high"]
         lows = [p for p in pivots if p.kind == "low"]
 
@@ -1161,6 +1151,22 @@ def find_strong_sr_zones(
             profile=profile,
             zone_type="Support",
         )
+
+    # Phase 2: MODE TREND-STRUCTURE — si aucune zone swing valide sur INDEX/METAL/JPY
+    use_trend_mode = (
+        not resistance_zones
+        and not support_zones
+        and profile.asset_class in ("INDEX", "METAL")
+    )
+
+    if use_trend_mode:
+        _LOG.info("Trend-structure mode for %s %s (swing zones empty, %d pivots found)", 
+                 symbol, timeframe, len(pivots))
+        resistance_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Resistance")
+        support_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Support")
+
+    if not resistance_zones and not support_zones:
+        return pd.DataFrame(), pd.DataFrame()
 
     merge_thresh_raw = atr_val * profile.merge_threshold_atr
     merge_thresh_cap = current_price * 0.0075
