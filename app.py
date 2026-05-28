@@ -1895,8 +1895,10 @@ def create_pdf_report(
         pdf.cell(0, 7, _safe_pdf_str("ALERTES ANOMALIES"),
                  border=0, align="L", new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 8)
+        _anomaly_w = pdf.w - pdf.l_margin - pdf.r_margin
         for sym, msg in anomalies.items():
-            pdf.multi_cell(0, 5, _safe_pdf_str(f"[!] {sym} : {msg}"))
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(_anomaly_w, 5, _safe_pdf_str(f"[!] {sym} : {msg}"))
         pdf.ln(4)
     if confluences_df is not None and not confluences_df.empty:
         pdf.chapter_title("ZONES DE CONFLUENCE")
