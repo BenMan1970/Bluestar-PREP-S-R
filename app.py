@@ -48,7 +48,7 @@ from scipy.signal import find_peaks
 # ==============================================================================
 # [ LAYER 0: CONFIG & LOGGING ]
 # ==============================================================================
-SCANNER_VERSION: Final[str] = "8.6.1-PROD"
+SCANNER_VERSION: Final[str] = "8.6.2-PROD"
 
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
@@ -385,6 +385,10 @@ def get_profile(symbol: str) -> InstrumentProfile:
             sym, "FOREX", 0.01, 0.9, 0.5, 0.2, 1.5, False,
             max_high_low_ratio=1.8,
             ignore_wick_filter=True,
+            min_touches_h4=1,
+            min_touches_daily=1,
+            min_touches_weekly=1,
+            major_pivot_mult=2.0,
         )
     if base in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF", "USD"):
         return InstrumentProfile(
@@ -401,8 +405,10 @@ def _min_touches_for_tf(profile: InstrumentProfile, tf: str, ui_override: int) -
         "daily": profile.min_touches_daily,
         "weekly": profile.min_touches_weekly,
     }.get(tf_lower, 2)
+    # Pour INDEX/METAL : le profil a ete calibre intentionnellement (min_touches_h4=1).
+    # Le garde-fou anti-bruit est is_major dans _clusters_to_zones, pas ici.
     if profile.asset_class in ("INDEX", "METAL"):
-        return max(2, profile_min)
+        return profile_min
     return max(profile_min, ui_override)
 
 
@@ -685,7 +691,8 @@ def _detect_trend_structure_zones(
                 (mean_p - 2.5 * std_p, 2.5),
             ]
             for lvl, mult in candidates:
-                if lvl > 0 and lvl < current_price and (current_price - lvl) / current_price * 100 <= 5.0:
+                max_dist_pct = 15.0 if profile.asset_class == "INDEX" else 8.0
+                if lvl > 0 and lvl < current_price and (current_price - lvl) / current_price * 100 <= max_dist_pct:
                     zones.append({
                         "level": round(lvl, 5),
                         "strength": int(mult * 10),
@@ -702,7 +709,8 @@ def _detect_trend_structure_zones(
                 (mean_p + 2.5 * std_p, 2.5),
             ]
             for lvl, mult in candidates:
-                if lvl > current_price and (lvl - current_price) / current_price * 100 <= 5.0:
+                max_dist_pct = 15.0 if profile.asset_class == "INDEX" else 8.0
+                if lvl > current_price and (lvl - current_price) / current_price * 100 <= max_dist_pct:
                     zones.append({
                         "level": round(lvl, 5),
                         "strength": int(mult * 10),
@@ -863,19 +871,24 @@ def _get_pivots_with_fallback_meta(
     pivots = detect_swing_pivots_meta(df, profile, atr_val, timeframe)
     if len(pivots) >= 3:
         return pivots
-    # Fallback calibration: si zero pivot sur INDEX/METAL/JPY, essayer avec 50% du seuil
-    if not pivots and profile.asset_class in ("INDEX", "METAL", "FOREX"):
-        # Creer un profil temporaire avec prominence reduite
+
+    # Soft-fallback: si < 3 pivots, essayer avec 50% du seuil de prominence
+    if len(pivots) < 3 and profile.asset_class in ("INDEX", "METAL", "FOREX"):
         fallback_profile = replace(profile, pivot_prominence_atr=profile.pivot_prominence_atr * 0.5)
-        pivots = detect_swing_pivots_meta(df, fallback_profile, atr_val, timeframe)
-        if pivots:
-            _LOG.info("Fallback pivot recovery: %s %s -> %d pivots (prominence %.2f -> %.2f)", 
-                     profile.symbol, timeframe, len(pivots), 
-                     profile.pivot_prominence_atr, fallback_profile.pivot_prominence_atr)
+        fp = detect_swing_pivots_meta(df, fallback_profile, atr_val, timeframe)
+        if len(fp) > len(pivots):
+            pivots = fp
+            _LOG.info("Soft-fallback pivot recovery: %s %s -> %d pivots", 
+                     profile.symbol, timeframe, len(pivots))
+
+    if len(pivots) >= 3:
+        return pivots
     try:
         n_total = len(df)
         dist = _PIVOT_FALLBACK_DIST.get(timeframe.lower(), 5)
-        prominence_min = _pivot_prominence_threshold(df, profile, atr_val)
+        # Utiliser le seuil reduit si on en est au stade fallback
+        eff_profile = replace(profile, pivot_prominence_atr=profile.pivot_prominence_atr * 0.5)
+        prominence_min = _pivot_prominence_threshold(df, eff_profile, atr_val)
         peak_kwargs = {"distance": dist, "prominence": prominence_min}
 
         high_idx, high_props = find_peaks(df["high"].to_numpy(dtype=float), **peak_kwargs)
@@ -1156,7 +1169,7 @@ def find_strong_sr_zones(
     use_trend_mode = (
         not resistance_zones
         and not support_zones
-        and profile.asset_class in ("INDEX", "METAL")
+        and profile.asset_class in ("INDEX", "METAL", "FOREX")
     )
 
     if use_trend_mode:
@@ -1947,3 +1960,4 @@ if "scan_results" in st.session_state:
     with col3:
         llm_b = create_llm_brief(res["summaries"], res["conf_full"], llm_max_dist, llm_min_score, tuple(llm_statuts))
         st.download_button("🤖 LLM Brief", data=llm_b, file_name="brief_llm.md")
+    
