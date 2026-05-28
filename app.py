@@ -642,6 +642,83 @@ def compute_institutional_trend(closes: pd.Series, lookback: int = 20, threshold
         return "NEUTRE"
 
 
+def _detect_trend_structure_zones(
+    df: pd.DataFrame,
+    current_price: float,
+    profile: InstrumentProfile,
+    atr_val: float,
+    zone_type: str,
+) -> List[dict]:
+    """Detection alternative par deviation std pour marches en tendance parabolique.
+
+    Utilise les deviations 1-sigma et 2-sigma du prix sur les 100 dernieres bougies
+    comme proxies de supports/resistances structurels.
+    """
+    if df is None or len(df) < 30 or atr_val is None or atr_val <= 0:
+        return []
+    try:
+        n = min(len(df), 100)
+        recent = df.tail(n)
+
+        if zone_type == "Support":
+            prices = recent["low"].values.astype(float)
+        else:
+            prices = recent["high"].values.astype(float)
+
+        if not np.all(np.isfinite(prices)) or len(prices) < 10:
+            return []
+
+        mean_p = float(np.mean(prices))
+        std_p = float(np.std(prices, ddof=1))
+
+        if std_p <= 0 or mean_p <= 0:
+            return []
+
+        # Niveaux: mean +/- 1.5 sigma et mean +/- 2.5 sigma
+        # Pour Support: on veut les niveaux sous le prix
+        # Pour Resistance: on veut les niveaux au-dessus
+        zones = []
+
+        if zone_type == "Support":
+            candidates = [
+                (mean_p - 1.5 * std_p, 1.5),
+                (mean_p - 2.5 * std_p, 2.5),
+            ]
+            for lvl, mult in candidates:
+                if lvl > 0 and lvl < current_price and (current_price - lvl) / current_price * 100 <= 5.0:
+                    zones.append({
+                        "level": round(lvl, 5),
+                        "strength": int(mult * 10),
+                        "age_bars": 0,
+                        "status": "Vierge",
+                        "zone_type": "Support",
+                        "prominence": round(std_p * mult, 8),
+                        "prominence_atr": round(std_p * mult / atr_val, 3) if atr_val else None,
+                        "is_major": False,
+                    })
+        else:
+            candidates = [
+                (mean_p + 1.5 * std_p, 1.5),
+                (mean_p + 2.5 * std_p, 2.5),
+            ]
+            for lvl, mult in candidates:
+                if lvl > current_price and (lvl - current_price) / current_price * 100 <= 5.0:
+                    zones.append({
+                        "level": round(lvl, 5),
+                        "strength": int(mult * 10),
+                        "age_bars": 0,
+                        "status": "Vierge",
+                        "zone_type": "Resistance",
+                        "prominence": round(std_p * mult, 8),
+                        "prominence_atr": round(std_p * mult / atr_val, 3) if atr_val else None,
+                        "is_major": False,
+                    })
+
+        return zones
+    except Exception:
+        return []
+
+
 @dataclass(frozen=True)
 class PivotPoint:
     price: float
@@ -1040,39 +1117,50 @@ def find_strong_sr_zones(
     profile = get_profile(symbol)
     n_total = len(df)
     pivots = _get_pivots_with_fallback_meta(df, profile, atr_val, timeframe)
-    if not pivots:
-        return pd.DataFrame(), pd.DataFrame()
 
-    raw_bandwidth = max(atr_val * profile.cluster_radius_atr, current_price * 0.0015)
-    max_bandwidth = current_price * (profile.max_cluster_width_pct / 100.0)
-    bandwidth = float(min(raw_bandwidth, max_bandwidth))
-    if bandwidth <= 0 or not np.isfinite(bandwidth):
-        return pd.DataFrame(), pd.DataFrame()
-
-    highs = [p for p in pivots if p.kind == "high"]
-    lows = [p for p in pivots if p.kind == "low"]
-
-    high_clusters = agglomerative_1d_clustering(highs, bandwidth)
-    low_clusters = agglomerative_1d_clustering(lows, bandwidth)
-
-    resistance_zones = _clusters_to_zones(
-        clusters_raw=high_clusters,
-        min_touches_required=min_touches_required,
-        n_total=n_total,
-        df=df,
-        atr_val=atr_val,
-        profile=profile,
-        zone_type="Resistance",
+    # MODE TREND-STRUCTURE: si aucun swing pivot valide sur INDEX/METAL/JPY tendanciel
+    use_trend_mode = (
+        not pivots
+        and profile.asset_class in ("INDEX", "METAL")
     )
-    support_zones = _clusters_to_zones(
-        clusters_raw=low_clusters,
-        min_touches_required=min_touches_required,
-        n_total=n_total,
-        df=df,
-        atr_val=atr_val,
-        profile=profile,
-        zone_type="Support",
-    )
+
+    if use_trend_mode:
+        _LOG.info("Trend-structure mode activated for %s %s (no swing pivots found)", symbol, timeframe)
+        resistance_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Resistance")
+        support_zones = _detect_trend_structure_zones(df, current_price, profile, atr_val, "Support")
+    elif not pivots:
+        return pd.DataFrame(), pd.DataFrame()
+    else:
+        raw_bandwidth = max(atr_val * profile.cluster_radius_atr, current_price * 0.0015)
+        max_bandwidth = current_price * (profile.max_cluster_width_pct / 100.0)
+        bandwidth = float(min(raw_bandwidth, max_bandwidth))
+        if bandwidth <= 0 or not np.isfinite(bandwidth):
+            return pd.DataFrame(), pd.DataFrame()
+
+        highs = [p for p in pivots if p.kind == "high"]
+        lows = [p for p in pivots if p.kind == "low"]
+
+        high_clusters = agglomerative_1d_clustering(highs, bandwidth)
+        low_clusters = agglomerative_1d_clustering(lows, bandwidth)
+
+        resistance_zones = _clusters_to_zones(
+            clusters_raw=high_clusters,
+            min_touches_required=min_touches_required,
+            n_total=n_total,
+            df=df,
+            atr_val=atr_val,
+            profile=profile,
+            zone_type="Resistance",
+        )
+        support_zones = _clusters_to_zones(
+            clusters_raw=low_clusters,
+            min_touches_required=min_touches_required,
+            n_total=n_total,
+            df=df,
+            atr_val=atr_val,
+            profile=profile,
+            zone_type="Support",
+        )
 
     merge_thresh_raw = atr_val * profile.merge_threshold_atr
     merge_thresh_cap = current_price * 0.0075
