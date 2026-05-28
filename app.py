@@ -48,7 +48,7 @@ from scipy.signal import find_peaks
 # ==============================================================================
 # [ LAYER 0: CONFIG & LOGGING ]
 # ==============================================================================
-SCANNER_VERSION: Final[str] = "8.6.5-PROD"
+SCANNER_VERSION: Final[str] = "8.6.6-PROD"
 
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
@@ -1306,7 +1306,11 @@ def _score_and_classify_group(group: pd.DataFrame, current_price: float, bars_ma
     totals = group["tf"].map(lambda t: bars_map.get(t, 500)).values.astype(float)
     age_r = np.clip(group["age_bars"].values / np.maximum(totals, 1), 0, 1)
     lams = group["tf"].map(_TF_LAMBDA).fillna(1.5).values
-    score = round(float((group["strength"].values * tf_w * sub_nb_tf * np.exp(-lams * age_r)).sum()), 1)
+    # Bonus pour zones majeures/trend
+    major_bonus = 1.0
+    if "is_major" in group.columns:
+        major_bonus = 1.0 + 0.3 * group["is_major"].sum()
+    score = round(float((group["strength"].values * tf_w * sub_nb_tf * np.exp(-lams * age_r)).sum() * major_bonus), 1)
     status = max(group["status"].tolist(), key=lambda s: _STATUS_PRIORITY.get(s, 1))
     is_near_price = sub_dist <= 0.50
     if is_near_price:
@@ -1377,7 +1381,12 @@ def detect_confluences(symbol: str, zones_dict: dict, current_price: float, bars
     confluences = []
     for indices in comp_map.values():
         group_full = z_df.iloc[indices]
-        if group_full["tf"].nunique() < 2:
+        nb_tf = group_full["tf"].nunique()
+        # INDEX/METAL: accepter 1 TF si zone trend (is_major ou is_trend)
+        has_trend_zone = False
+        if "is_major" in group_full.columns:
+            has_trend_zone = group_full["is_major"].any()
+        if nb_tf < 2 and not has_trend_zone:
             continue
         sub_avg = group_full["level"].mean()
         group_full = group_full.assign(_dist=(group_full["level"] - sub_avg).abs())
@@ -1773,7 +1782,7 @@ def create_json_export(
     summary_list,
     confluences_df,
     max_dist=5.0,
-    min_score=30.0,
+    min_score=20.0,
     allowed_statuts=("Vierge", "Testee", "Role Reverse"),
 ):
     now_utc = datetime.now(timezone.utc)
