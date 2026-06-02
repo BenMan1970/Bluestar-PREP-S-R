@@ -60,6 +60,11 @@ from scipy.signal import find_peaks
 # ==============================================================================
 SCANNER_VERSION: Final[str] = "8.7.3-AUDIT100"
 
+# Instrumentation de diagnostic (classe A). Strictement inactive quand False :
+# aucun calcul, aucune clé ajoutée à scan_results. Mettre à True uniquement
+# pour le diagnostic du pipeline de détection. Aucun effet sur la logique métier.
+DEBUG_INSTRUMENTATION: Final[bool] = False
+
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
     re.compile(r"(Authorization['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}]+", re.IGNORECASE),
@@ -2941,7 +2946,111 @@ def _build_summaries(symbols_to_scan, agg):
     return summaries
 
 
-def _execute_scan(symbols_to_scan, access_token, account_id, min_touches, confluence_threshold):
+def build_class_a_metrics(
+    symbols_to_scan: List[str],
+    agg: Dict[str, Any],
+    conf_full: pd.DataFrame,
+    json_args: Tuple[float, float, tuple],
+    llm_args: Tuple[float, float, tuple],
+) -> Optional[Dict[str, Any]]:
+    """Agrège les sept métriques de classe A depuis des sorties déjà calculées.
+
+    Aucune détection : lit debug_map / conf_full et rejoue _filter_confluences
+    (fonction d'export). Retourne None si DEBUG_INSTRUMENTATION est False.
+    """
+    if not DEBUG_INSTRUMENTATION:
+        return None
+
+    debug_map = agg.get("debug_map", {}) or {}
+
+    # Rejeu des deux filtres d'export (paramètres effectifs de l'UI, pas les
+    # défauts des fonctions). Aujourd'hui identiques ; comptés séparément au cas
+    # où les paramètres divergeraient.
+    exported_json_df = _filter_confluences(conf_full, *json_args)
+    exported_llm_df = _filter_confluences(conf_full, *llm_args)
+
+    def _count_actif(frame: Optional[pd.DataFrame], sym_d: str) -> int:
+        if frame is None or frame.empty or "Actif" not in frame.columns:
+            return 0
+        return int((frame["Actif"] == sym_d).sum())
+
+    per_symbol: Dict[str, Any] = {}
+    total_pivots = 0
+    total_trend_zones = 0
+    total_zones = 0
+    total_after_confluence = 0
+    total_exported_json = 0
+    total_exported_llm = 0
+
+    for sym in symbols_to_scan:
+        sym_d = sym.replace("_", "/")
+        tf_debug = debug_map.get(sym_d, {}) or {}
+
+        sym_pivots = 0
+        sym_trend_zones = 0
+        sym_zones = 0
+        per_tf: Dict[str, Any] = {}
+        for tf_name, dbg in tf_debug.items():
+            if not isinstance(dbg, dict):
+                continue
+            n_piv = dbg.get("n_pivots") or 0
+            n_tz = dbg.get("n_trend_zones") or 0
+            n_z = dbg.get("n_zones") or 0
+            sym_pivots += int(n_piv)
+            sym_trend_zones += int(n_tz)
+            sym_zones += int(n_z)
+            per_tf[tf_name] = {
+                "n_pivots": int(n_piv),
+                "n_trend_zones": int(n_tz),
+                "n_zones": int(n_z),
+                "min_touches": dbg.get("min_touches"),
+                "atr": dbg.get("atr"),
+            }
+
+        sym_after_conf = _count_actif(conf_full, sym_d)
+        sym_json = _count_actif(exported_json_df, sym_d)
+        sym_llm = _count_actif(exported_llm_df, sym_d)
+
+        per_symbol[sym_d] = {
+            "n_pivots": sym_pivots,
+            "n_trend_zones": sym_trend_zones,
+            "n_zones": sym_zones,
+            "after_confluence": sym_after_conf,
+            "exported_json": sym_json,
+            "exported_llm": sym_llm,
+            "by_tf": per_tf,
+        }
+
+        total_pivots += sym_pivots
+        total_trend_zones += sym_trend_zones
+        total_zones += sym_zones
+        total_after_confluence += sym_after_conf
+        total_exported_json += sym_json
+        total_exported_llm += sym_llm
+
+    return {
+        "per_symbol": per_symbol,
+        "totals": {
+            "n_pivots": total_pivots,
+            "n_trend_zones": total_trend_zones,
+            "n_zones": total_zones,
+            "after_confluence": total_after_confluence,
+            "exported_json": total_exported_json,
+            "exported_llm": total_exported_llm,
+        },
+    }
+
+
+def _execute_scan(
+    symbols_to_scan,
+    access_token,
+    account_id,
+    min_touches,
+    confluence_threshold,
+    llm_max_dist,
+    llm_min_score,
+    llm_statuts,
+):
     """Exécute le scan complet et persiste les résultats dans la session."""
     progress_bar = st.progress(0, text="Initialisation...")
     raw_results = _run_async_isolated(
@@ -2950,6 +3059,16 @@ def _execute_scan(symbols_to_scan, access_token, account_id, min_touches, conflu
     agg = _accumulate_scan_results(raw_results, progress_bar)
     conf_df = _compute_all_confluences(symbols_to_scan, agg, confluence_threshold)
     summaries = _build_summaries(symbols_to_scan, agg)
+
+    # Instrumentation de classe A : non invasive, neutre quand le flag est False.
+    # Les arguments reflètent les paramètres effectivement passés à l'UI dans
+    # _render_downloads (json_args == llm_args aujourd'hui), pas les défauts des
+    # fonctions create_json_export / create_llm_brief.
+    json_args = (llm_max_dist, llm_min_score, tuple(llm_statuts))
+    llm_args = (llm_max_dist, llm_min_score, tuple(llm_statuts))
+    class_a_metrics = build_class_a_metrics(
+        symbols_to_scan, agg, conf_df, json_args, llm_args
+    )
 
     df_h4 = pd.DataFrame(agg["results_h4"])
     df_d = pd.DataFrame(agg["results_daily"])
@@ -2965,6 +3084,7 @@ def _execute_scan(symbols_to_scan, access_token, account_id, min_touches, conflu
         "scan_errors": agg["scan_errors"],
         "missing_tfs_map": agg["missing_tfs_map"],
         "debug_map": agg["debug_map"],
+        "class_a_metrics": class_a_metrics,
     }
 
 
@@ -2976,7 +3096,14 @@ if st.session_state.get("pending_scan", False):
     else:
         try:
             _execute_scan(
-                symbols_to_scan, access_token, account_id, min_touches, confluence_threshold
+                symbols_to_scan,
+                access_token,
+                account_id,
+                min_touches,
+                confluence_threshold,
+                llm_max_dist,
+                llm_min_score,
+                llm_statuts,
             )
             st.session_state.pop("scanning_lock_ts", None)
             st.success("Scan termine !")
@@ -3057,3 +3184,5 @@ if "scan_results" in st.session_state:
     _render_confluences(res, max_dist_filter)
     _render_tf_tables(res, max_dist_filter)
     _render_downloads(res, llm_max_dist, llm_min_score, llm_statuts)
+
+ 
