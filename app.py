@@ -787,9 +787,16 @@ class AsyncOandaClient:
                 return symbol, timeframe, None
 
     async def fetch_price(self, session, sem, symbol):
-        """Récupère le prix courant (mid) pour un symbole."""
+        """Récupère le prix courant (mid) pour un symbole.
+
+        Retourne un tuple (symbol, price, source) où source vaut :
+          - "live"          : prix bid/ask mid en temps réel (tradeable=True)
+          - "stale"         : marché fermé (tradeable=False dans OANDA pricing) ;
+                             le price retourné est quand même le dernier mid connu.
+          - None            : fetch échoué (price=None, source=None).
+        """
         if not self.env_url:
-            return symbol, None
+            return symbol, None, None
         url = f"{self.env_url}/v3/accounts/{self.account_id}/pricing"
         async with sem:
             data = await self._get_json_with_retry(
@@ -797,13 +804,20 @@ class AsyncOandaClient:
             )
             try:
                 if data and "prices" in data and data["prices"]:
-                    bid = float(data["prices"][0]["closeoutBid"])
-                    ask = float(data["prices"][0]["closeoutAsk"])
+                    price_obj = data["prices"][0]
+                    bid = float(price_obj["closeoutBid"])
+                    ask = float(price_obj["closeoutAsk"])
                     if np.isfinite(bid) and np.isfinite(ask) and bid > 0:
-                        return symbol, (bid + ask) / 2
+                        mid = (bid + ask) / 2
+                        # SR-1 FIX: OANDA retourne tradeable=False quand le marché
+                        # est fermé (ex: indices US hors session, weekend).
+                        # Dans ce cas le prix mid est stale (dernier prix connu).
+                        is_tradeable = bool(price_obj.get("tradeable", True))
+                        source = "live" if is_tradeable else "stale"
+                        return symbol, mid, source
             except (KeyError, ValueError, IndexError, TypeError):
                 pass
-        return symbol, None
+        return symbol, None, None
 
 
 def _run_async_isolated(coro_factory, timeout=300.0):
@@ -1900,18 +1914,39 @@ def _score_and_classify_group(
     score = _group_score(group, sub_nb_tf, bars_map)
     status = max(group["status"].tolist(), key=lambda s: _STATUS_PRIORITY.get(s, 1))
     ctype, sig = _classify_confluence_type(group, safe_cp, sub_dist)
+    # SR-2 FIX: Les champs originaux sont conservés intacts pour la compatibilité
+    # des dashboards existants. Les champs snake_case ajoutés en parallèle
+    # permettent au merger de lire les données sans parsing fragile basé sur
+    # les noms à espaces/majuscules inconsistantes.
+    #
+    # SR-3 FIX: pivot_bias est initialisé à null ici. Le merger (merge_app.py)
+    # est responsable de le calculer en croisant avec les biais GPS/D1 :
+    # "support" si D1 Bullish, "resistance" si D1 Bearish, "neutral" si Range/inconnu.
+    # Ce champ ne peut pas être rempli ici car le SR scanner n'a pas accès au GPS JSON.
+    force_totale = int(group["strength"].sum())
+    nb_tf = int(sub_nb_tf)
+    dist_pct = round(sub_dist, 3)
     return {
+        # --- Champs originaux (ne pas modifier : compatibilité dashboards) ---
         "Actif": symbol,
         "Signal": sig,
         "Niveau": round(sub_avg, 5),
         "Type": ctype,
         "Timeframes": " + ".join(sorted(group["tf"].unique())),
-        "Nb TF": int(sub_nb_tf),
-        "Force Totale": int(group["strength"].sum()),
+        "Nb TF": nb_tf,
+        "Force Totale": force_totale,
         "Score": round(score, 1),
         "Statut": status,
-        "Distance %": round(sub_dist, 3),
+        "Distance %": dist_pct,
         "Alerte": "🔥 ZONE CHAUDE" if sub_dist < 0.5 else ("⚠️ Proche" if sub_dist < 1.5 else ""),
+        # --- Champs normalisés snake_case (SR-2) : alias lisibles par le merger ---
+        "zone_type": ctype,
+        "zone_signal": sig,
+        "zone_strength": force_totale,
+        "zone_tf_count": nb_tf,
+        "zone_distance_pct": dist_pct,
+        # --- Biais directionnel Pivot (SR-3) : à calculer par le merger ---
+        "pivot_bias": None,
     }
 
 
@@ -2028,6 +2063,8 @@ class ScanResult:
     missing_tfs: List[str] = field(default_factory=list)
     price_is_fallback: bool = False
     debug_info: Dict[str, Any] = field(default_factory=dict)
+    # SR-1: source du prix courant ("live" | "candle_close" | "stale" | None)
+    current_price_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -2069,16 +2106,24 @@ def _make_row(z: dict, ztype: str, ctx: _RowContext) -> Dict[str, Any]:
 
 
 async def _fetch_live_prices(client, session, sem, symbols):
-    """Récupère les prix live pour tous les symboles."""
+    """Récupère les prix live pour tous les symboles.
+
+    Retourne deux dicts : prices {sym: float|None} et price_sources {sym: str|None}.
+    price_sources[sym] vaut "live", "stale", ou None (fetch échoué).
+    """
     tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
     res = await asyncio.gather(*tasks, return_exceptions=True)
-    out = {}
+    prices: Dict[str, Optional[float]] = {}
+    price_sources: Dict[str, Optional[str]] = {}
     for sym, item in zip(symbols, res):
         if isinstance(item, BaseException):
-            out[sym] = None
+            prices[sym] = None
+            price_sources[sym] = None
         else:
-            out[item[0]] = item[1]
-    return out
+            fetched_sym, price, source = item
+            prices[fetched_sym] = price
+            price_sources[fetched_sym] = source
+    return prices, price_sources
 
 
 async def _fetch_candles_cube(client, session, sem, symbols):
@@ -2257,20 +2302,30 @@ def _process_tf_frame(ctx: _TFProcessingContext):
         return None, None, "", debug
 
 
-def _resolve_working_price(cp_live, data_cube, symbol):
-    """Détermine le prix de travail (live ou fallback)."""
+def _resolve_working_price(cp_live, data_cube, symbol, cp_live_source: Optional[str] = None):
+    """Détermine le prix de travail (live ou fallback).
+
+    Retourne (price, is_fallback, current_price_source) où source vaut :
+      - "live"         : prix bid/ask mid OANDA en temps réel (tradeable=True)
+      - "stale"        : prix OANDA mais marché fermé (tradeable=False)
+      - "candle_close" : fallback sur le dernier close de bougie (live indispo)
+    """
     if cp_live and cp_live > 0 and np.isfinite(cp_live):
-        return cp_live, False
+        # SR-1 FIX: propager la source fournie par fetch_price ("live" ou "stale").
+        # Si cp_live_source est None (fetch_price ancien comportement ou test),
+        # on considère "live" par défaut.
+        source = cp_live_source if cp_live_source in ("live", "stale") else "live"
+        return cp_live, False, source
     for tf_k in ("daily", "h4", "weekly"):
         df = data_cube.get(symbol, {}).get(tf_k)
         if df is not None and not df.empty:
             try:
                 last_close = float(df["close"].iloc[-1])
                 if np.isfinite(last_close) and last_close > 0:
-                    return last_close, True
+                    return last_close, True, "candle_close"
             except (ValueError, KeyError, IndexError):
                 continue
-    return None, False
+    return None, False, None
 
 
 def _validate_price_bounds_post(current_price, profile):
@@ -2370,12 +2425,20 @@ def _last_daily_close(data_cube: dict, symbol: str) -> Optional[float]:
     return None
 
 
-def _process_symbol(symbol: str, cp_live: Optional[float], data_cube: dict, min_touches_ui: int):
+def _process_symbol(
+    symbol: str,
+    cp_live: Optional[float],
+    data_cube: dict,
+    min_touches_ui: int,
+    cp_live_source: Optional[str] = None,
+):
     """Traite un symbole complet."""
     try:
         profile = get_profile(symbol)
         sym_d = symbol.replace("_", "/")
-        current_price, price_is_fallback = _resolve_working_price(cp_live, data_cube, symbol)
+        current_price, price_is_fallback, cp_source = _resolve_working_price(
+            cp_live, data_cube, symbol, cp_live_source=cp_live_source
+        )
         if current_price is None:
             return ScanResult(symbol, {}, {}, None, {}, {}, scan_error="Aucune donnee disponible")
         bounds_err = _validate_price_bounds_post(current_price, profile)
@@ -2407,6 +2470,7 @@ def _process_symbol(symbol: str, cp_live: Optional[float], data_cube: dict, min_
             missing_tfs=missing_tfs,
             price_is_fallback=price_is_fallback,
             debug_info=debug,
+            current_price_source=cp_source,
         )
     except (ValueError, KeyError, TypeError) as e:
         _LOG.exception("Symbol processing error: %s", symbol)
@@ -2460,12 +2524,15 @@ async def run_institutional_scan(symbols, token, oanda_account_id, min_touches_u
         if not await client.initialize(session):
             raise OandaAuthError("Auth OANDA echouee")
         sem = asyncio.Semaphore(_OANDA_SEMAPHORE_LIMIT)
-        live_prices = await _fetch_live_prices(client, session, sem, symbols)
+        live_prices, price_sources = await _fetch_live_prices(client, session, sem, symbols)
         data_cube = await _fetch_candles_cube(client, session, sem, symbols)
 
     results: List[ScanResult] = []
     for sym in symbols:
-        res = _process_symbol(sym, live_prices.get(sym), data_cube, min_touches_ui)
+        res = _process_symbol(
+            sym, live_prices.get(sym), data_cube, min_touches_ui,
+            cp_live_source=price_sources.get(sym),
+        )
         results.append(res)
 
     coverage = _validate_symbol_coverage(symbols, results)
@@ -2716,20 +2783,48 @@ def create_json_export(
     }
     filtered_conf = _filter_confluences(confluences_df, max_dist, min_score, allowed_statuts)
 
+    assets_with_no_zones: List[str] = []
+
     for sym, summary in summary_map.items():
         if not filtered_conf.empty and "Actif" in filtered_conf.columns:
             zones = filtered_conf[filtered_conf["Actif"] == sym].to_dict("records")
         else:
             zones = []
+
+        # SR-4 FIX: statut du scan par asset pour permettre au superviseur de
+        # détecter les anomalies (ex: USD/JPY sans zones = seuils trop élevés
+        # ou lookback insuffisant). "scan_error" est réservé aux exceptions
+        # catchées dans _process_symbol ; ici on ne distingue que found/none_detected.
+        if zones:
+            zones_scan_status = "found"
+        else:
+            zones_scan_status = "none_detected"
+            assets_with_no_zones.append(sym)
+
         output["assets"].append(
             {
                 "symbol": sym,
                 "current_price": summary.get("current_price"),
+                # SR-1 FIX: source de traçabilité du prix courant
+                # "live" = bid/ask mid temps réel (tradeable=True)
+                # "stale" = marché fermé (tradeable=False), dernier prix OANDA
+                # "candle_close" = fallback dernier close bougie (live indispo)
+                "current_price_source": summary.get("current_price_source"),
+                # SR-4 FIX: statut du scan de zones pour cet asset
+                "zones_scan_status": zones_scan_status,
                 "zones": zones,
             }
         )
 
     output["assets"].sort(key=lambda x: x["symbol"])
+
+    # SR-4 FIX: diagnostic global — liste des assets sans zones détectées.
+    # Permet au superviseur de repérer rapidement les anomalies de détection
+    # sans parcourir tous les assets. Ne pas modifier les seuils sans analyse séparée.
+    output["diagnostics"] = {
+        "assets_with_no_zones": sorted(assets_with_no_zones),
+    }
+
     return json.dumps(output, indent=2, ensure_ascii=False).encode("utf-8")
 
 
@@ -2856,6 +2951,7 @@ def _accumulate_scan_results(raw_results, progress_bar):
     all_zones_map, prices_map, trends_map = {}, {}, {}
     anomalies_map, scan_errors, bars_map = {}, {}, {}
     missing_tfs_map, price_fallback_map, debug_map = {}, {}, {}
+    price_sources_map: Dict[str, Optional[str]] = {}
 
     total = len(raw_results)
     for idx, res in enumerate(raw_results):
@@ -2870,6 +2966,8 @@ def _accumulate_scan_results(raw_results, progress_bar):
         if res.missing_tfs:
             missing_tfs_map[res.symbol.replace("_", "/")] = res.missing_tfs
         price_fallback_map[res.symbol] = res.price_is_fallback
+        # SR-1: collecter la source du prix courant pour chaque symbole
+        price_sources_map[res.symbol] = res.current_price_source
         debug_map[res.symbol.replace("_", "/")] = res.debug_info
         for tf, rows in res.rows.items():
             if not rows:
@@ -2892,6 +2990,7 @@ def _accumulate_scan_results(raw_results, progress_bar):
         "bars_map": bars_map,
         "missing_tfs_map": missing_tfs_map,
         "debug_map": debug_map,
+        "price_sources_map": price_sources_map,
     }
 
 
@@ -2941,6 +3040,8 @@ def _build_summaries(symbols_to_scan, agg):
                 "trend_weekly": agg["trends_map"].get(sym, {}).get("Weekly", "NEUTRE"),
                 "price_context": ctx,
                 "current_price": cp,
+                # SR-1: source de traçabilité du prix courant pour le JSON downstream
+                "current_price_source": agg.get("price_sources_map", {}).get(sym),
             }
         )
     return summaries
@@ -3184,5 +3285,3 @@ if "scan_results" in st.session_state:
     _render_confluences(res, max_dist_filter)
     _render_tf_tables(res, max_dist_filter)
     _render_downloads(res, llm_max_dist, llm_min_score, llm_statuts)
-
- 
