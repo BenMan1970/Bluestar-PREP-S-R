@@ -1874,17 +1874,34 @@ def _flatten_zones_to_dataframe(zones_dict: dict) -> pd.DataFrame:
 
 
 def _group_score(group: pd.DataFrame, sub_nb_tf: int, bars_map: dict) -> float:
-    """Calcule le score pondéré d'un groupe de confluences."""
+    """Calcule le score pondéré d'un groupe de confluences.
+
+    PATCH SCORE-1 (sqrt nb_tf) : remplace sub_nb_tf par sqrt(sub_nb_tf) pour
+    supprimer l'effet quadratique O(nb_tf²). La somme contient déjà sub_nb_tf
+    termes (un par TF après groupby.idxmin) — multiplier chaque terme par
+    sub_nb_tf créait une croissance quadratique qui écrasait les setups forex
+    valides derrière XAU/indices. sqrt est monotone : "plus de TF = mieux"
+    est préservé, seul l'effet quadratique disparaît.
+
+    PATCH SCORE-2 (major_bonus borné) : min(is_major.sum(), 2) sature le bonus
+    à +60% max (au lieu de +90%/+120% non borné). Atténue sans réétalonner.
+
+    Recalibration seuils : XAU 920 → ~531, équivalent seuil ~57 post-patch
+    (vs 100 pré-patch). Mettre à jour llm_min_score en conséquence.
+    """
     tf_w = group["tf"].map(TF_WEIGHT).fillna(1.0).values
     totals = group["tf"].map(lambda t: bars_map.get(t, 500)).values.astype(float)
     age_r = np.clip(group["age_bars"].values / np.maximum(totals, 1), 0, 1)
     lams = group["tf"].map(_TF_LAMBDA).fillna(1.5).values
     major_bonus = 1.0
     if "is_major" in group.columns:
-        major_bonus = 1.0 + 0.3 * group["is_major"].sum()
+        # PATCH SCORE-2 : borne le bonus (saturation +60% max)
+        major_bonus = 1.0 + 0.3 * min(int(group["is_major"].sum()), 2)
+    # PATCH SCORE-1 : sqrt(nb_tf) au lieu de nb_tf — supprime O(nb_tf²)
+    mtf_factor = float(np.sqrt(max(sub_nb_tf, 1)))
     return round(
         float(
-            (group["strength"].values * tf_w * sub_nb_tf * np.exp(-lams * age_r)).sum()
+            (group["strength"].values * tf_w * mtf_factor * np.exp(-lams * age_r)).sum()
             * major_bonus
         ),
         1,
@@ -2458,6 +2475,10 @@ def _process_symbol(
         anomaly = flag_data_anomaly(symbol, current_price, sup_levels, last_candle_close=last_close)
         if price_is_fallback:
             anomaly = f"{anomaly} | Prix fallback" if anomaly else "Prix fallback"
+        # PATCH STALE: marché fermé (tradeable=False) — prix potentiellement décalé
+        # après gap d'ouverture. Signalé dans l'expander anomalies Streamlit UI.
+        if cp_source == "stale":
+            anomaly = f"{anomaly} | Prix STALE (marché fermé)" if anomaly else "Prix STALE (marché fermé)"
         return ScanResult(
             symbol,
             rows,
@@ -2832,7 +2853,7 @@ def create_llm_brief(
     summary_list,
     confluences_df,
     max_dist=2.0,
-    min_score=100.0,
+    min_score=57.0,  # PATCH SCORE-1 : recalibré depuis 100.0 (échelle sqrt(nb_tf))
     allowed_statuts=("Vierge", "Testee", "Role Reverse"),
 ):
     """Crée un résumé textuel pour LLM.
@@ -2911,7 +2932,7 @@ with st.sidebar:
 
     st.header("3. Parametres LLM")
     llm_max_dist = st.slider("Dist. max (%) brief LLM", 0.5, 5.0, 2.0, 0.5, key="llm_max_dist")
-    llm_min_score = st.slider("Score min JSON/LLM", 20, 300, 30, 10, key="llm_min_score")
+    llm_min_score = st.slider("Score min JSON/LLM", 10, 175, 20, 5, key="llm_min_score")
     llm_statuts = st.multiselect(
         "Statuts autorises",
         options=["Vierge", "Testee", "Role Reverse", "Consommee"],
