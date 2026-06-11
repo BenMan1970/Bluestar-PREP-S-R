@@ -468,7 +468,7 @@ _PROFILES: Final[Dict[str, InstrumentProfile]] = {
         min_touches_daily=2,
         min_touches_weekly=2,
         price_min=1500.0,
-        price_max=6000.0,
+        price_max=8000.0,  # mis à jour 2026 : XAU/USD > 4200, plafond relevé 6000→8000
         major_pivot_mult=0.5,
         max_high_low_ratio=2.5,
         max_cluster_width_pct=1.5,
@@ -506,7 +506,7 @@ _PROFILES: Final[Dict[str, InstrumentProfile]] = {
         min_touches_daily=2,
         min_touches_weekly=2,
         price_min=10000.0,
-        price_max=50000.0,
+        price_max=30000.0,  # mis à jour 2026 : NAS100 ~21000-29000, plafond 50000→30000 trop bas à terme, seuil réaliste
         major_pivot_mult=0.5,
         max_high_low_ratio=2.5,
         max_cluster_width_pct=1.5,
@@ -2733,19 +2733,8 @@ def _pdf_render_anomalies(pdf: "PDF", anomalies: dict) -> None:
         new_y=YPos.NEXT,
     )
     pdf.set_font("Helvetica", "", 8)
-    # Use explicit width (page width minus both margins) instead of 0 to avoid
-    # fpdf2 "Not enough horizontal space to render a single character" when the
-    # cursor X position has drifted past the right margin after a prior cell.
-    cell_w = pdf.epw  # effective page width (accounts for left + right margins)
     for sym, msg in anomalies.items():
-        pdf.set_x(pdf.l_margin)  # ensure we always start at the left margin
-        pdf.multi_cell(
-            cell_w,
-            5,
-            _safe_pdf_str(f"[!] {sym} : {msg}"),
-            new_x=XPos.LMARGIN,
-            new_y=YPos.NEXT,
-        )
+        pdf.multi_cell(0, 5, _safe_pdf_str(f"[!] {sym} : {msg}"))
     pdf.ln(4)
 
 
@@ -3253,9 +3242,23 @@ def _render_messages(res: dict, show_debug: bool) -> None:
             for s, e in res["scan_errors"].items():
                 st.error(f"{s}: {e}")
     if res["anomalies"]:
-        with st.expander("⚠️ Anomalies"):
-            for s, m in res["anomalies"].items():
-                st.warning(f"{s}: {m}")
+        # Séparer les anomalies pures "marché fermé" (info) des vraies anomalies (warning)
+        stale_only = {
+            s: m for s, m in res["anomalies"].items()
+            if m.strip() == "Prix STALE (marché fermé)"
+        }
+        real_anomalies = {
+            s: m for s, m in res["anomalies"].items()
+            if s not in stale_only
+        }
+        if stale_only:
+            with st.expander(f"🌙 Marchés fermés ({len(stale_only)})"):
+                for s, m in stale_only.items():
+                    st.info(f"{s}: {m}")
+        if real_anomalies:
+            with st.expander(f"⚠️ Anomalies ({len(real_anomalies)})"):
+                for s, m in real_anomalies.items():
+                    st.warning(f"{s}: {m}")
     if show_debug and res.get("debug_map"):
         with st.expander("🔍 Debug pipeline (n_pivots / n_zones / n_trend_zones par TF)"):
             for s, dbg in res["debug_map"].items():
@@ -3295,8 +3298,15 @@ def _render_downloads(res: dict, llm_max_dist, llm_min_score, llm_statuts) -> No
     st.divider()
     col1, col2, col3 = st.columns(3)
     with col1:
+        # Exclure les anomalies "marché fermé" seules du PDF : ce sont des infos
+        # d'état opérationnel (OANDA tradeable=False), pas des anomalies de données.
+        # Les vraies anomalies composites (ex: "Ecart aberrant | Prix STALE") sont conservées.
+        pdf_anomalies = {
+            s: m for s, m in (res["anomalies"] or {}).items()
+            if m.strip() != "Prix STALE (marché fermé)"
+        }
         pdf_b = create_pdf_report(
-            res["report_dict"], res["conf_full"], res["summaries"], res["anomalies"]
+            res["report_dict"], res["conf_full"], res["summaries"], pdf_anomalies or None
         )
         st.download_button("📄 PDF", data=pdf_b, file_name="rapport_bluestar.pdf")
     with col2:
