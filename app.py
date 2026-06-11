@@ -2733,8 +2733,19 @@ def _pdf_render_anomalies(pdf: "PDF", anomalies: dict) -> None:
         new_y=YPos.NEXT,
     )
     pdf.set_font("Helvetica", "", 8)
+    # Use explicit width (page width minus both margins) instead of 0 to avoid
+    # fpdf2 "Not enough horizontal space to render a single character" when the
+    # cursor X position has drifted past the right margin after a prior cell.
+    cell_w = pdf.epw  # effective page width (accounts for left + right margins)
     for sym, msg in anomalies.items():
-        pdf.multi_cell(0, 5, _safe_pdf_str(f"[!] {sym} : {msg}"))
+        pdf.set_x(pdf.l_margin)  # ensure we always start at the left margin
+        pdf.multi_cell(
+            cell_w,
+            5,
+            _safe_pdf_str(f"[!] {sym} : {msg}"),
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
     pdf.ln(4)
 
 
