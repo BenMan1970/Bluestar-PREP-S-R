@@ -2825,7 +2825,7 @@ def create_json_export(
         output["assets"].append(
             {
                 "symbol": sym,
-                "current_price": summary.get("current_price"),
+                "current_price": round(summary["current_price"], 5) if summary.get("current_price") is not None else None,
                 # SR-1 FIX: source de traçabilité du prix courant
                 # "live" = bid/ask mid temps réel (tradeable=True)
                 # "stale" = marché fermé (tradeable=False), dernier prix OANDA
@@ -2932,7 +2932,8 @@ with st.sidebar:
 
     st.header("3. Parametres LLM")
     llm_max_dist = st.slider("Dist. max (%) brief LLM", 0.5, 5.0, 2.0, 0.5, key="llm_max_dist")
-    llm_min_score = st.slider("Score min JSON/LLM", 10, 175, 20, 5, key="llm_min_score")
+    json_min_score = st.slider("Score min JSON (merger)", 10, 175, 20, 5, key="json_min_score")
+    llm_min_score = st.slider("Score min LLM Brief", 10, 175, 57, 5, key="llm_min_score")
     llm_statuts = st.multiselect(
         "Statuts autorises",
         options=["Vierge", "Testee", "Role Reverse", "Consommee"],
@@ -3170,6 +3171,7 @@ def _execute_scan(
     min_touches,
     confluence_threshold,
     llm_max_dist,
+    json_min_score,
     llm_min_score,
     llm_statuts,
 ):
@@ -3184,9 +3186,9 @@ def _execute_scan(
 
     # Instrumentation de classe A : non invasive, neutre quand le flag est False.
     # Les arguments reflètent les paramètres effectivement passés à l'UI dans
-    # _render_downloads (json_args == llm_args aujourd'hui), pas les défauts des
-    # fonctions create_json_export / create_llm_brief.
-    json_args = (llm_max_dist, llm_min_score, tuple(llm_statuts))
+    # _render_downloads (json_args et llm_args sont découplés depuis le split slider),
+    # pas les défauts des fonctions create_json_export / create_llm_brief.
+    json_args = (llm_max_dist, json_min_score, tuple(llm_statuts))
     llm_args = (llm_max_dist, llm_min_score, tuple(llm_statuts))
     class_a_metrics = build_class_a_metrics(
         symbols_to_scan, agg, conf_df, json_args, llm_args
@@ -3224,6 +3226,7 @@ if st.session_state.get("pending_scan", False):
                 min_touches,
                 confluence_threshold,
                 llm_max_dist,
+                json_min_score,
                 llm_min_score,
                 llm_statuts,
             )
@@ -3293,7 +3296,7 @@ def _render_tf_tables(res: dict, max_dist_filter: float) -> None:
             )
 
 
-def _render_downloads(res: dict, llm_max_dist, llm_min_score, llm_statuts) -> None:
+def _render_downloads(res: dict, llm_max_dist, json_min_score, llm_min_score, llm_statuts) -> None:
     """Affiche les boutons de téléchargement (PDF / JSON / LLM)."""
     st.divider()
     col1, col2, col3 = st.columns(3)
@@ -3311,7 +3314,7 @@ def _render_downloads(res: dict, llm_max_dist, llm_min_score, llm_statuts) -> No
         st.download_button("📄 PDF", data=pdf_b, file_name="rapport_bluestar.pdf")
     with col2:
         json_b = create_json_export(
-            res["summaries"], res["conf_full"], llm_max_dist, llm_min_score, tuple(llm_statuts)
+            res["summaries"], res["conf_full"], llm_max_dist, json_min_score, tuple(llm_statuts)
         )
         st.download_button("🔧 JSON", data=json_b, file_name="supports et resistances.json")
     with col3:
@@ -3326,4 +3329,4 @@ if "scan_results" in st.session_state:
     _render_messages(res, show_debug)
     _render_confluences(res, max_dist_filter)
     _render_tf_tables(res, max_dist_filter)
-    _render_downloads(res, llm_max_dist, llm_min_score, llm_statuts)
+    _render_downloads(res, llm_max_dist, json_min_score, llm_min_score, llm_statuts)
