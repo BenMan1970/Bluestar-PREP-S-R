@@ -1754,8 +1754,18 @@ def _build_zones_dataframe(
     merge_thresh_cap = current_price * 0.0075
     merge_thresh = float(min(merge_thresh_raw, merge_thresh_cap))
 
-    support_zones = _merge_adjacent_zones(support_zones, merge_thresh)
-    resistance_zones = _merge_adjacent_zones(resistance_zones, merge_thresh)
+    # PATCH 1 — Filtrage pré-fusion Consommee (méta-audit validé, risque LOW)
+    # Une zone Consommee (priorité 3 dans _STATUS_PRIORITY) absorbe silencieusement
+    # une zone valide adjacente dans _merge_two_zones, la faisant disparaître lors
+    # du filtre aval _flatten_one_tf. Les Consommee sont exclues avant fusion car
+    # _flatten_one_tf les élimine de toute façon ; elles ne doivent pas participer
+    # à la fusion.
+    support_zones = _merge_adjacent_zones(
+        [z for z in support_zones if z.get("status") != "Consommee"], merge_thresh
+    )
+    resistance_zones = _merge_adjacent_zones(
+        [z for z in resistance_zones if z.get("status") != "Consommee"], merge_thresh
+    )
 
     all_zones = support_zones + resistance_zones
     if not all_zones:
