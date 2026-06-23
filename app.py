@@ -1103,8 +1103,6 @@ def _pivot_lookback_for_tf(timeframe: str) -> int:
     tf_lower = timeframe.lower()
     if tf_lower == "weekly":
         return 5
-    if tf_lower == "daily":
-        return 3
     return 3
 
 
@@ -2355,13 +2353,50 @@ def _resolve_working_price(cp_live, data_cube, symbol, cp_live_source: Optional[
     return None, False, None
 
 
-def _validate_price_bounds_post(current_price, profile):
-    """Vérifie que le prix est dans les bornes autorisées."""
-    if profile.price_min is not None and current_price < profile.price_min:
-        return f"PRIX HORS BORNES ({current_price:.2f} < {profile.price_min:.0f})"
-    if profile.price_max is not None and current_price > profile.price_max:
-        return f"PRIX HORS BORNES ({current_price:.2f} > {profile.price_max:.0f})"
-    return None
+# PATCH 2 — Facteur de détection de prix corrompu (méta-audit validé, risque LOW)
+# Heuristique conservatrice, non calibrée empiriquement.
+# Un prix inférieur à price_min / FACTOR ou supérieur à price_max * FACTOR
+# est considéré comme un artefact de données (ex : feed erroné, valeur aberrante).
+# Facteur 10 choisi pour ne jamais déclencher sur un mouvement de marché réel,
+# même extrême (crash -50%, rally +200% sur indices). Toute révision nécessite
+# une validation empirique sur données historiques.
+_BOUNDS_CORRUPTION_FACTOR: Final[float] = 10.0
+
+
+def _validate_price_bounds_post(
+    current_price: float, profile: InstrumentProfile
+) -> Tuple[Optional[float], Optional[str]]:
+    """Vérifie que le prix est dans les bornes autorisées.
+
+    PATCH 2 — méta-audit validé, risque LOW :
+    Remplace l'interruption systématique par un warning + clipping sécurisé.
+    Si l'écart dépasse _BOUNDS_CORRUPTION_FACTOR × la borne, le prix est
+    considéré corrompu et le scan est interrompu (retour None, erreur).
+    Retourne (prix_corrigé_ou_None, erreur_ou_None).
+    Appelant unique : _process_symbol (vérifié par grep, un seul call-site).
+    """
+    low  = profile.price_min
+    high = profile.price_max
+
+    if low is not None and current_price < low:
+        if current_price < low / _BOUNDS_CORRUPTION_FACTOR:
+            return None, f"PRIX CORROMPU ({current_price:.2f} << {low:.0f})"
+        _LOG.warning(
+            "Prix hors borne basse pour %s : %.2f < %.0f — clipping appliqué",
+            profile.symbol, current_price, low,
+        )
+        return low, None
+
+    if high is not None and current_price > high:
+        if current_price > high * _BOUNDS_CORRUPTION_FACTOR:
+            return None, f"PRIX CORROMPU ({current_price:.2f} >> {high:.0f})"
+        _LOG.warning(
+            "Prix hors borne haute pour %s : %.2f > %.0f — clipping appliqué",
+            profile.symbol, current_price, high,
+        )
+        return high, None
+
+    return current_price, None
 
 
 def _collect_tf_data(
@@ -2468,7 +2503,7 @@ def _process_symbol(
         )
         if current_price is None:
             return ScanResult(symbol, {}, {}, None, {}, {}, scan_error="Aucune donnee disponible")
-        bounds_err = _validate_price_bounds_post(current_price, profile)
+        current_price, bounds_err = _validate_price_bounds_post(current_price, profile)
         if bounds_err:
             return ScanResult(symbol, {}, {}, None, {}, {}, scan_error=bounds_err)
         (
@@ -3031,6 +3066,9 @@ _SYMBOL_CONFLUENCE_THRESHOLD: Final[Dict[str, float]] = {
     "NAS100_USD": 1.5,
     "SPX500_USD": 1.2,
     "XAU_USD": 1.5,
+    # PATCH 3 — DE30_EUR absent de la map (méta-audit validé) ; valeur conservatrice
+    # alignée sur SPX500_USD (même asset_class INDEX, même pip_value 0.1).
+    "DE30_EUR": 1.3,
 }
 
 
