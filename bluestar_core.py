@@ -361,6 +361,34 @@ _AGE_REFERENCE_DEFAULT: Final[int] = 500
 _FETCH_LIMIT_BY_TF: Final[Dict[str, int]] = {"h4": 5000, "daily": 1500, "weekly": 1000}
 _FETCH_LIMIT_DEFAULT: Final[int] = 500
 
+# ------------------------------------------------------------------------------
+# PATCH PERF-2 — fenêtre de DÉTECTION découplée de la profondeur de FETCH.
+#
+# Le walk-forward de calibration (rapport §5.2) a été mené sur des fenêtres de
+# 500 bougies, et _AGE_REFERENCE_BARS vaut 500 : le régime de détection validé
+# empiriquement est celui d'une fenêtre courte. Détecter sur 5000 barres H4 est
+# donc un régime NON calibré : les pivots anciens entrent dans les clusters avec
+# un strength plein mais un poids de décroissance au plancher (exp(-2) ~ 0.135),
+# ce qui gonfle `Force Totale` et élargit les clusters de confluence.
+#
+# On conserve la profondeur de FETCH (couverture >= 3 ans, data_window honnête)
+# et on borne la profondeur de DÉTECTION. Daily/Weekly restent à leur profondeur
+# de fetch (coût négligeable, zéro changement de sortie) ; seul H4 est borné.
+# Mettre la valeur à None pour restaurer exactement le comportement v8.8.0.
+_DETECTION_WINDOW_BY_TF: Final[Dict[str, Optional[int]]] = {
+    "h4": 1500,      # ~1 an ; 3x la fenêtre calibrée, 3.3x moins de barres que 5000
+    "daily": None,   # = profondeur de fetch (1500)
+    "weekly": None,  # = profondeur de fetch (1000)
+}
+
+
+def _detection_frame(frame: pd.DataFrame, tf_key: str) -> pd.DataFrame:
+    """Restreint le DataFrame à la fenêtre de détection calibrée (PATCH PERF-2)."""
+    win = _DETECTION_WINDOW_BY_TF.get(str(tf_key).lower())
+    if win is None or frame is None or len(frame) <= win:
+        return frame
+    return frame.tail(win)
+
 # PATCH DEPTH-1 : plafond de `count` de l'API OANDA candles, MESURÉ (et non
 # supposé) — count=5000 -> 200, count=5001 -> HTTP 400 "Maximum value for
 # 'count' exceeded". Cf. tools/probe_oanda.py et reports/api_probe.txt.
@@ -883,23 +911,94 @@ class AsyncOandaClient:
 
     @staticmethod
     def _parse_candles_payload(data: dict, profile: InstrumentProfile, limit: int):
-        """Transforme une réponse OANDA en DataFrame OHLC nettoyé (ou None)."""
-        candles = [
-            {
-                "date": pd.to_datetime(c["time"], utc=True),
-                "open": float(c["mid"]["o"]),
-                "high": float(c["mid"]["h"]),
-                "low": float(c["mid"]["l"]),
-                "close": float(c["mid"]["c"]),
-                "volume": int(c.get("volume", 0)),
-            }
-            for c in data.get("candles", [])
-            if c.get("complete") and _is_valid_candle_dict(c, profile)
-        ]
-        if not candles:
+        """Transforme une réponse OANDA en DataFrame OHLC nettoyé (ou None).
+
+        PATCH PERF-1 — parsing VECTORISÉ.
+        AVANT : une list-comprehension appelait `pd.to_datetime()` scalaire et
+        `_is_valid_candle_dict()` (try/except) par bougie. Avec _FETCH_LIMIT_BY_TF
+        (5000 H4 / 1500 D / 1000 W) x 33 actifs = 247 500 appels scalaires, exécutés
+        DANS la coroutine -> l'event loop était bloqué et les 12 fetchs concurrents
+        se sérialisaient derrière le parsing.
+        APRÈS : une seule conversion datetime vectorisée + un masque booléen numpy.
+        La logique de validation est IDENTIQUE à _is_valid_candle_dict (mêmes
+        prédicats, même ordre, même max_high_low_ratio) -> parité de sortie.
+        """
+        raw = data.get("candles") or []
+        if not raw:
             return None
+
+        times: List[str] = []
+        o_raw: List[Any] = []
+        h_raw: List[Any] = []
+        l_raw: List[Any] = []
+        c_raw: List[Any] = []
+        v_raw: List[Any] = []
+
+        for c in raw:
+            if not c.get("complete"):
+                continue
+            mid = c.get("mid")
+            if not mid:
+                continue
+            t = c.get("time")
+            if t is None:
+                continue
+            try:
+                o_raw.append(mid["o"])
+                h_raw.append(mid["h"])
+                l_raw.append(mid["l"])
+                c_raw.append(mid["c"])
+            except KeyError:
+                continue
+            times.append(t)
+            v_raw.append(c.get("volume", 0))
+
+        if not times:
+            return None
+
+        try:
+            idx = pd.to_datetime(pd.Series(times), utc=True, format="ISO8601")
+        except (ValueError, TypeError):
+            # Repli si le format OANDA dévie de l'ISO8601 strict.
+            idx = pd.to_datetime(pd.Series(times), utc=True, errors="coerce")
+
+        frame = pd.DataFrame(
+            {
+                "date": idx,
+                "open": pd.to_numeric(pd.Series(o_raw), errors="coerce"),
+                "high": pd.to_numeric(pd.Series(h_raw), errors="coerce"),
+                "low": pd.to_numeric(pd.Series(l_raw), errors="coerce"),
+                "close": pd.to_numeric(pd.Series(c_raw), errors="coerce"),
+                "volume": pd.to_numeric(pd.Series(v_raw), errors="coerce").fillna(0),
+            }
+        )
+        frame = frame.dropna(subset=["date", "open", "high", "low", "close"])
+        if frame.empty:
+            return None
+
+        max_ratio = float(getattr(profile, "max_high_low_ratio", 1.8))
+        o = frame["open"].to_numpy(dtype=float)
+        h = frame["high"].to_numpy(dtype=float)
+        lo = frame["low"].to_numpy(dtype=float)
+        cl = frame["close"].to_numpy(dtype=float)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(lo > 0, h / lo, np.inf)
+
+        ok = (
+            np.isfinite(o) & np.isfinite(h) & np.isfinite(lo) & np.isfinite(cl)
+            & (lo > 0) & (h > 0) & (h >= lo)
+            & (o >= lo) & (o <= h)
+            & (cl >= lo) & (cl <= h)
+            & (ratio <= max_ratio)
+        )
+        frame = frame[ok]
+        if frame.empty:
+            return None
+
+        frame["volume"] = frame["volume"].astype("int64", errors="ignore")
         return _sanitize_ohlc_dataframe(
-            pd.DataFrame(candles).set_index("date").tail(limit),
+            frame.set_index("date").tail(limit),
             profile,
         )
 
@@ -2136,6 +2235,85 @@ def _zone_per_timeframe(group: pd.DataFrame) -> List[dict]:
     return out
 
 
+# ==============================================================================
+# [ CALIBRATION EMPIRIQUE — tables mesurées, rapport v1-2026-09-12 ]
+# ==============================================================================
+# Source : §5.6 "Contrôle du confondant distance" — taux de RETOUCHE observé sur
+# 16 693 confluences / 12 actifs, walk-forward aligné H4, ventilé mono vs multi-TF.
+# Ces valeurs sont des FRÉQUENCES OBSERVÉES, pas un modèle. Elles décrivent la
+# PORTÉE (la zone sera-t-elle atteinte dans l'horizon ?), jamais la TENUE.
+_REACH_BY_DIST_ATR_MULTI_TF: Final[List[Tuple[float, float, int]]] = [
+    (0.5, 1.000, 125),
+    (1.0, 0.954, 129),
+    (2.0, 0.892, 305),
+    (4.0, 0.690, 697),
+    (8.0, 0.438, 1393),
+    (float("inf"), 0.051, 6790),
+]
+_REACH_BY_DIST_ATR_MONO_TF: Final[List[Tuple[float, float, int]]] = [
+    (0.5, 1.000, 19),
+    (1.0, 1.000, 20),
+    (2.0, 0.849, 53),
+    (4.0, 0.711, 83),
+    (8.0, 0.500, 200),
+    (float("inf"), 0.013, 6879),
+]
+
+# Source : §5.6 / §5.8 / §10.10 — P(respect | touch) est INVARIANTE : ~0.14 quelle
+# que soit la profondeur de confluence (mono 0.146 / bi 0.140 / tri 0.141) et quel
+# que soit le seuil de confluence balayé (0.1388 / 0.1384 / 0.1415). C'est donc une
+# CONSTANTE globale, et surtout PAS un discriminant par zone. Toute tentative de la
+# décliner par zone serait une invention : le rapport démontre l'inverse (§5.7).
+_RESPECT_GIVEN_TOUCH_GLOBAL: Final[float] = 0.14
+
+_CALIBRATION_EVIDENCE: Final[Dict[str, Any]] = {
+    "source_report": "v1-2026-09-12 (Phase 3 — recalibrage empirique sur historique profond)",
+    "sample": "16693 confluences / 12 actifs / walk-forward out-of-sample, aligné H4",
+    "reach_table_ref": "§5.6 (taux de retouche par tranche de distance ATR, mono vs multi-TF)",
+    "respect_given_touch": _RESPECT_GIVEN_TOUCH_GLOBAL,
+    "respect_given_touch_ref": "§5.6 / §5.8 / §10.10 — invariante (~0.14)",
+    "horizon_bars": {"H4": 120, "Daily": 40, "Weekly": 12},
+    "regime": "2023-2026, régime de marché unique (cf. §5.9d, §11)",
+    "known_limits": [
+        "reach_probability = PORTÉE (zone atteinte), jamais TENUE (zone défendue).",
+        "P(respect|touch) ~0.14 est globale et non discriminante par zone (§5.7).",
+        "Le score n'est prédictif que dans la bande 4-8 ATR (+10.6 pp, p=0.0026) "
+        "et n'est PAS un prédicteur de tenue -> confidence_tier reste null.",
+        "Table mesurée sur un seul régime de marché ; à répliquer avant usage en dur.",
+        "Distance mesurée au centroïde dans l'étude ; distance_atr_edge est fourni "
+        "en complément mais n'a PAS été validé par le walk-forward.",
+    ],
+}
+
+
+def _reach_probability(distance_atr: Optional[float], nb_tf: int) -> Optional[float]:
+    """Taux de retouche OBSERVÉ pour cette tranche de distance (§5.6).
+
+    Retourne une fréquence empirique par tranche, sans interpolation : interpoler
+    entre deux tranches mesurées produirait un chiffre qui n'a jamais été observé.
+    """
+    if distance_atr is None or not np.isfinite(distance_atr) or distance_atr < 0:
+        return None
+    table = _REACH_BY_DIST_ATR_MULTI_TF if nb_tf >= 2 else _REACH_BY_DIST_ATR_MONO_TF
+    for upper, rate, _n in table:
+        if distance_atr < upper:
+            return rate
+    return table[-1][1]
+
+
+def _reach_bucket_label(distance_atr: Optional[float]) -> Optional[str]:
+    """Libellé de la tranche de distance utilisée (traçabilité pour le merger)."""
+    if distance_atr is None or not np.isfinite(distance_atr):
+        return None
+    for upper, label in (
+        (0.5, "<0.5 ATR"), (1.0, "0.5-1 ATR"), (2.0, "1-2 ATR"),
+        (4.0, "2-4 ATR"), (8.0, "4-8 ATR"),
+    ):
+        if distance_atr < upper:
+            return label
+    return ">8 ATR"
+
+
 def _score_and_classify_group(
     group: pd.DataFrame,
     current_price: float,
@@ -2147,6 +2325,29 @@ def _score_and_classify_group(
     PATCH JSON-2 : enrichit la sortie pour le schéma v2 (zone_id, per_timeframe,
     zone_bounds, distance_atr, confidence_tier). AUCUN champ historique n'est
     retiré : les nouveaux champs s'AJOUTENT (rétro-compatibilité stricte).
+
+    PATCH BOUNDS-1 — sémantique de `zone_bounds` CORRIGÉE.
+      AVANT : bounds = min/max de `full_cluster` (la composante union-find
+      ENTIÈRE), alors que `Niveau`, `Score`, `Force Totale`, `Distance %` et
+      `per_timeframe` sont calculés sur `group` (un niveau par TF après
+      groupby.idxmin). Les deux ne décrivaient pas le même objet : sur l'export
+      v8.8.0, AUD/CHF 0.54019 annonçait des bornes larges de 9.4 % alors que ses
+      trois niveaux scorés ne s'étalent que sur 1.8 %. Un merger lisant
+      `zone_bounds` comme bande tradable recevait un couloir 5x trop large.
+      APRÈS : `zone_bounds` = étendue des niveaux SCORÉS (cohérent avec Niveau) ;
+      l'étendue de la composante complète est exposée à part dans `cluster_bounds`,
+      avec son compte de membres, pour l'audit.
+
+    PATCH DIST-1 — `distance_atr_edge` : distance au BORD le plus proche de la
+      zone, en plus de la distance au centroïde. Le centroïde est ce que le
+      walk-forward a mesuré (donc `distance_atr` est conservé tel quel et reste la
+      seule variable validée) ; le bord est ce qu'un filtre d'actionnabilité doit
+      regarder. Les deux sont fournis, explicitement étiquetés.
+
+    PATCH REACH-1 — `reach_probability` : fréquence de retouche OBSERVÉE pour la
+      tranche de distance de la zone (rapport §5.6). C'est une PORTÉE, pas une
+      qualité. `confidence_tier` reste null : le rapport démontre (§5.7, §10.7)
+      qu'aucune statistique de TENUE par zone n'existe dans les données.
     """
     sub_avg = group["level"].mean()
     sub_nb_tf = group["tf"].nunique()
@@ -2155,29 +2356,53 @@ def _score_and_classify_group(
     score = _group_score(group, sub_nb_tf)
     status = max(group["status"].tolist(), key=lambda s: _STATUS_PRIORITY.get(s, 1))
     ctype, sig = _classify_confluence_type(group, safe_cp, sub_dist)
-    # SR-2 FIX: Les champs originaux sont conservés intacts pour la compatibilité
-    # des dashboards existants. Les champs snake_case ajoutés en parallèle
-    # permettent au merger de lire les données sans parsing fragile basé sur
-    # les noms à espaces/majuscules inconsistantes.
-    #
-    # SR-3 FIX: pivot_bias est initialisé à null ici. Le merger (merge_app.py)
-    # est responsable de le calculer en croisant avec les biais GPS/D1 :
-    # "support" si D1 Bullish, "resistance" si D1 Bearish, "neutral" si Range/inconnu.
-    # Ce champ ne peut pas être rempli ici car le SR scanner n'a pas accès au GPS JSON.
     force_totale = int(group["strength"].sum())
     nb_tf = int(sub_nb_tf)
     dist_pct = round(sub_dist, 3)
 
     # --- Enrichissements v2 ---
     level_round = round(float(sub_avg), 5)
+
+    # PATCH BOUNDS-1 : bornes = niveaux SCORÉS (group), pas la composante entière.
+    bounds_low = round(float(group["level"].min()), 5)
+    bounds_high = round(float(group["level"].max()), 5)
+    zone_width_pct = round((bounds_high - bounds_low) / safe_cp * 100.0, 4)
+
     cluster = full_cluster if full_cluster is not None else group
-    bounds_low = round(float(cluster["level"].min()), 5)
-    bounds_high = round(float(cluster["level"].max()), 5)
-    distance_atr = None
+    cluster_low = round(float(cluster["level"].min()), 5)
+    cluster_high = round(float(cluster["level"].max()), 5)
+    cluster_bounds = {
+        "low": cluster_low,
+        "high": cluster_high,
+        "members": int(len(cluster)),
+        "width_pct": round((cluster_high - cluster_low) / safe_cp * 100.0, 4),
+        "note": "Étendue de la composante de clustering complète. NON scorée : "
+                "Niveau/Score/per_timeframe portent sur zone_bounds.",
+    }
+
+    # ATR médian des TF représentées, utilisé pour les deux distances ATR.
+    atr_med: Optional[float] = None
     if "atr" in group.columns:
         atrs = pd.to_numeric(group["atr"], errors="coerce").dropna()
         if len(atrs) > 0 and float(atrs.median()) > 0:
-            distance_atr = round(abs(safe_cp - level_round) / float(atrs.median()), 3)
+            atr_med = float(atrs.median())
+
+    distance_atr = None
+    distance_atr_edge = None
+    if atr_med:
+        distance_atr = round(abs(safe_cp - level_round) / atr_med, 3)
+        if safe_cp < bounds_low:
+            edge_gap = bounds_low - safe_cp
+        elif safe_cp > bounds_high:
+            edge_gap = safe_cp - bounds_high
+        else:
+            edge_gap = 0.0  # prix DANS la zone
+        distance_atr_edge = round(edge_gap / atr_med, 3)
+
+    reach_p = _reach_probability(distance_atr, nb_tf)
+    expected_hold = (
+        round(reach_p * _RESPECT_GIVEN_TOUCH_GLOBAL, 4) if reach_p is not None else None
+    )
 
     return {
         # --- Champs originaux (ne pas modifier : compatibilité dashboards) ---
@@ -2192,7 +2417,7 @@ def _score_and_classify_group(
         "Statut": status,
         "Distance %": dist_pct,
         "Alerte": "🔥 ZONE CHAUDE" if sub_dist < 0.5 else ("⚠️ Proche" if sub_dist < 1.5 else ""),
-        # --- Champs normalisés snake_case (SR-2) : alias lisibles par le merger ---
+        # --- Champs normalisés snake_case (SR-2) ---
         "zone_type": ctype,
         "zone_signal": sig,
         "zone_strength": force_totale,
@@ -2200,15 +2425,26 @@ def _score_and_classify_group(
         "zone_distance_pct": dist_pct,
         # --- Biais directionnel Pivot (SR-3) : à calculer par le merger ---
         "pivot_bias": None,
-        # --- Enrichissements schéma v2.0 (PATCH JSON-2) ---
+        # --- Enrichissements schéma v2.0 ---
         "zone_id": compute_zone_id(symbol, level_round, ctype),
         "distance_atr": distance_atr,
         "zone_bounds": {"low": bounds_low, "high": bounds_high},
         "per_timeframe": _zone_per_timeframe(group),
-        # confidence_tier : volontairement None tant qu'il ne repose pas sur une
-        # statistique empirique de respect historique (Phase 3). Pas d'étiquette
-        # arbitraire (règle de conception de la section 4 du cahier des charges).
         "confidence_tier": None,
+        # --- Enrichissements v2.1 (PATCH BOUNDS-1 / DIST-1 / REACH-1) ---
+        "zone_width_pct": zone_width_pct,
+        "cluster_bounds": cluster_bounds,
+        "atr_reference": round(atr_med, 8) if atr_med else None,
+        "distance_atr_edge": distance_atr_edge,
+        "price_inside_zone": bool(bounds_low <= safe_cp <= bounds_high),
+        "reach_probability": reach_p,
+        "reach_distance_bucket": _reach_bucket_label(distance_atr),
+        "reach_basis": "empirical_frequency_§5.6" if reach_p is not None else None,
+        "respect_given_touch_global": _RESPECT_GIVEN_TOUCH_GLOBAL,
+        "expected_hold_probability": expected_hold,
+        "score_is_predictive_here": (
+            bool(distance_atr is not None and 4.0 <= distance_atr < 8.0)
+        ),
     }
 
 
@@ -2242,21 +2478,61 @@ class _UnionFind:
             self.rank[rx] += 1
 
 
-def _cluster_levels_union_find(levels_arr: np.ndarray, threshold: float) -> Dict[int, List[int]]:
-    """Regroupe les indices de niveaux proches via Union-Find."""
+# PATCH WIDTH-1 — plafond de largeur des composantes de confluence.
+# Le clustering mono-TF est doublement borné (span > 2.5*bandwidth dans
+# agglomerative_1d_clustering, ET max_cluster_width_pct dans _swing_clustered_zones).
+# La confluence multi-TF, elle, ne testait que la distance de proche en proche puis
+# fusionnait la composante entière : une chaîne de N niveaux espacés de moins que
+# `threshold` produisait un cluster de largeur illimitée. Effet mesuré sur l'export
+# v8.8.0 du 2026-09-12 : AUD/CHF niveau 0.54019 -> zone_bounds 0.51546-0.56630,
+# soit 9.4 % de largeur pour un seuil de 0.8 % ; AUD/CAD 0.90923 -> ~4.9 % ;
+# AUD/JPY 97.50472 -> ~5.4 %.
+# Le multiplicateur reprend la borne déjà utilisée en mono-TF (2.5x).
+_CONFLUENCE_MAX_SPAN_MULT: Final[float] = 2.5
+
+
+def _cluster_levels_union_find(
+    levels_arr: np.ndarray,
+    threshold: float,
+    max_span_mult: float = _CONFLUENCE_MAX_SPAN_MULT,
+) -> Dict[int, List[int]]:
+    """Regroupe les indices de niveaux proches (balayage trié, largeur bornée).
+
+    PRÉCONDITION (inchangée) : ``levels_arr`` trié par ordre croissant —
+    ``detect_confluences`` trie avant l'appel.
+
+    Critère de rattachement : gap au voisin <= ``threshold`` (%) ET étendue
+    cumulée depuis le premier membre du cluster <= ``threshold * max_span_mult``.
+    Le premier critère est celui de la v8.8.0 ; le second est le plafond ajouté.
+    Le nom et le contrat de retour sont conservés (composante -> indices).
+    """
     n = len(levels_arr)
-    uf = _UnionFind(n)
-    for i in range(n):
-        li = levels_arr[i]
-        if li <= 0:
-            continue
-        for j in range(i + 1, n):
-            if (levels_arr[j] - li) / li * 100 > threshold:
-                break
-            uf.union(i, j)
     comp_map: Dict[int, List[int]] = {}
-    for idx in range(n):
-        comp_map.setdefault(uf.find(idx), []).append(idx)
+    if n == 0:
+        return comp_map
+    if not np.isfinite(threshold) or threshold <= 0:
+        return {i: [i] for i in range(n)}
+
+    span_cap = float(threshold) * float(max_span_mult)
+    root = 0
+    current: List[int] = [0]
+
+    for i in range(1, n):
+        prev = float(levels_arr[i - 1])
+        first = float(levels_arr[current[0]])
+        cur = float(levels_arr[i])
+
+        gap_ok = prev > 0 and ((cur - prev) / prev * 100.0) <= threshold
+        span_ok = first > 0 and ((cur - first) / first * 100.0) <= span_cap
+
+        if gap_ok and span_ok:
+            current.append(i)
+        else:
+            comp_map[root] = current
+            root = i
+            current = [i]
+
+    comp_map[root] = current
     return comp_map
 
 
@@ -2307,7 +2583,7 @@ def detect_confluences(
     threshold = resolve_confluence_threshold(profile, confluence_threshold_pct)
     z_df = z_df.sort_values("level").reset_index(drop=True)
     levels_arr = z_df["level"].values
-    comp_map = _cluster_levels_union_find(levels_arr, threshold)
+    comp_map = _cluster_levels_union_find(levels_arr, threshold, _CONFLUENCE_MAX_SPAN_MULT)
 
     confluences = []
     for indices in comp_map.values():
@@ -2584,7 +2860,18 @@ def _rows_from_zones(sup: pd.DataFrame, res: pd.DataFrame, row_ctx: _RowContext)
 
 
 def _process_tf_frame(ctx: _TFProcessingContext):
-    """Traite une timeframe unique et retourne les lignes, zones, contexte prix et debug."""
+    """Traite une timeframe unique et retourne les lignes, zones, contexte prix et debug.
+
+    PATCH PERF-3 — les compteurs de debug ne rejouent plus la détection.
+      AVANT : `_debug_pivot_count` et `_debug_trend_zone_count` étaient appelés
+      INCONDITIONNELLEMENT, puis `find_strong_sr_zones` recalculait pivots et
+      zones trend-structure en interne -> la détection tournait 2 à 3 fois par
+      (actif, TF), soit 99 fois par scan, pour alimenter des compteurs que l'UI
+      n'affiche que si `show_debug` est coché. Gaté sur DEBUG_INSTRUMENTATION.
+
+    PATCH PERF-2 — la détection travaille sur la fenêtre calibrée (cf.
+    _DETECTION_WINDOW_BY_TF), pas sur la profondeur de fetch complète.
+    """
     debug = {
         "atr": None,
         "n_pivots": 0,
@@ -2592,19 +2879,30 @@ def _process_tf_frame(ctx: _TFProcessingContext):
         "n_trend_zones": 0,
         "min_touches": None,
         "tf": ctx.tf_name,
+        "instrumented": bool(DEBUG_INSTRUMENTATION),
     }
     try:
-        atr_val = compute_atr(ctx.dataframe)
+        det_df = _detection_frame(ctx.dataframe, ctx.tf_key)
+        debug["bars_fetched"] = int(len(ctx.dataframe)) if ctx.dataframe is not None else 0
+        debug["bars_detection"] = int(len(det_df)) if det_df is not None else 0
+
+        atr_val = compute_atr(det_df)
         debug["atr"] = atr_val
         if atr_val is None:
             return None, None, "", debug
+
         min_t = _min_touches_for_tf(ctx.profile, ctx.tf_key, ctx.min_touches_ui)
         debug["min_touches"] = min_t
-        debug["n_pivots"] = _debug_pivot_count(ctx, atr_val)
-        debug["n_trend_zones"] = _debug_trend_zone_count(ctx, atr_val)
+
+        det_ctx = replace(ctx, dataframe=det_df) if det_df is not ctx.dataframe else ctx
+
+        # PATCH PERF-3 : coûteux (rejoue la détection) -> uniquement si instrumenté.
+        if DEBUG_INSTRUMENTATION:
+            debug["n_pivots"] = _debug_pivot_count(det_ctx, atr_val)
+            debug["n_trend_zones"] = _debug_trend_zone_count(det_ctx, atr_val)
 
         sup, res = find_strong_sr_zones(
-            ctx.dataframe, ctx.current_price, ctx.symbol, atr_val, ctx.tf_key, min_t
+            det_df, ctx.current_price, ctx.symbol, atr_val, ctx.tf_key, min_t
         )
         debug["n_zones"] = int(len(sup) + len(res))
 
@@ -2893,15 +3191,22 @@ async def run_institutional_scan(symbols, token, oanda_account_id, min_touches_u
     """Exécute le scan institutionnel complet.
 
     PATCH ENV-1 (point 14) : ``oanda_env`` ("practice" | "trade") force
-    l'environnement OANDA et le journalise. None = auto-détection (comportement
-    historique de l'UI).
+    l'environnement OANDA et le journalise. None = auto-détection.
+
+    PATCH ENV-2 : l'environnement RÉSOLU est désormais exposé via
+    ``run_institutional_scan.last_env`` pour que l'appelant puisse le threader
+    jusqu'à create_json_export. Sur l'export v8.8.0, `oanda_environment` valait
+    null parce que l'UI lisait os.environ["OANDA_ENV"] (non positionné) au lieu
+    de l'environnement effectivement résolu par le client.
     """
     client = AsyncOandaClient(token, oanda_account_id)
+    run_institutional_scan.last_env = None
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, connect=10)
     ) as session:
         if not await client.initialize(session, env_override=oanda_env):
             raise OandaAuthError("Auth OANDA echouee")
+        run_institutional_scan.last_env = client.env_name
         sem = asyncio.Semaphore(_OANDA_SEMAPHORE_LIMIT)
         live_prices, price_sources = await _fetch_live_prices(client, session, sem, symbols)
         data_cube = await _fetch_candles_cube(client, session, sem, symbols)
@@ -2918,6 +3223,9 @@ async def run_institutional_scan(symbols, token, oanda_account_id, min_touches_u
     if not coverage["ok"]:
         _patch_coverage_gaps(results, coverage)
     return results
+
+
+run_institutional_scan.last_env = None
 
 
 # ==============================================================================
@@ -3178,7 +3486,7 @@ def create_json_export(
     confluences_df,
     max_dist=None,
     min_score=0.0,
-    allowed_statuts=("Vierge", "Testee", "Role Reverse", "Consommee"),
+    allowed_statuts=("Vierge", "Testee", "Role Reverse"),
     *,
     scan_errors=None,
     missing_tfs_map=None,
@@ -3188,45 +3496,111 @@ def create_json_export(
     oanda_environment=None,
     calibration_profile_version=None,
 ):
-    """Exporte les résultats au format JSON — SCHÉMA v2.0.
+    """Exporte les résultats au format JSON — SCHÉMA v2.1.
 
-    PATCH JSON-1 (point 2) — DÉCOUPLAGE des filtres JSON / brief LLM.
-      AVANT : ``create_json_export`` était appelé avec ``llm_max_dist`` (slider
-      "Dist. max (%) brief LLM", défaut 2.0 %) : le JSON héritait d'un filtre de
-      distance conçu pour un résumé humain. Preuve empirique : 8 des 33 actifs
-      (24 %) sortaient en ``none_detected`` alors que la détection avait produit
-      4 à 15 confluences (cf. reports/phase0_none_detected_diagnosis.txt) ; des
-      zones 3-TF de score 58.5 étaient écartées pour 3.6 % de distance.
-      APRÈS : défauts JSON dédiés — AUCUN filtre de distance (``max_dist=None``),
-      score bas (``0.0``), tous statuts. Le merger filtre selon SES critères.
-      ``export_filters_applied`` documente dans le JSON ce qui a été appliqué.
+    v2.1 = sur-ensemble STRICT de v2.0 (aucune clé retirée). Changements :
 
-    PATCH JSON-2 — schéma enrichi (points 6/7/8) : tendances D1/H4/W, contexte de
-    prix, statut de scan granulaire, erreurs/anomalies/TF manquantes, ``zone_id``
-    stable, ``per_timeframe``, ``zone_bounds``, ``distance_atr``.
+    PATCH TS-1 — `current_price_timestamp` ne mentait plus.
+      AVANT : `now_utc` dès que la source était "live" OU "stale". Sur l'export
+      v8.8.0 du 2026-09-12 (samedi), les 33 actifs portaient un horodatage de
+      samedi 19:46 UTC pour un prix de clôture de vendredi. Le commentaire du code
+      refusait d'"inventer" l'heure pour le repli candle_close (-> null) mais
+      affirmait une fraîcheur fausse pour stale.
+      APRÈS : horodatage rempli SEULEMENT si "live". Pour "stale", null + le
+      booléen explicite `price_is_stale` et `price_timestamp_note`. La CLÉ est
+      conservée (rétro-compat) ; seule la valeur devient honnête.
 
-    RÈGLE DE RÉTRO-COMPATIBILITÉ STRICTE : tous les champs existants sont
-    conservés à l'identique (``Actif``, ``Signal``, ``Niveau``, ``zone_type``,
-    ``pivot_bias``, ...). Les nouveaux champs S'AJOUTENT, ils ne remplacent rien.
+    PATCH ENV-2 — `oanda_environment` n'est plus silencieusement null.
+      Sur l'export v8.8.0 le champ valait null alors que le rapport annonçait
+      "practice (forcé et journalisé)" : la variable d'env n'était pas positionnée
+      et l'appelant ne threadait pas l'environnement RÉSOLU par le client. On
+      journalise désormais un avertissement au lieu d'exporter un null muet.
+
+    PATCH RUNID-1 — `run_id` réellement stable.
+      AVANT : le hash portait sur `assets`, qui contenait `current_price_timestamp`
+      = now -> le run_id changeait à chaque run même à données identiques, ce qui
+      contredisait le commentaire "stable entre runs identiques".
+      APRÈS : les champs volatils sont exclus du périmètre de hash.
+
+    PATCH CTX-1 — `price_context` réconcilié avec les zones exportées.
+      `_nearest_support_label` travaille sur les niveaux Daily BRUTS, pas sur les
+      confluences fusionnées : le contexte pouvait annoncer "SUR resistance
+      0.58640" alors que la plus proche confluence exportée était 0.58863. Le
+      merger lisait un niveau sans zone_id, sans statut, sans score. On ajoute
+      `nearest_zones` dérivé des zones RÉELLEMENT exportées, et on marque
+      `price_context` comme indicatif.
     """
     now_utc = datetime.now(timezone.utc)
     scan_errors = scan_errors or {}
     missing_tfs_map = missing_tfs_map or {}
     anomalies = anomalies or {}
 
+    if not oanda_environment:
+        _LOG.warning(
+            "PATCH ENV-2 : oanda_environment non fourni -> exporté à null. "
+            "Passer l'environnement RÉSOLU par AsyncOandaClient (client.env_name) "
+            "ou définir OANDA_ENV pour rendre le run traçable."
+        )
+
+    resolved_window = data_window if data_window is not None else _data_window_from_bars(bars_map)
+
     output: Dict[str, Any] = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "generated_at": now_utc.isoformat(),
         "scanner_version": SCANNER_VERSION,
         "oanda_environment": oanda_environment,
-        "data_window": data_window if data_window is not None else _data_window_from_bars(bars_map),
+        "data_window": resolved_window,
+        "detection_window_by_tf": {
+            "H4": _DETECTION_WINDOW_BY_TF.get("h4"),
+            "Daily": _DETECTION_WINDOW_BY_TF.get("daily"),
+            "Weekly": _DETECTION_WINDOW_BY_TF.get("weekly"),
+            "note": "Profondeur de DÉTECTION (null = toute la profondeur de fetch). "
+                    "data_window décrit la profondeur FETCHÉE. Le walk-forward de "
+                    "calibration a été mené sur 500 bougies (rapport §5.2).",
+        },
         "calibration_profile_version": calibration_profile_version,
+        "calibration_evidence": _CALIBRATION_EVIDENCE,
+        "confluence_width_cap": {
+            "max_span_mult": _CONFLUENCE_MAX_SPAN_MULT,
+            "note": "PATCH WIDTH-1 : une composante de confluence est bornée à "
+                    "threshold * max_span_mult en largeur. Sans ce plafond, le "
+                    "chaînage transitif produisait des clusters de 5 à 10 % de "
+                    "large pour un seuil de 0.8 %.",
+        },
         "export_filters_applied": {
             "max_dist_pct": max_dist,
             "min_score": float(min_score),
             "allowed_statuts": list(allowed_statuts) if allowed_statuts else None,
             "note": "JSON non pré-filtré par distance par défaut (max_dist=None) ; "
                     "le merger applique ses propres critères.",
+            "consommee_unreachable": True,
+            "consommee_note": "Le statut 'Consommee' est INSATISFIABLE par "
+                              "construction : les zones Consommee sont exclues avant "
+                              "fusion dans _build_zones_dataframe puis re-filtrées "
+                              "dans _flatten_one_tf. Aucune zone Consommee ne peut "
+                              "apparaître dans cet export, quel que soit ce filtre.",
+        },
+        "merger_contract": {
+            "recommended_distance_field": "distance_atr",
+            "recommended_distance_note": "distance_atr (centroïde) est la SEULE "
+                "variable de distance validée par le walk-forward. "
+                "distance_atr_edge est fourni en complément mais n'a pas été validé.",
+            "recommended_filter": "distance_atr <= 4.0 (au-delà de 4 ATR le taux de "
+                "retouche observé tombe à 0.438 puis 0.051 ; cf. §5.4/§5.6). "
+                "Le rapport recommande 2-4 ATR selon l'appétit de précision (§12).",
+            "do_not_use_as_quality": [
+                "Score (non prédictif de la tenue ; discriminant seulement en 4-8 ATR)",
+                "Nb TF / zone_tf_count (aucun avantage à distance comparable, §5.6)",
+                "Statut (artefact de composition en distance, §5.9b)",
+                "confidence_tier (toujours null, par choix : §5.7)",
+            ],
+            "zone_bounds_semantics": "Étendue des niveaux SCORÉS (un par TF). "
+                "cluster_bounds décrit la composante de clustering complète, non scorée.",
+            "pivot_bias": "Toujours null : à calculer par le merger en croisant "
+                "trend_daily/trend_h4/trend_weekly avec le biais GPS externe.",
+            "price_context": "Champ TEXTE indicatif, dérivé des niveaux Daily BRUTS. "
+                "Ne correspond PAS forcément à une zone de `zones`. Utiliser "
+                "`nearest_zones` pour un lien fiable par zone_id.",
         },
         "assets": [],
     }
@@ -3240,6 +3614,7 @@ def create_json_export(
     assets_with_scan_error: List[str] = []
     assets_with_stale_price: List[str] = []
     assets_with_missing_tf: List[str] = []
+    total_zones = 0
 
     for sym, summary in summary_map.items():
         sym_clean = sym.replace("/", "_")
@@ -3250,13 +3625,25 @@ def create_json_export(
         else:
             zones = []
 
+        cp = summary.get("current_price")
+
+        # Tri par actionnabilité : distance ATR croissante (variable validée),
+        # repli sur la distance en % quand l'ATR n'est pas disponible.
+        def _sort_key(z):
+            d_atr = z.get("distance_atr")
+            if d_atr is None or not isinstance(d_atr, (int, float)):
+                return (1, float(z.get("Distance %") or 1e9))
+            return (0, float(d_atr))
+
+        zones.sort(key=_sort_key)
+        total_zones += len(zones)
+
         scan_error = scan_errors.get(sym)
         missing = list(missing_tfs_map.get(sym, []) or [])
         anomaly = anomalies.get(sym)
         price_source = summary.get("current_price_source")
+        is_stale = price_source == "stale"
 
-        # SR-4 FIX (étendu, point 7) : statut granulaire. On ne confond plus
-        # "marché calme, pas de zone" avec "OANDA a échoué" ou "TF manquante".
         if scan_error:
             zones_scan_status = "scan_error"
             assets_with_scan_error.append(sym)
@@ -3269,29 +3656,44 @@ def create_json_export(
             assets_with_no_zones.append(sym)
         if missing:
             assets_with_missing_tf.append(sym)
-        if price_source == "stale":
+        if is_stale:
             assets_with_stale_price.append(sym)
+
+        # PATCH CTX-1 : plus proche support / résistance parmi les zones EXPORTÉES.
+        nearest_zones: Dict[str, Any] = {"support": None, "resistance": None}
+        if cp:
+            below = [z for z in zones if (z.get("Niveau") or 0) < cp]
+            above = [z for z in zones if (z.get("Niveau") or 0) >= cp]
+            if below:
+                z = max(below, key=lambda x: x["Niveau"])
+                nearest_zones["support"] = {
+                    "zone_id": z.get("zone_id"), "Niveau": z.get("Niveau"),
+                    "distance_atr": z.get("distance_atr"),
+                    "distance_pct": z.get("Distance %"), "Statut": z.get("Statut"),
+                    "reach_probability": z.get("reach_probability"),
+                }
+            if above:
+                z = min(above, key=lambda x: x["Niveau"])
+                nearest_zones["resistance"] = {
+                    "zone_id": z.get("zone_id"), "Niveau": z.get("Niveau"),
+                    "distance_atr": z.get("distance_atr"),
+                    "distance_pct": z.get("Distance %"), "Statut": z.get("Statut"),
+                    "reach_probability": z.get("reach_probability"),
+                }
 
         output["assets"].append(
             {
                 # --- champs historiques (inchangés) ---
                 "symbol": sym,
-                "current_price": round(summary["current_price"], 5) if summary.get("current_price") is not None else None,
-                # SR-1 FIX: source de traçabilité du prix courant
-                # "live" = bid/ask mid temps réel (tradeable=True)
-                # "stale" = marché fermé (tradeable=False), dernier prix OANDA
-                # "candle_close" = fallback dernier close bougie (live indispo)
+                "current_price": round(cp, 5) if cp is not None else None,
                 "current_price_source": price_source,
-                # SR-4 FIX: statut du scan de zones pour cet asset
                 "zones_scan_status": zones_scan_status,
                 "zones": zones,
-                # --- enrichissements v2 (PATCH JSON-2) ---
+                # --- enrichissements v2 ---
                 "asset_class": profile.asset_class,
                 "pip_value": profile.pip_value,
-                # horodatage du prix : le scan lit le prix à generated_at ; pour un
-                # fallback candle_close, l'horodatage exact de la bougie n'est pas
-                # threadé -> null (explicite plutôt qu'inventé).
-                "current_price_timestamp": now_utc.isoformat() if price_source in ("live", "stale") else None,
+                # PATCH TS-1 : rempli seulement si le prix est réellement live.
+                "current_price_timestamp": now_utc.isoformat() if price_source == "live" else None,
                 "trend_h4": summary.get("trend_h4"),
                 "trend_daily": summary.get("trend_daily"),
                 "trend_weekly": summary.get("trend_weekly"),
@@ -3299,28 +3701,47 @@ def create_json_export(
                 "scan_error": scan_error,
                 "missing_timeframes": missing,
                 "anomalies": [anomaly] if anomaly else [],
+                # --- enrichissements v2.1 ---
+                "price_is_stale": is_stale,
+                "price_timestamp_note": (
+                    "Marché fermé (OANDA tradeable=False) : dernier mid connu, "
+                    "horodatage réel non threadé -> null plutôt qu'inventé. "
+                    "Toutes les distances de cet actif sont calculées sur ce prix."
+                    if is_stale else None
+                ),
+                "zone_count": len(zones),
+                "nearest_zones": nearest_zones,
+                "actionable_zone_count": sum(
+                    1 for z in zones
+                    if isinstance(z.get("distance_atr"), (int, float)) and z["distance_atr"] <= 4.0
+                ),
             }
         )
 
     output["assets"].sort(key=lambda x: x["symbol"])
 
-    # run_id : hash déterministe du CONTENU (stable entre runs identiques).
+    # PATCH RUNID-1 : hash déterministe sur le CONTENU non volatil.
+    _volatile = {"current_price_timestamp", "price_timestamp_note"}
+    hash_payload = [
+        {k: v for k, v in a.items() if k not in _volatile} for a in output["assets"]
+    ]
     output["run_id"] = hashlib.sha1(
-        json.dumps(output["assets"], sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        json.dumps(hash_payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     ).hexdigest()[:16]
 
-    # SR-4 FIX (étendu, point 7) : diagnostics opérationnels complets.
     output["diagnostics"] = {
         "assets_with_no_zones": sorted(assets_with_no_zones),
         "assets_with_scan_error": sorted(assets_with_scan_error),
         "assets_with_stale_price": sorted(assets_with_stale_price),
         "assets_with_missing_tf": sorted(assets_with_missing_tf),
-        "coverage_summary": {
-            tf: v for tf, v in output["data_window"].items()
-        },
+        "coverage_summary": {tf: v for tf, v in resolved_window.items()},
+        "total_assets": len(output["assets"]),
+        "total_zones_exported": total_zones,
+        "all_prices_stale": (
+            len(assets_with_stale_price) == len(output["assets"]) and bool(output["assets"])
+        ),
     }
 
-    # Réordonner : run_id juste après schema_version pour la lisibilité.
     ordered = {
         "schema_version": output["schema_version"],
         "run_id": output["run_id"],
@@ -3328,8 +3749,12 @@ def create_json_export(
         "scanner_version": output["scanner_version"],
         "oanda_environment": output["oanda_environment"],
         "data_window": output["data_window"],
+        "detection_window_by_tf": output["detection_window_by_tf"],
         "calibration_profile_version": output["calibration_profile_version"],
+        "calibration_evidence": output["calibration_evidence"],
+        "confluence_width_cap": output["confluence_width_cap"],
         "export_filters_applied": output["export_filters_applied"],
+        "merger_contract": output["merger_contract"],
         "assets": output["assets"],
         "diagnostics": output["diagnostics"],
     }
