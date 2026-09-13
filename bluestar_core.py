@@ -68,9 +68,14 @@ SCANNER_VERSION: Final[str] = "8.8.0-CALIBRATED-20260912"
 # pour que le merger sache sur quelle calibration les seuils reposent.
 CALIBRATION_PROFILE_VERSION: Final[str] = "v1-2026-09-12 (Phase 3 — recalibrage empirique sur historique profond)"
 
-# Instrumentation de diagnostic (classe A). Strictement inactive quand False :
-# aucun calcul, aucune clé ajoutée à scan_results. Mettre à True uniquement
-# pour le diagnostic du pipeline de détection. Aucun effet sur la logique métier.
+# Instrumentation de diagnostic (classe A). Cette constante ne gouverne que les
+# COMPTEURS LOURDS (rejeu de détection, debug enrichi). ATTENTION (audit-3
+# OPUS H7 — le commentaire promettait « aucune clé ajoutée », c'était faux) :
+# le dict debug minimal (dont debug["atr"], alimenté inconditionnellement par
+# _process_tf_frame) est TOUJOURS construit et n'est pas un ornement :
+# _atr_map_for_symbol le lit pour produire distance_atr / distance_atr_edge de
+# l'export JSON. Retirer debug_map de la chaîne casserait la variable validée.
+# Mettre DEBUG_INSTRUMENTATION à True n'ajoute que les compteurs instrumentés.
 DEBUG_INSTRUMENTATION: Final[bool] = False
 
 # PATCH VALID-2 (audit-2) — rend validate_ohlc_frame (et DataValidationError)
@@ -436,15 +441,14 @@ def _hash_df(frame: Optional[pd.DataFrame]) -> str:
         h.update(f"shape:{frame.shape[0]}x{frame.shape[1]}|".encode())
         if len(frame.index) > 0:
             h.update(f"idx:{frame.index[0]}:{frame.index[-1]}|".encode())
-        n = len(frame)
-        sample = (
-            frame
-            if n <= 32
-            else pd.concat(
-                [frame.iloc[:8], frame.iloc[n // 2 - 4 : n // 2 + 4], frame.iloc[-8:]], copy=False
-            )
-        )
-        h.update(pd.util.hash_pandas_object(sample, index=True).values.tobytes())
+        # PATCH AUDIT-3 (OPUS H6) : hash du CONTENU ENTIER, plus d'échantillon
+        # 8+8+8 qui aliasait deux frames ne différant qu'hors échantillon
+        # (clé de cache de compute_atr / find_strong_sr_zones : résultat périmé
+        # servi pendant le TTL de 120 s). Coût MESURÉ (pandas 3.0.5, frame
+        # 5000x5) : plein 1,19 ms vs échantillonné 3,23 ms — le hash complet
+        # est 2,7x PLUS RAPIDE ; la contre-mesure « économie » était un mythe.
+        # ~118 ms pour les 99 frames d'un scan entier.
+        h.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
         return h.hexdigest()[:32]
     except (ValueError, TypeError, AttributeError):
         return f"unhashable_{id(frame)}"
@@ -880,7 +884,17 @@ class AsyncOandaClient:
                     if r.status == 200:
                         return await r.json()
                     if r.status in (401, 403):
-                        return None
+                        # PATCH AUDIT-3 (OPUS H5) : AVANT, un 401/403 en cours
+                        # de scan renvoyait None -> cache négatif -> TF vide
+                        # « silencieusement » ; l'auth n'était vérifiée qu'une
+                        # fois dans initialize(). Un token révoqué produisait
+                        # un export structurellement valide et faussement
+                        # propre. L'auth est FATALE : on lève.
+                        raise OandaAuthError(
+                            f"HTTP {r.status} sur "
+                            f"{url.split('/v3/')[-1] if '/v3/' in url else url}"
+                            " — token révoqué ou compte inatteignable"
+                        )
                     if r.status in (429, 500, 502, 503, 504) and attempt < retries - 1:
                         ra = None
                         if r.status == 429:
@@ -1096,17 +1110,43 @@ class AsyncOandaClient:
 
 
 def _run_async_isolated(coro_factory, timeout=300.0):
-    """Exécute une coroutine dans un thread séparé si nécessaire."""
+    """Exécute une coroutine avec un VRAI timeout, dans un thread séparé si une
+    boucle asyncio tourne déjà dans le thread appelant.
+
+    PATCH TIMEOUT-1 (audit-3, OPUS C2 + constat local) :
+    - AVANT : le timeout n'était appliqué QUE sur la branche thread. Sous
+      Streamlit (aucune boucle courante), c'est la branche asyncio.run() qui
+      s'exécute -> le paramètre timeout était TOTALEMENT inopérant sur le
+      chemin de production. Et sur la branche thread, le `with
+      ThreadPoolExecutor(...)` appelait shutdown(wait=True) pendant le
+      défilement de l'exception : future.result(timeout=...) bornait bien la
+      LEVÉE, jamais l'ATTENTE (mesure OPUS reproduite ici : 20,03 s vécues
+      pour timeout=1,0 s).
+    - APRÈS : asyncio.wait_for borne la coroutine sur LES DEUX chemins, donc
+      l'annulation est réelle (tasks aiohttp annulées, session fermée) ; sur
+      la branche thread l'executor est hors `with` et shutdown(wait=False)
+      rend la main aussitôt. Un worker orphelin peut encore finir ses requêtes
+      en arrière-plan (tuer un thread Python n'existe pas) : résidu assumé et
+      documenté, non corrigeable proprement.
+    """
+    async def _guarded():
+        return await asyncio.wait_for(coro_factory(), timeout=timeout)
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro_factory())
+        try:
+            return asyncio.run(_guarded())
+        except asyncio.TimeoutError as e:
+            raise ScanTimeoutError(f"Async scan exceeded {timeout}s") from e
 
     def _worker():
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro_factory())
+            return loop.run_until_complete(_guarded())
+        except asyncio.TimeoutError as e:
+            raise ScanTimeoutError(f"Async scan exceeded {timeout}s") from e
         finally:
             try:
                 pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
@@ -1121,15 +1161,17 @@ def _run_async_isolated(coro_factory, timeout=300.0):
             finally:
                 loop.close()
 
-    with concurrent.futures.ThreadPoolExecutor(
+    ex = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="oanda-async"
-    ) as ex:
-        future = ex.submit(_worker)
-        try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError as e:
-            future.cancel()
-            raise ScanTimeoutError(f"Async scan exceeded {timeout}s") from e
+    )
+    try:
+        return ex.submit(_worker).result(timeout=timeout + 15.0)
+    except concurrent.futures.TimeoutError as e:
+        # Garde-fou du thread réellement gelé (boucle bloquée par du code
+        # sync) : wait_for interne a déjà dû parler avant ; on rend la main.
+        raise ScanTimeoutError(f"Async scan exceeded {timeout}s (thread gelé)") from e
+    finally:
+        ex.shutdown(wait=False)
 
 
 # ==============================================================================
@@ -1222,18 +1264,18 @@ def _make_trend_zone(
         "prominence": round(abs(current_price - lvl), 8),
         "prominence_atr": round(abs(current_price - lvl) / atr_val, 3),
         "is_major": True,
+        # AUDIT-3 (OPUS H1) : marque l'ORIGINE du niveau — force SYNTHÉTIQUE
+        # (int(mult*10+5) = 15 ou 25) et age 0 : ce ne sont pas des touchés
+        # observés, mais bien propagés dans « touches »/Force Totale/Score.
+        "origin": "trend_regression",
     }
 
 
-def _trend_residual_band(resid: np.ndarray, atr_val: float, current_price: float) -> float:
-    """Calcule la largeur de bande à partir des résidus (avec fallback robuste)."""
-    band = float(np.std(resid))
-    if np.isfinite(band) and band > 0:
-        return band
-    anchor_mag = abs(float(np.quantile(resid, 0.5)))
-    if anchor_mag > 0:
-        return anchor_mag
-    return atr_val / max(current_price, 1e-9)
+# (_trend_residual_band supprimé par l'audit-3/H9 : code MORT jamais appelé,
+#  et logique divergente des deux copies inlinées de _trend_support_levels /
+#  _trend_resistance_levels — ancre quantile 0.5 contre 0.10/0.90. Ne pas la
+#  « rebrancher » : elle changerait le comportement. Zéro call-site vérifié
+#  par grep, y compris dans les tests.)
 
 
 def _trend_support_levels(
@@ -2139,6 +2181,10 @@ def _flatten_one_tf(df_z: pd.DataFrame, timeframe_key: str, ztype: str) -> Optio
     for c in ["prominence_atr", "is_major"]:
         if c in tmp.columns:
             cols.append(c)
+    if "origin" in tmp.columns:
+        # AUDIT-3 (H1) : origine par défaut « swing » pour les zones réelles.
+        tmp["origin"] = tmp["origin"].fillna("swing")
+        cols.append("origin")
     return tmp[[c for c in cols if c in tmp.columns]]
 
 
@@ -2161,6 +2207,13 @@ def _flatten_zones_to_dataframe(zones_dict: dict, atr_map: Optional[dict] = None
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True).sort_values("level").reset_index(drop=True)
+    if "origin" in out.columns:
+        # AUDIT-3 (fix post-mesure) : pd.concat réintroduit du NaN pour les
+        # frames sources qui n'avaient pas la colonne origin (zones purement
+        # swing) — le fillna de _flatten_one_tf ne couvre que l'intérieur d'une
+        # frame. Sans ce second fillna, 19 lignes portaient origin=NaN ->
+        # level_origin="nan" dans l'export (mesuré au scan 0b3d0329).
+        out["origin"] = out["origin"].fillna("swing")
     if atr_map:
         out["atr"] = out["tf"].map(lambda t: atr_map.get(t))
     return out
@@ -2225,11 +2278,28 @@ def compute_zone_id(symbol: str, level: float, zone_type: str) -> str:
     """PATCH JSON-2 (point 8) — identité STABLE de zone, déterministe.
 
     Hash de ``symbol + niveau arrondi + type``. Deux runs successifs produisent
-    le MÊME ``zone_id`` pour la même zone, ce qui permet au merger de suivre son
-    cycle de vie (Vierge -> Testee -> Role Reverse -> Consommee) d'un run à
-    l'autre, au lieu de recevoir des instantanés déconnectés.
+    le MÊME ``zone_id`` pour la même zone tant que le niveau ET le type sont
+    stables.
+
+    AUDIT-3 (OPUS G1/G4) — limites assumées, explicitées ici plutôt que cachées :
+    - le TYPE est dans la clé : une traversée du prix fait basculer Pivot <->
+      Support/Resistance et donc changer le zone_id d'un niveau structurellement
+      inchangé. D'où ``zone_id_stable`` (symbol + niveau, sans type), exporté
+      en complément pour le suivi de cycle de vie à travers les traversées ;
+      ``zone_id`` lui-même N'EST PAS modifié (rétro-compat stricte) ;
+    - les zones ``Consommee`` sont écartées de l'export EN AMONT (double filtre
+      _build_zones_dataframe / _flatten_one_tf) : la transition « -> Consommee »
+      n'est jamais observable par le merger, seule son absence. La promesse
+      initiale « suivre ... -> Consommee » était fausse ; c'est le commentaire
+      qui est corrigé, pas le comportement.
     """
     key = f"{symbol}|{round(float(level), 5)}|{zone_type}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_zone_id_stable(symbol: str, level: float) -> str:
+    """Identité insensible au type (AUDIT-3 G1) : symbol + niveau arrondi."""
+    key = f"{symbol}|{round(float(level), 5)}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -2250,6 +2320,12 @@ def _zone_per_timeframe(group: pd.DataFrame) -> List[dict]:
                 "touches": int(r["strength"]),
                 "age_bars": int(r["age_bars"]),
                 "status": r["status"],
+                # AUDIT-3 (OPUS H1) : « touches » vaut 15/25 SYNTHÉTIQUES pour
+                # un niveau trend_regression (jamais touché réellement) — le
+                # merger doit pouvoir les distinguer sans deviner.
+                "level_origin": (
+                    "swing" if pd.isna(r.get("origin", None)) else str(r["origin"])
+                ),
                 "prominence_atr": prom,
                 "is_major": bool(r.get("is_major", False)) if "is_major" in group.columns else False,
             }
@@ -2304,8 +2380,26 @@ _CALIBRATION_EVIDENCE: Final[Dict[str, Any]] = {
         "Table mesurée sur un seul régime de marché ; à répliquer avant usage en dur.",
         "Distance mesurée au centroïde dans l'étude ; distance_atr_edge est fourni "
         "en complément mais n'a PAS été validé par le walk-forward.",
+        # --- AUDIT-3 ---
+        "Biais de censure aux bords de fenêtre : une zone formée près du bord "
+        "gauche du walk-forward a moins de barres d'observation -> la tranche "
+        ">8 ATR mélange « trop loin » et « pas assez observé » (KIMI §B3).",
+        "Tranches fines MONO sous-échantillonnées (n=19 et 20 pour <1 ATR, "
+        "taux 1.000) : reach_bucket_n est exporté pour rappel — ne pas lire "
+        "1.000 comme une certitude (intervalle de confiance ~[0.83, 1] à n=20).",
+        "Régime de distance ATR : la production divise par la MÉDIANE des ATR "
+        "des TF représentées (atr_med) tandis que l'étude était alignée H4 -> "
+        "les valeurs multi-TF en tranches mixtes sont transposées, pas mesurées "
+        "(OPUS B2 ; recalibration = dossier Phase 2).",
     ],
 }
+
+
+# AUDIT-3 (OPUS B3) : horizon commun des deux tables §5.6 — walk-forward aligné
+# H4, retouche cherchée dans les 120 barres H4 suivantes (~20 jours ouvrés).
+# Sans cette étiquette exportée, un reach_probability n'a pas d'échéance.
+_REACH_HORIZON_BARS: Final[int] = 120
+_REACH_HORIZON_TF: Final[str] = "H4"
 
 
 def _reach_probability(distance_atr: Optional[float], nb_tf: int) -> Optional[float]:
@@ -2354,14 +2448,27 @@ def _reach_bucket_meta(distance_atr: Optional[float], nb_tf: int) -> Dict[str, A
 
 
 def _tf_decay_weight(tf_name: str, age_bars: Any) -> float:
-    """Poids de décroissance d'âge d'un niveau, NON borné (PATCH NBTF-1).
+    """Poids de décroissance d'âge BRUT, plafonné à la fenêtre du TF (NBTF-1).
 
-    PRÉCISION FORENSIQUE (vérifiée à l'application de l'audit-2) : ce n'est PAS
-    la formule de compute_structural_score, qui CLIPPE age_r dans [0, 1] — un
-    pivot H4 de 1400 barres y vaut exp(-2*1)=0.135 (plancher), jamais 0.004.
-    Ici la décroissance est calculée sans clip, volontairement : le seuil vise
-    l'âge HORS fenêtre de calibration (§5.2 : 500 bougies), pas la contribution
-    au score. C'est ce qui distingue NBTF-1 d'un simple écrasement de score.
+    PRÉCISION FORENSIQUE (corrigée par l'audit-3 — la version initiale citait
+    la mauvaise fonction) : trois sémantiques d'âge coexistent dans ce module.
+    - compute_structural_score (colonne « Score (1TF) » de l'UI) : décroissance
+      BRUTE, sans clip ni plafond -> un pivot H4 de 1400 barres y vaut ~0,004
+      (le chiffre de l'audit-2 était EXACT pour cette fonction ; le plancher
+      0,135 attribué à tort par la première version de NBTF-1 appartient à la
+      fonction suivante) ;
+    - _group_score (champ « Score » de l'export JSON) : age_r CLIPPÉ dans
+      [0, 1] -> plancher exp(-lambda), soit 0,135 (H4), 0,368 (Daily),
+      0,607 (Weekly) ;
+    - CE helper : décroissance brute, âge plafonné (AUDIT-3, KIMI §A) à la
+      fenêtre de détection ou de fetch du TF : un niveau que le scanner a le
+      droit de détecter ne peut pas être déclaré « mort » par-delà sa propre
+      fenêtre. Weekly n'est donc jamais filtré (plancher 0,368 > 0,05), H4
+      l'est au-delà d'environ 749 barres, Daily est à la limite et ne l'est
+      quasiment jamais.
+
+    Depuis l'audit-3 (ROUTE-1), ce poids ne pilote plus la sélection de table
+    de portée : il alimente uniquement le diagnostic nb_tf_effective exporté.
     """
     try:
         age = max(int(age_bars), 0)
@@ -2369,6 +2476,10 @@ def _tf_decay_weight(tf_name: str, age_bars: Any) -> float:
         return 1.0  # âge inconnu -> on ne disqualifie pas le niveau
     ref = _AGE_REFERENCE_BARS.get(tf_name, _AGE_REFERENCE_DEFAULT)
     lam = _TF_LAMBDA.get(tf_name, 1.5)
+    key_tf = str(tf_name).lower()
+    win = _DETECTION_WINDOW_BY_TF.get(key_tf) or _FETCH_LIMIT_BY_TF.get(key_tf)
+    if win:
+        age = min(age, int(win))  # AUDIT-3 : fenêtre = âge effectif maximum
     return float(np.exp(-lam * (age / max(ref, 1))))
 
 
@@ -2464,6 +2575,8 @@ def _score_and_classify_group(
             if cluster_low > 0 else None
         ),
         "width_pct_denominator": "current_price",
+        # AUDIT-3 (OPUS F3) : chaque ratio a SON dénominateur nommé.
+        "width_pct_of_low_denominator": "cluster_low",
         "span_cap_mult": _CONFLUENCE_MAX_SPAN_MULT,
         "note": "Étendue de la composante de clustering complète. NON scorée : "
                 "Niveau/Score/per_timeframe portent sur zone_bounds. "
@@ -2489,12 +2602,24 @@ def _score_and_classify_group(
             edge_gap = 0.0  # prix DANS la zone
         distance_atr_edge = round(edge_gap / atr_med, 3)
 
-    nb_tf_eff = _effective_tf_count(group)      # PATCH NBTF-1
-    reach_p = _reach_probability(distance_atr, nb_tf_eff)
-    _rmeta = _reach_bucket_meta(distance_atr, nb_tf_eff)  # PATCH REACH-2/NBTF-1
+    # PATCH NBTF-1 -> ROUTE-1 (audit-3 A5/B5) : nb_tf_effective NE PILOTE PLUS
+    # la table de portée. Audit-2 l'avait branché sur le sélecteur de table ;
+    # l'audit-3 a démontré (a) un biais train/serve — les tables §5.6 sont
+    # ajustées sur le mono/multi BRUT observé, pas sur un comptage filtré —
+    # et (b) une non-monotonité : retirer un TF AUGMENTAIT reach_probability
+    # (mono 0.711 > multi 0.690 en 2-4 ATR ; 0.500 > 0.438 en 4-8 ATR), le
+    # « garde-fou » n'était défavorable que dans la tranche >8 ATR où deux
+    # zones ne sont pas départageables. La sélection revient donc au Nb TF
+    # BRUT (régime calibré) ; le diagnostic d'ancienneté reste exporté.
+    nb_tf_eff = _effective_tf_count(group)  # NBTF-1 : diagnostic, ne route plus
+    reach_p = _reach_probability(distance_atr, nb_tf)
+    _rmeta = _reach_bucket_meta(distance_atr, nb_tf)  # PATCH REACH-2 (brut)
     expected_hold = (
         round(reach_p * _RESPECT_GIVEN_TOUCH_GLOBAL, 4) if reach_p is not None else None
     )
+    # AUDIT-3 : détails consommés par les champs additifs du return (B3/F2/H1).
+    per_tf = _zone_per_timeframe(group)
+    has_synthetic = any(p.get("level_origin") == "trend_regression" for p in per_tf)
 
     return {
         # --- Champs originaux (ne pas modifier : compatibilité dashboards) ---
@@ -2519,9 +2644,12 @@ def _score_and_classify_group(
         "pivot_bias": None,
         # --- Enrichissements schéma v2.0 ---
         "zone_id": compute_zone_id(symbol, level_round, ctype),
+        # AUDIT-3 (G1) : id SANS le type — suit le niveau à travers les
+        # traversées Pivot <-> Support/Resistance (zone_id reste l'original).
+        "zone_id_stable": compute_zone_id_stable(symbol, level_round),
         "distance_atr": distance_atr,
         "zone_bounds": {"low": bounds_low, "high": bounds_high},
-        "per_timeframe": _zone_per_timeframe(group),
+        "per_timeframe": per_tf,
         "confidence_tier": None,
         # --- Enrichissements v2.1 (PATCH BOUNDS-1 / DIST-1 / REACH-1) ---
         "zone_width_pct": zone_width_pct,
@@ -2529,7 +2657,16 @@ def _score_and_classify_group(
         "atr_reference": round(atr_med, 8) if atr_med else None,
         "distance_atr_edge": distance_atr_edge,
         "price_inside_zone": bool(bounds_low <= safe_cp <= bounds_high),
+        # AUDIT-3 (F2/KIMI #13) : 35,6 % des zones sont PONCTUELLES (bornes
+        # égales). Flag explicite : une bande nulle n'est pas un bug, c'est un
+        # point — le consumer qui dessine un couloir doit le savoir.
+        "zone_is_degenerate": bool(bounds_low == bounds_high),
         "reach_probability": reach_p,
+        # AUDIT-3 (B3) : la fréquence §5.6 est mesurée sur horizon 120 barres
+        # H4 (~20 jours). Sans ce champ, la valeur n'engage à aucune échéance.
+        "reach_horizon_bars": _REACH_HORIZON_BARS,
+        "reach_horizon_tf": _REACH_HORIZON_TF,
+        "has_synthetic_level": has_synthetic,
         "reach_bucket_n": _rmeta["n"],
         "reach_is_discriminant": _rmeta["is_discriminant"],
         "nb_tf_effective": nb_tf_eff,
@@ -2544,34 +2681,11 @@ def _score_and_classify_group(
     }
 
 
-class _UnionFind:
-    """Union-Find (disjoint set) pour le clustering 1D des confluences."""
-
-    def __init__(self, n: int) -> None:
-        self.parent = list(range(n))
-        self.rank = [0] * n
-
-    def find(self, x: int) -> int:
-        """Trouve la racine avec compression de chemin."""
-        root = x
-        while self.parent[root] != root:
-            root = self.parent[root]
-        while self.parent[x] != root:
-            self.parent[x], x = root, self.parent[x]
-        return root
-
-    def union(self, x: int, y: int) -> None:
-        """Fusionne deux ensembles par rang."""
-        rx, ry = self.find(x), self.find(y)
-        if rx == ry:
-            return
-        if self.rank[rx] < self.rank[ry]:
-            self.parent[rx] = ry
-        elif self.rank[rx] > self.rank[ry]:
-            self.parent[ry] = rx
-        else:
-            self.parent[ry] = rx
-            self.rank[rx] += 1
+# (Classe _UnionFind supprimée par l'audit-3/G3 : jamais instanciée nulle part
+#  — grep vérifié — et son nom faisait croire à une fusion transitive alors que
+#  _cluster_levels_union_find est un balayage linéaire à une passe, ancré sur
+#  le premier membre. Voir la docstring de cette fonction pour la limite
+#  caractérisée G2.)
 
 
 # PATCH WIDTH-1 — plafond de largeur des composantes de confluence.
@@ -2780,6 +2894,11 @@ async def _fetch_live_prices(client, session, sem, symbols):
     """
     tasks = [client.fetch_price(session, sem, sym) for sym in symbols]
     res = await asyncio.gather(*tasks, return_exceptions=True)
+    # AUDIT-3 (H5) : return_exceptions=True avalerait l'erreur d'auth comme un
+    # échec de fetch ordinaire -> propager explicitement.
+    for _item in res:
+        if isinstance(_item, OandaAuthError):
+            raise _item
     prices: Dict[str, Optional[float]] = {}
     price_sources: Dict[str, Optional[str]] = {}
     for sym, item in zip(symbols, res):
@@ -2808,6 +2927,9 @@ async def _fetch_candles_cube(client, session, sem, symbols):
     ]
     res = await asyncio.gather(*tasks, return_exceptions=True)
     for item in res:
+        if isinstance(item, OandaAuthError):
+            # AUDIT-3 (H5) : auth = fatal, pas de TF vide silencieux.
+            raise item
         if isinstance(item, BaseException):
             _LOG.warning("Candle fetch task failed: %s", type(item).__name__)
             continue
@@ -3018,7 +3140,9 @@ def _process_tf_frame(ctx: _TFProcessingContext):
         )
         uniq = _rows_from_zones(sup, res, row_ctx)
         return (uniq if uniq else None), (sup, res), price_ctx, debug
-    except (ValueError, KeyError, TypeError) as e:
+    except (ValueError, KeyError, TypeError, DataValidationError) as e:
+        # AUDIT-3 (OPUS H8) : DataValidationError doit tuer LA FRAME, pas le
+        # scan entier (le filet STRICT_DATA_VALIDATION lève cette classe).
         _LOG.warning("TF processing error %s/%s: %s", ctx.symbol, ctx.tf_name, type(e).__name__)
         debug["error"] = type(e).__name__
         return None, None, "", debug
@@ -3062,14 +3186,23 @@ _BOUNDS_CORRUPTION_FACTOR: Final[float] = 10.0
 
 def _validate_price_bounds_post(
     current_price: float, profile: InstrumentProfile
-) -> Tuple[Optional[float], Optional[str]]:
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     """Vérifie que le prix est dans les bornes autorisées.
 
     PATCH 2 — méta-audit validé, risque LOW :
     Remplace l'interruption systématique par un warning + clipping sécurisé.
     Si l'écart dépasse _BOUNDS_CORRUPTION_FACTOR × la borne, le prix est
     considéré corrompu et le scan est interrompu (retour None, erreur).
-    Retourne (prix_corrigé_ou_None, erreur_ou_None).
+    Retourne (prix_corrigé_ou_None, erreur_ou_None, note_ecretement_ou_None).
+
+    PATCH CLIP-1 (audit-3, OPUS H4) : le prix écrêté était exporté sans trace.
+    flag_data_anomaly est appelé APRÈS l'écrêtage, avec une comparaison
+    stricte (borne < prix) : borne == prix ne déclenche JAMAIS rien. Un token
+    de gap légitime hors bornes produisait donc un current_price FABRIQUÉ,
+    étiqueté live, sans anomalie. Le 3e élément du retour propage désormais la
+    substitution dans `anomalies` de l'actif (UI, PDF, JSON). Le clipping est
+    conservé (un profil à bornes étroites ne doit pas aveugler 32 autres
+    actifs) mais ne sera plus jamais silencieux : un prix fabriqué se dit.
     Appelant unique : _process_symbol (vérifié par grep, un seul call-site).
     """
     low  = profile.price_min
@@ -3077,23 +3210,33 @@ def _validate_price_bounds_post(
 
     if low is not None and current_price < low:
         if current_price < low / _BOUNDS_CORRUPTION_FACTOR:
-            return None, f"PRIX CORROMPU ({current_price:.2f} << {low:.0f})"
+            return None, f"PRIX CORROMPU ({current_price:.2f} << {low:.0f})", None
         _LOG.warning(
             "Prix hors borne basse pour %s : %.2f < %.0f — clipping appliqué",
             profile.symbol, current_price, low,
         )
-        return low, None
+        note = (
+            f"PRIX HORS BORNE BASSE DU PROFIL : {current_price:.5g} ramené à "
+            f"{low:.5g} — distances calculées sur ce prix substitué ; élargir "
+            f"price_min du profil"
+        )
+        return low, None, note
 
     if high is not None and current_price > high:
         if current_price > high * _BOUNDS_CORRUPTION_FACTOR:
-            return None, f"PRIX CORROMPU ({current_price:.2f} >> {high:.0f})"
+            return None, f"PRIX CORROMPU ({current_price:.2f} >> {high:.0f})", None
         _LOG.warning(
             "Prix hors borne haute pour %s : %.2f > %.0f — clipping appliqué",
             profile.symbol, current_price, high,
         )
-        return high, None
+        note = (
+            f"PRIX HORS BORNE HAUTE DU PROFIL : {current_price:.5g} ramené à "
+            f"{high:.5g} — distances calculées sur ce prix substitué ; élargir "
+            f"price_max du profil"
+        )
+        return high, None, note
 
-    return current_price, None
+    return current_price, None, None
 
 
 def _collect_tf_data(
@@ -3213,7 +3356,9 @@ def _process_symbol(
         )
         if current_price is None:
             return ScanResult(symbol, {}, {}, None, {}, {}, scan_error="Aucune donnee disponible")
-        current_price, bounds_err = _validate_price_bounds_post(current_price, profile)
+        current_price, bounds_err, clip_note = _validate_price_bounds_post(
+            current_price, profile
+        )
         if bounds_err:
             return ScanResult(symbol, {}, {}, None, {}, {}, scan_error=bounds_err)
         (
@@ -3235,6 +3380,10 @@ def _process_symbol(
         # après gap d'ouverture. Signalé dans l'expander anomalies Streamlit UI.
         if cp_source == "stale":
             anomaly = f"{anomaly} | Prix STALE (marché fermé)" if anomaly else "Prix STALE (marché fermé)"
+        if clip_note:
+            # PATCH CLIP-1 (audit-3) : le prix de travail n'est pas le prix
+            # reçu -> trace visible, jamais un prix fabriqué silencieux.
+            anomaly = f"{anomaly} | {clip_note}" if anomaly else clip_note
         return ScanResult(
             symbol,
             rows,
@@ -3250,7 +3399,8 @@ def _process_symbol(
             spans_map=spans_map,  # PATCH COV-1
             current_price_source=cp_source,
         )
-    except (ValueError, KeyError, TypeError) as e:
+    except (ValueError, KeyError, TypeError, DataValidationError) as e:
+        # AUDIT-3 (OPUS H8) : échec par actif, pas avortement du scan.
         _LOG.exception("Symbol processing error: %s", symbol)
         return ScanResult(
             symbol, {}, {}, None, {}, {}, scan_error=f"Erreur interne : {type(e).__name__}"
@@ -3658,16 +3808,22 @@ def _data_window_from_bars(bars_map: Optional[dict], spans_map: Optional[dict] =
             "window_end": min(lasts).isoformat() if lasts else None,
         }
 
-    # PATCH PERF-4 (partie retenue) : verdict AGRÉGÉ — la couverture « >= 3 ans »
-    # s'apprécie AU NIVEAU DU SCAN, pas par TF isolée.
-    out["scan_coverage_ok_3y"] = any(
-        isinstance(v, dict) and v.get("coverage_ok_3y") for v in out.values()
-    )
-    out["scan_coverage_note"] = (
-        "Couverture >= 3 ans appréciée au niveau du SCAN (au moins un TF). "
-        "H4 est borné à sa fenêtre de détection pour la détection ; sa "
-        "profondeur fetchée sert à l'affichage et au walk-forward H4."
-    )
+    # PATCH PERF-4 -> AUDIT-3 (OPUS H10) : les deux scalaires sont NICHÉS sous
+    # "scan" pour que data_window et diagnostics.coverage_summary restent des
+    # maps HOMOGÈNES de dicts (un consommateur qui itère ne heurte plus un
+    # bool/str). Le verdict est calculé avant l'ajout, sur les seules entrées
+    # par TF. Verdict AGRÉGÉ : la couverture >= 3 ans s'apprécie au niveau du
+    # SCAN, pas par TF isolée.
+    out["scan"] = {
+        "coverage_ok_3y": any(
+            isinstance(v, dict) and v.get("coverage_ok_3y") for v in out.values()
+        ),
+        "note": (
+            "Couverture >= 3 ans appréciée au niveau du SCAN (au moins un TF). "
+            "H4 est borné à sa fenêtre de détection pour la détection ; sa "
+            "profondeur fetchée sert à l'affichage et au walk-forward H4."
+        ),
+    }
     return out
 
 
@@ -3783,6 +3939,18 @@ def create_json_export(
                 "reach_probability (fréquence de PORTÉE agrégée par tranche ; "
                 "uniquement ordonnable si reach_is_discriminant est true — dans "
                 "la tranche >8 ATR, deux zones ne sont pas départageables)",
+                # --- additions AUDIT-3 ---
+                "expected_hold_probability (reach_p × 0,14 : AUCUNE information "
+                "au-delà de reach_probability ; le nom invite au tri, n'en "
+                "faites pas — OPUS B4)",
+                "nb_tf_effective / nb_tf_decay_filtered (diagnostic "
+                "d'ancienneté ; ne pilote PLUS la table de portée depuis "
+                "ROUTE-1 audit-3 — OPUS A6)",
+                "Score / Force Totale sans vérifier has_synthetic_level et "
+                "level_origin : les niveaux trend_regression portent une force "
+                "SYNTHÉTIQUE 15/25 avec age 0 et dominent le haut du "
+                "classement (OPUS H1 : scores max 215,9/215,0 synthétiques vs "
+                "111,8 meilleure zone à âge réel)",
             ],
             "zone_bounds_semantics": "Étendue des niveaux SCORÉS (un par TF). "
                 "cluster_bounds décrit la composante de clustering complète, non scorée.",
@@ -3791,6 +3959,27 @@ def create_json_export(
             "price_context": "Champ TEXTE indicatif, dérivé des niveaux Daily BRUTS. "
                 "Ne correspond PAS forcément à une zone de `zones`. Utiliser "
                 "`nearest_zones` pour un lien fiable par zone_id.",
+            # --- AUDIT-3 : quatre promesses tenues noir sur blanc ---
+            "reach_routing_note": "reach_probability sélectionné sur le Nb TF "
+                "BRUT (régime d'ajustement §5.6, ROUTE-1). Les tables MONO et "
+                "MULTI ne sont PAS ordonnées dans le même sens selon la "
+                "tranche (2-4 ATR : 0,711 mono > 0,690 multi) — tout routage "
+                "par comptage filtré (nb_tf_effective) inverserait distance et "
+                "portée : ne pas réintroduire.",
+            "zone_lifecycle_note": "Suivre une zone à travers les traversées de "
+                "prix via zone_id_stable (symbol+niveau, sans type) ; zone_id "
+                "change quand le Type bascule Pivot<->Support/Resistance. Les "
+                "zones Consommee sont ÉCARTÉES de l'export en amont : leur "
+                "disparition est le seul signal de consommation.",
+            "zone_bounds_degenerate_note": "zone_bounds.low == high possible "
+                "(zones ponctuelles ; mesuré 156/438 = 35,6 % au scan du "
+                "2026-09-13) — voir zone_is_degenerate par zone ; synthétiser "
+                "une bande (ex. ±0,25 × atr_reference) pour le rendu.",
+            "run_id_scope_note": "run_id (RUNID-2) = empreinte de l'ARTEFACT "
+                "complet : zones + versions schema/scanner/calibration + "
+                "plafond + fenêtres + filtres d'export. Tout changement de "
+                "paramètres de production change l'empreinte même à zones "
+                "identiques -> sûr pour la déduplication merger.",
         },
         "assets": [],
     }
@@ -3911,10 +4100,28 @@ def create_json_export(
     output["assets"].sort(key=lambda x: x["symbol"])
 
     # PATCH RUNID-1 : hash déterministe sur le CONTENU non volatil.
+    # PATCH RUNID-2 (audit-3, OPUS D2 / KIMI §D) : l'empreinte devient celle de
+    # l'ARTEFACT complet, plus des seules zones. Un redéploiement changeant
+    # version de scanner, profil de calibration, plafond, fenêtres de détection
+    # ou filtres SANS changer le jeu de zones produisait le MÊME run_id ; une
+    # déduplication par run_id pouvait fusionner deux artefacts de code
+    # différent (D3 : relâcher un filtre sans admettre de zone nouvelle aussi).
+    # generated_at reste hors hash : l'empreinte demeure fonction du contenu.
     _volatile = {"current_price_timestamp", "price_timestamp_note"}
-    hash_payload = [
-        {k: v for k, v in a.items() if k not in _volatile} for a in output["assets"]
-    ]
+    hash_payload = {
+        "run_parameters": {
+            "schema_version": output["schema_version"],
+            "scanner_version": output["scanner_version"],
+            "calibration_profile_version": output["calibration_profile_version"],
+            "export_filters_applied": output["export_filters_applied"],
+            "detection_window_by_tf": output["detection_window_by_tf"],
+            "confluence_width_cap": output["confluence_width_cap"],
+        },
+        "assets": [
+            {k: v for k, v in a.items() if k not in _volatile}
+            for a in output["assets"]
+        ],
+    }
     output["run_id"] = hashlib.sha1(
         json.dumps(hash_payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     ).hexdigest()[:16]

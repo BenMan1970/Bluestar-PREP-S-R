@@ -238,7 +238,10 @@ with st.sidebar:
 scan_button = st.button(
     "🚀 LANCER LE SCAN COMPLET",
     type="primary",
-    use_container_width=True,
+    # AUDIT-3 (E1) : migration officielle de use_container_width (dépréciée,
+    # warning mesuré sous 1.63). Le DÉFAUT du bouton est "content" (vérifié
+    # par inspect) -> width="stretch" explicite pour conserver la pleine largeur.
+    width="stretch",
     disabled=_is_scanning_locked(st.session_state) or not (access_token and account_id),
 )
 
@@ -308,6 +311,7 @@ if st.session_state.get("pending_scan", False):
         st.error("Identifiants OANDA manquants")
         st.session_state.pop("scanning_lock_ts", None)
     else:
+        scan_ok = False
         try:
             with st.spinner("Scan en cours..."):
                 _execute_scan(
@@ -324,14 +328,27 @@ if st.session_state.get("pending_scan", False):
                     json_statuts,
                     oanda_env_cfg,
                 )
-            st.session_state.pop("scanning_lock_ts", None)
-            st.rerun()
+            scan_ok = True
         except (ScanTimeoutError, OandaAuthError, KeyError, ValueError) as e:
             st.error(f"Scan interrompu : {type(e).__name__} — {e}")
-            st.session_state.pop("scanning_lock_ts", None)
         except Exception as e:  # noqa: BLE001 — ne jamais laisser le lock coincé.
             st.error(f"Erreur inattendue : {type(e).__name__} — {e}")
+        finally:
+            # AUDIT-3 (OPUS C3 / KIMI #5) : le verrou se libère sur TOUTES les
+            # sorties, y compris l'exception de contrôle (Rerun/Stop). MESURÉ
+            # sur streamlit 1.63 : RerunException hérite de BaseException ->
+            # elle filtrait entre les deux except ci-dessus et laissait le
+            # verrou posé jusqu'au TTL 900 s si une interaction arrivait pendant
+            # le scan ou si l'onglet se déconnectait en cours de route.
             st.session_state.pop("scanning_lock_ts", None)
+        # AUDIT-3 : st.rerun() SORTI du try — sur streamlit <1.38 RerunException
+        # hérite d'Exception et aurait été capturée par le catch-all (erreur
+        # fantôme après un scan réussi). Le rerun ne se fait que sur succès :
+        # le faire aussi sur erreur effacerait le message st.error qui vient
+        # d'être rendu (le bouton reste grisé jusqu'à la prochaine interaction
+        # — résiduel cosmétique documenté, verrou libéré lui est garanti).
+        if scan_ok:
+            st.rerun()
 
 
 def _render_messages(res: dict, show_debug: bool) -> None:
@@ -381,9 +398,12 @@ def _render_confluences(res: dict, max_dist_filter: float) -> None:
         ] if c in filtered_c.columns
     ]
     sort_col = "distance_atr" if "distance_atr" in filtered_c.columns else "Score"
+    # AUDIT-3 (E1, correctif asymétrique OPUS) : pas de kwarg ici — le DÉFAUT
+    # de st.dataframe est width="stretch" (vérifié par inspect sur 1.63),
+    # exactement ce que faisait use_container_width=True. Retirer le kwarg
+    # supprime le warning sans changer le rendu.
     st.dataframe(
         filtered_c[cols].sort_values(sort_col, ascending=(sort_col == "distance_atr")),
-        use_container_width=True,
     )
     st.caption(
         "`reach_probability` = fréquence de RETOUCHE observée pour cette tranche de "
@@ -403,10 +423,52 @@ def _render_tf_tables(res: dict, max_dist_filter: float) -> None:
                 continue
             df_f = df.copy()
             df_f["dist_num"] = _coerce_dist_num(df_f["Dist. %"])
+            # AUDIT-3 (E1) : défaut "stretch" — kwarg retiré (cf. _render_confluences).
             st.dataframe(
                 df_f[df_f["dist_num"] <= max_dist_filter].drop(columns=["dist_num"]),
-                use_container_width=True,
             )
+
+
+@st.cache_data(
+    ttl=600, show_spinner=False,
+    hash_funcs={pd.DataFrame: _hash_df, pd.Series: _hash_series},
+)
+def _build_export_bytes(
+    res, json_max_dist, json_min_score, json_statuts,
+    llm_max_dist, llm_min_score, llm_statuts,
+):
+    """Construit (PDF, JSON, brief LLM) — UNE fois par (résultat, filtres).
+
+    AUDIT-3 (OPUS C6) : AVANT, les trois fabrications lourdes — dont l'export
+    JSON ~1 Mo — tournaient à CHAQUE rerun, donc à chaque coup de curseur.
+    La clé de cache est fonction du contenu (hash complet mesuré, batch B) et
+    des filtres : toute dérive invalide naturellement. Les tuples sont passés
+    plutôt que les listes pour un hashable stable.
+    """
+    pdf_anomalies = {
+        s: m for s, m in (res["anomalies"] or {}).items()
+        if m.strip() != "Prix STALE (marché fermé)"
+    }
+    pdf_b = create_pdf_report(
+        res["report_dict"], res["conf_full"], res["summaries"], pdf_anomalies or None
+    )
+    json_b = create_json_export(
+        res["summaries"],
+        res["conf_full"],
+        json_max_dist,
+        json_min_score,
+        json_statuts,
+        scan_errors=res.get("scan_errors"),
+        missing_tfs_map=res.get("missing_tfs_map"),
+        anomalies=res.get("anomalies"),
+        bars_map=res.get("bars_map"),
+        spans_map=res.get("spans_map"),
+        calibration_profile_version=core.CALIBRATION_PROFILE_VERSION,
+    )
+    llm_b = create_llm_brief(
+        res["summaries"], res["conf_full"], llm_max_dist, llm_min_score, llm_statuts
+    )
+    return pdf_b, json_b, llm_b
 
 
 def _render_downloads(
@@ -415,39 +477,25 @@ def _render_downloads(
 ) -> None:
     """Affiche les boutons de téléchargement (PDF / JSON / LLM)."""
     st.divider()
+    pdf_b, json_b, llm_b = _build_export_bytes(
+        res,
+        json_max_dist,
+        json_min_score,
+        tuple(json_statuts),
+        llm_max_dist,
+        llm_min_score,
+        tuple(llm_statuts),
+    )
     col1, col2, col3 = st.columns(3)
     with col1:
-        pdf_anomalies = {
-            s: m for s, m in (res["anomalies"] or {}).items()
-            if m.strip() != "Prix STALE (marché fermé)"
-        }
-        pdf_b = create_pdf_report(
-            res["report_dict"], res["conf_full"], res["summaries"], pdf_anomalies or None
-        )
         st.download_button("📄 PDF", data=pdf_b, file_name="rapport_bluestar.pdf")
     with col2:
-        json_b = create_json_export(
-            res["summaries"],
-            res["conf_full"],
-            json_max_dist,
-            json_min_score,
-            tuple(json_statuts),
-            scan_errors=res.get("scan_errors"),
-            missing_tfs_map=res.get("missing_tfs_map"),
-            anomalies=res.get("anomalies"),
-            bars_map=res.get("bars_map"),
-            spans_map=res.get("spans_map"),
-            calibration_profile_version=core.CALIBRATION_PROFILE_VERSION,
-        )
         st.download_button(
             "🔧 JSON (merger)", data=json_b, file_name="supports et resistances.json",
             mime="application/json",
         )
     with col3:
-        llm_bytes = create_llm_brief(
-            res["summaries"], res["conf_full"], llm_max_dist, llm_min_score, tuple(llm_statuts)
-        )
-        st.download_button("🤖 LLM Brief", data=llm_bytes, file_name="brief_llm.md")
+        st.download_button("🤖 LLM Brief", data=llm_b, file_name="brief_llm.md")
 
 
 if "scan_results" in st.session_state:
