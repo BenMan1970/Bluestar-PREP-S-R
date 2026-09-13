@@ -34,6 +34,7 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -71,6 +72,12 @@ CALIBRATION_PROFILE_VERSION: Final[str] = "v1-2026-09-12 (Phase 3 — recalibrag
 # aucun calcul, aucune clé ajoutée à scan_results. Mettre à True uniquement
 # pour le diagnostic du pipeline de détection. Aucun effet sur la logique métier.
 DEBUG_INSTRUMENTATION: Final[bool] = False
+
+# PATCH VALID-2 (audit-2) — rend validate_ohlc_frame (et DataValidationError)
+# vivants. False en production : comportement strictement inchangé. True dans le
+# harnais de collecte / recalibration pour échouer BRUYAMMENT sur données
+# corrompues. (VALID-1 documentait l'intention ; le branchement était resté absent.)
+STRICT_DATA_VALIDATION: Final[bool] = os.environ.get("BLUESTAR_STRICT_DATA") == "1"
 
 _TOKEN_REDACT_PATTERNS: Final[List[re.Pattern]] = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.IGNORECASE),
@@ -343,6 +350,14 @@ _SCAN_LOCK_TTL_S: Final[float] = 900.0
 _AGE_REFERENCE_BARS: Final[Dict[str, int]] = {"H4": 500, "Daily": 500, "Weekly": 500}
 _AGE_REFERENCE_DEFAULT: Final[int] = 500
 
+# PATCH NBTF-1 (audit-2) — poids de décroissance minimal pour qu'un niveau
+# COMPTE dans nb_tf_effective. Ce n'est PAS une valeur calibrée : c'est un seuil
+# de gouvernance, choisi pour écarter les niveaux dont la décroissance d'âge
+# BRUTE (hors fenêtre de calibration §5.2, 500 bougies) est sous 5 % de leur
+# poids nominal. Le score n'est PAS modifié ; seule la sélection de la table de
+# portée l'est. Retour arrière : mettre 0.0 (comportement d'avant).
+_NB_TF_MIN_DECAY_WEIGHT: Final[float] = 0.05
+
 # ------------------------------------------------------------------------------
 # PATCH DEPTH-1 (Phase 2/3, point 5) — profondeur d'historique par TF.
 #
@@ -358,6 +373,13 @@ _AGE_REFERENCE_DEFAULT: Final[int] = 500
 #   Weekly : 1000 bougies ≈ 19 ans (l'historique OANDA W remonte à 2002)
 # L'API plafonne `count` à 5000 (mesuré : 5001 -> HTTP 400). Aucune valeur ne
 # dépasse ce plafond.
+# DECISION AUDIT-2 (2026-09-13, MESURÉE — patch 7 verbatim non retenu sur ce
+# point) : la réduction h4 5000 -> 1600 a été écartée car chronométrée sans
+# effet (0,63 s vs 0,60 s par requête ; parsing vectorisé ~30 ms/5000 bougies),
+# donc < 2 s de gain sur un scan de 15,3 s, payés d'une perte d'historique
+# affichable. Le verdict agrégé scan_coverage_ok_3y (PATCH PERF-4 dans
+# _data_window_from_bars) lève l'ambiguïté de lecture qui était le seul enjeu
+# réel. Ratio octets mesuré : 3,12x (683 915 vs 219 030).
 _FETCH_LIMIT_BY_TF: Final[Dict[str, int]] = {"h4": 5000, "daily": 1500, "weekly": 1000}
 _FETCH_LIMIT_DEFAULT: Final[int] = 500
 
@@ -2314,6 +2336,63 @@ def _reach_bucket_label(distance_atr: Optional[float]) -> Optional[str]:
     return ">8 ATR"
 
 
+def _reach_bucket_meta(distance_atr: Optional[float], nb_tf: int) -> Dict[str, Any]:
+    """Effectif et pouvoir discriminant de la tranche de portée (PATCH REACH-2).
+
+    La tranche terminale (>8 ATR) est bornée à droite par l'infini : la
+    fréquence y reste exacte en agrégat mais ne permet PAS d'ordonner deux
+    zones entre elles. Le merger doit lire reach_is_discriminant avant de
+    trier sur reach_probability.
+    """
+    if distance_atr is None or not np.isfinite(distance_atr):
+        return {"n": None, "is_discriminant": None}
+    table = _REACH_BY_DIST_ATR_MULTI_TF if nb_tf >= 2 else _REACH_BY_DIST_ATR_MONO_TF
+    for upper, _rate, n in table:
+        if distance_atr < upper:
+            return {"n": int(n), "is_discriminant": bool(np.isfinite(upper))}
+    return {"n": int(table[-1][2]), "is_discriminant": False}
+
+
+def _tf_decay_weight(tf_name: str, age_bars: Any) -> float:
+    """Poids de décroissance d'âge d'un niveau, NON borné (PATCH NBTF-1).
+
+    PRÉCISION FORENSIQUE (vérifiée à l'application de l'audit-2) : ce n'est PAS
+    la formule de compute_structural_score, qui CLIPPE age_r dans [0, 1] — un
+    pivot H4 de 1400 barres y vaut exp(-2*1)=0.135 (plancher), jamais 0.004.
+    Ici la décroissance est calculée sans clip, volontairement : le seuil vise
+    l'âge HORS fenêtre de calibration (§5.2 : 500 bougies), pas la contribution
+    au score. C'est ce qui distingue NBTF-1 d'un simple écrasement de score.
+    """
+    try:
+        age = max(int(age_bars), 0)
+    except (TypeError, ValueError):
+        return 1.0  # âge inconnu -> on ne disqualifie pas le niveau
+    ref = _AGE_REFERENCE_BARS.get(tf_name, _AGE_REFERENCE_DEFAULT)
+    lam = _TF_LAMBDA.get(tf_name, 1.5)
+    return float(np.exp(-lam * (age / max(ref, 1))))
+
+
+def _effective_tf_count(
+    group: pd.DataFrame, min_weight: float = _NB_TF_MIN_DECAY_WEIGHT
+) -> int:
+    """Nombre de TF dont au moins un niveau pèse encore (PATCH NBTF-1).
+
+    Repli strict : si aucune colonne d'âge n'est présente, retourne le compte
+    brut -> comportement d'avant strictement conservé, aucune régression.
+    """
+    age_col = next(
+        (c for c in ("age_bars", "age", "bars_ago") if c in group.columns), None
+    )
+    if age_col is None:
+        return int(group["tf"].nunique())
+    alive = {
+        str(tf)
+        for tf, age in zip(group["tf"], group[age_col])
+        if _tf_decay_weight(str(tf), age) >= min_weight
+    }
+    return max(int(len(alive)), 1)
+
+
 def _score_and_classify_group(
     group: pd.DataFrame,
     current_price: float,
@@ -2376,8 +2455,19 @@ def _score_and_classify_group(
         "high": cluster_high,
         "members": int(len(cluster)),
         "width_pct": round((cluster_high - cluster_low) / safe_cp * 100.0, 4),
+        # PATCH WIDTH-2 : dénominateur ALIGNÉ sur celui du plafond réellement
+        # appliqué dans _cluster_levels_union_find (borne basse du cluster, pas
+        # current_price). C'est CE ratio, et lui seul, que le merger doit
+        # comparer à confluence_threshold * span_cap_mult.
+        "width_pct_of_low": (
+            round((cluster_high - cluster_low) / cluster_low * 100.0, 4)
+            if cluster_low > 0 else None
+        ),
+        "width_pct_denominator": "current_price",
+        "span_cap_mult": _CONFLUENCE_MAX_SPAN_MULT,
         "note": "Étendue de la composante de clustering complète. NON scorée : "
-                "Niveau/Score/per_timeframe portent sur zone_bounds.",
+                "Niveau/Score/per_timeframe portent sur zone_bounds. "
+                "Contrôler le plafond via width_pct_of_low, jamais width_pct.",
     }
 
     # ATR médian des TF représentées, utilisé pour les deux distances ATR.
@@ -2399,7 +2489,9 @@ def _score_and_classify_group(
             edge_gap = 0.0  # prix DANS la zone
         distance_atr_edge = round(edge_gap / atr_med, 3)
 
-    reach_p = _reach_probability(distance_atr, nb_tf)
+    nb_tf_eff = _effective_tf_count(group)      # PATCH NBTF-1
+    reach_p = _reach_probability(distance_atr, nb_tf_eff)
+    _rmeta = _reach_bucket_meta(distance_atr, nb_tf_eff)  # PATCH REACH-2/NBTF-1
     expected_hold = (
         round(reach_p * _RESPECT_GIVEN_TOUCH_GLOBAL, 4) if reach_p is not None else None
     )
@@ -2438,6 +2530,10 @@ def _score_and_classify_group(
         "distance_atr_edge": distance_atr_edge,
         "price_inside_zone": bool(bounds_low <= safe_cp <= bounds_high),
         "reach_probability": reach_p,
+        "reach_bucket_n": _rmeta["n"],
+        "reach_is_discriminant": _rmeta["is_discriminant"],
+        "nb_tf_effective": nb_tf_eff,
+        "nb_tf_decay_filtered": bool(nb_tf_eff < nb_tf),
         "reach_distance_bucket": _reach_bucket_label(distance_atr),
         "reach_basis": "empirical_frequency_§5.6" if reach_p is not None else None,
         "respect_given_touch_global": _RESPECT_GIVEN_TOUCH_GLOBAL,
@@ -2630,6 +2726,8 @@ class ScanResult:
     debug_info: Dict[str, Any] = field(default_factory=dict)
     # SR-1: source du prix courant ("live" | "candle_close" | "stale" | None)
     current_price_source: Optional[str] = None
+    # PATCH COV-1 : empan calendaire réel par TF (dicts first/last/span_days)
+    spans_map: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -2883,6 +2981,8 @@ def _process_tf_frame(ctx: _TFProcessingContext):
     }
     try:
         det_df = _detection_frame(ctx.dataframe, ctx.tf_key)
+        if STRICT_DATA_VALIDATION:
+            validate_ohlc_frame(det_df, ctx.profile, context=f"{ctx.symbol}/{ctx.tf_name}")
         debug["bars_fetched"] = int(len(ctx.dataframe)) if ctx.dataframe is not None else 0
         debug["bars_detection"] = int(len(det_df)) if det_df is not None else 0
 
@@ -3007,6 +3107,7 @@ def _collect_tf_data(
     """Collecte les données pour toutes les timeframes d'un symbole."""
     rows = {"H4": None, "Daily": None, "Weekly": None}
     zones_d, trends, bars_map = {}, {}, {}
+    spans_map = {}                                    # PATCH COV-1
     debug_per_tf, missing_tfs = {}, []
     price_ctx = ""
     for tf_k, tf_name in (("h4", "H4"), ("daily", "Daily"), ("weekly", "Weekly")):
@@ -3015,6 +3116,9 @@ def _collect_tf_data(
             missing_tfs.append(tf_name)
             continue
         bars_map[tf_name] = len(df)
+        span = _tf_span_days(df)                      # PATCH COV-1
+        if span is not None:
+            spans_map[tf_name] = span
         lb, th = _TF_TREND_PARAMS.get(tf_name, (20, 2.0))
         trends[tf_name] = compute_institutional_trend(df["close"], lookback=lb, threshold=th)
         ctx = _TFProcessingContext(
@@ -3035,7 +3139,7 @@ def _collect_tf_data(
             rows[tf_name] = tf_rows
         if ctx_str:
             price_ctx = ctx_str
-    return rows, zones_d, trends, bars_map, price_ctx, missing_tfs, debug_per_tf
+    return rows, zones_d, trends, bars_map, spans_map, price_ctx, missing_tfs, debug_per_tf
 
 
 def _ratio_anomaly(current_price: float, support_levels: list, skip_ratio_check: bool) -> bool:
@@ -3117,6 +3221,7 @@ def _process_symbol(
             zones_d,
             trends,
             bars_map,
+            spans_map,
             price_ctx,
             missing_tfs,
             debug,
@@ -3142,6 +3247,7 @@ def _process_symbol(
             missing_tfs=missing_tfs,
             price_is_fallback=price_is_fallback,
             debug_info=debug,
+            spans_map=spans_map,  # PATCH COV-1
             current_price_source=cp_source,
         )
     except (ValueError, KeyError, TypeError) as e:
@@ -3460,24 +3566,108 @@ def _filter_confluences(
 _BARS_PER_YEAR: Final[Dict[str, int]] = {"H4": 1560, "Daily": 260, "Weekly": 52}
 
 
-def _data_window_from_bars(bars_map: Optional[dict]) -> dict:
-    """Fenêtre de données réellement utilisée par TF (couverture minimale garantie)."""
+def _tf_span_days(df) -> Optional[Dict[str, Any]]:
+    """Empan calendaire RÉEL d'un DataFrame OHLC (PATCH COV-1).
+
+    Retourne None si l'index n'est pas exploitable : l'appelant retombe alors
+    sur l'estimation par comptage de bougies (_BARS_PER_YEAR).
+    """
+    try:
+        idx = getattr(df, "index", None)
+        if idx is None or not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
+            return None
+        first, last = idx[0], idx[-1]
+        if pd.isna(first) or pd.isna(last):
+            return None
+        days = (last - first).total_seconds() / 86400.0
+        if not np.isfinite(days) or days <= 0:
+            return None
+        return {
+            "first": first.isoformat(),
+            "last": last.isoformat(),
+            "span_days": round(float(days), 3),
+        }
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _data_window_from_bars(bars_map: Optional[dict], spans_map: Optional[dict] = None) -> dict:
+    """Fenêtre de données réellement utilisée par TF (couverture minimale garantie).
+
+    PATCH COV-1 : `coverage_years` est désormais MESURÉ sur les dates réelles des
+    bougies quand elles sont disponibles. L'ancienne estimation
+    (n / _BARS_PER_YEAR) reste exposée sous
+    `coverage_years_estimated_from_bar_count` et sert de repli. `coverage_basis`
+    indique laquelle des deux alimente `coverage_years` et `coverage_ok_3y`.
+    """
     out: Dict[str, Any] = {}
+    spans_map = spans_map or {}
     for tf_name in ("H4", "Daily", "Weekly"):
-        counts = []
+        counts: List[int] = []
         for b in (bars_map or {}).values():
             if isinstance(b, dict) and b.get(tf_name):
                 counts.append(int(b[tf_name]))
-        if counts:
-            n = min(counts)  # couverture minimale garantie sur tous les actifs
-            years = n / _BARS_PER_YEAR.get(tf_name, 260)
+
+        days: List[float] = []
+        firsts: List[pd.Timestamp] = []
+        lasts: List[pd.Timestamp] = []
+        for s in spans_map.values():
+            rec = s.get(tf_name) if isinstance(s, dict) else None
+            if not isinstance(rec, dict):
+                continue
+            d = rec.get("span_days")
+            if isinstance(d, (int, float)) and d > 0:
+                days.append(float(d))
+            try:
+                if rec.get("first"):
+                    firsts.append(pd.Timestamp(rec["first"]))
+                if rec.get("last"):
+                    lasts.append(pd.Timestamp(rec["last"]))
+            except (ValueError, TypeError):
+                pass
+
+        if not counts:
             out[tf_name] = {
-                "candles_used": n,
-                "coverage_years": round(years, 2),
-                "coverage_ok_3y": years >= 3.0,
+                "candles_used": 0,
+                "coverage_years": 0.0,
+                "coverage_ok_3y": False,
+                "coverage_basis": "unavailable",
+                "coverage_years_estimated_from_bar_count": 0.0,
+                "window_start": None,
+                "window_end": None,
             }
+            continue
+
+        n = min(counts)  # couverture minimale garantie sur tous les actifs
+        est_years = n / _BARS_PER_YEAR.get(tf_name, 260)
+        if days:
+            years = min(days) / 365.25  # empan garanti sur tous les actifs
+            basis = "measured_calendar_span"
         else:
-            out[tf_name] = {"candles_used": 0, "coverage_years": 0.0, "coverage_ok_3y": False}
+            years = est_years
+            basis = "estimated_from_bar_count"
+
+        out[tf_name] = {
+            "candles_used": n,
+            "coverage_years": round(years, 2),
+            "coverage_ok_3y": years >= 3.0,
+            "coverage_basis": basis,
+            "coverage_years_estimated_from_bar_count": round(est_years, 2),
+            # Fenêtre commune à TOUS les actifs : début le plus tardif, fin la plus précoce.
+            "window_start": max(firsts).isoformat() if firsts else None,
+            "window_end": min(lasts).isoformat() if lasts else None,
+        }
+
+    # PATCH PERF-4 (partie retenue) : verdict AGRÉGÉ — la couverture « >= 3 ans »
+    # s'apprécie AU NIVEAU DU SCAN, pas par TF isolée.
+    out["scan_coverage_ok_3y"] = any(
+        isinstance(v, dict) and v.get("coverage_ok_3y") for v in out.values()
+    )
+    out["scan_coverage_note"] = (
+        "Couverture >= 3 ans appréciée au niveau du SCAN (au moins un TF). "
+        "H4 est borné à sa fenêtre de détection pour la détection ; sa "
+        "profondeur fetchée sert à l'affichage et au walk-forward H4."
+    )
     return out
 
 
@@ -3492,13 +3682,14 @@ def create_json_export(
     missing_tfs_map=None,
     anomalies=None,
     bars_map=None,
+    spans_map=None,          # PATCH COV-1
     data_window=None,
-    oanda_environment=None,
     calibration_profile_version=None,
 ):
     """Exporte les résultats au format JSON — SCHÉMA v2.1.
 
-    v2.1 = sur-ensemble STRICT de v2.0 (aucune clé retirée). Changements :
+    v2.1 = v2.0 enrichi, à l'exception de la clé `oanda_environment` retirée sur
+    demande (2026-09-13, le merger n'en a pas besoin). Changements :
 
     PATCH TS-1 — `current_price_timestamp` ne mentait plus.
       AVANT : `now_utc` dès que la source était "live" OU "stale". Sur l'export
@@ -3510,11 +3701,11 @@ def create_json_export(
       booléen explicite `price_is_stale` et `price_timestamp_note`. La CLÉ est
       conservée (rétro-compat) ; seule la valeur devient honnête.
 
-    PATCH ENV-2 — `oanda_environment` n'est plus silencieusement null.
-      Sur l'export v8.8.0 le champ valait null alors que le rapport annonçait
-      "practice (forcé et journalisé)" : la variable d'env n'était pas positionnée
-      et l'appelant ne threadait pas l'environnement RÉSOLU par le client. On
-      journalise désormais un avertissement au lieu d'exporter un null muet.
+    RETRAIT POST-PASSE FINALE (décision utilisateur, 2026-09-13) — l'ancienne clé
+      ENV-2 `oanda_environment` est RETIRÉE de l'export : le merger n'a pas besoin
+      de connaître l'environnement OANDA, il veut un JSON exploitable.
+      L'environnement résolu reste exposé côté core (`run_institutional_scan.last_env`)
+      pour la journalisation interne ; le run_id (hash des seuls assets) est inchangé.
 
     PATCH RUNID-1 — `run_id` réellement stable.
       AVANT : le hash portait sur `assets`, qui contenait `current_price_timestamp`
@@ -3535,20 +3726,16 @@ def create_json_export(
     missing_tfs_map = missing_tfs_map or {}
     anomalies = anomalies or {}
 
-    if not oanda_environment:
-        _LOG.warning(
-            "PATCH ENV-2 : oanda_environment non fourni -> exporté à null. "
-            "Passer l'environnement RÉSOLU par AsyncOandaClient (client.env_name) "
-            "ou définir OANDA_ENV pour rendre le run traçable."
-        )
-
-    resolved_window = data_window if data_window is not None else _data_window_from_bars(bars_map)
+    resolved_window = (
+        data_window
+        if data_window is not None
+        else _data_window_from_bars(bars_map, spans_map)
+    )
 
     output: Dict[str, Any] = {
         "schema_version": "2.1",
         "generated_at": now_utc.isoformat(),
         "scanner_version": SCANNER_VERSION,
-        "oanda_environment": oanda_environment,
         "data_window": resolved_window,
         "detection_window_by_tf": {
             "H4": _DETECTION_WINDOW_BY_TF.get("h4"),
@@ -3593,6 +3780,9 @@ def create_json_export(
                 "Nb TF / zone_tf_count (aucun avantage à distance comparable, §5.6)",
                 "Statut (artefact de composition en distance, §5.9b)",
                 "confidence_tier (toujours null, par choix : §5.7)",
+                "reach_probability (fréquence de PORTÉE agrégée par tranche ; "
+                "uniquement ordonnable si reach_is_discriminant est true — dans "
+                "la tranche >8 ATR, deux zones ne sont pas départageables)",
             ],
             "zone_bounds_semantics": "Étendue des niveaux SCORÉS (un par TF). "
                 "cluster_bounds décrit la composante de clustering complète, non scorée.",
@@ -3747,7 +3937,6 @@ def create_json_export(
         "run_id": output["run_id"],
         "generated_at": output["generated_at"],
         "scanner_version": output["scanner_version"],
-        "oanda_environment": output["oanda_environment"],
         "data_window": output["data_window"],
         "detection_window_by_tf": output["detection_window_by_tf"],
         "calibration_profile_version": output["calibration_profile_version"],
@@ -3801,6 +3990,7 @@ def _accumulate_scan_results(raw_results, progress_bar):
     results_h4, results_daily, results_weekly = [], [], []
     all_zones_map, prices_map, trends_map = {}, {}, {}
     anomalies_map, scan_errors, bars_map = {}, {}, {}
+    spans_map = {}                                                    # PATCH COV-1
     missing_tfs_map, price_fallback_map, debug_map = {}, {}, {}
     price_sources_map: Dict[str, Optional[str]] = {}
 
@@ -3812,6 +4002,7 @@ def _accumulate_scan_results(raw_results, progress_bar):
             continue
         all_zones_map[res.symbol], prices_map[res.symbol] = res.zones, res.price
         trends_map[res.symbol], bars_map[res.symbol] = res.trends, res.bars_map
+        spans_map[res.symbol] = res.spans_map                          # PATCH COV-1
         if res.anomaly:
             anomalies_map[res.symbol.replace("_", "/")] = res.anomaly
         if res.missing_tfs:
@@ -3839,6 +4030,7 @@ def _accumulate_scan_results(raw_results, progress_bar):
         "anomalies_map": anomalies_map,
         "scan_errors": scan_errors,
         "bars_map": bars_map,
+        "spans_map": spans_map,                                        # PATCH COV-1
         "missing_tfs_map": missing_tfs_map,
         "debug_map": debug_map,
         "price_sources_map": price_sources_map,
