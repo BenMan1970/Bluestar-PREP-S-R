@@ -21,6 +21,16 @@ import time
 import pandas as pd
 import streamlit as st
 
+# PATCH ENV-3 (audit-2) — lire .env en local AVANT toute lecture de secret.
+# override=False : sur Streamlit Cloud, st.secrets doit rester prioritaire sur
+# un .env résiduel. ImportError toléré : dotenv est optionnel (Cloud n'en a
+# pas besoin ; les variables d'environnement du process suffisent).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
 import bluestar_core as core
 from bluestar_core import (  # noqa: F401  (noms ré-exportés pour l'UI)
     ALL_SYMBOLS,
@@ -48,16 +58,31 @@ from bluestar_core import (  # noqa: F401  (noms ré-exportés pour l'UI)
 # ==============================================================================
 st.set_page_config(page_title="Scanner Bluestar S/R", page_icon="📡", layout="wide")
 
-# [CACHE PATCH] parité v8.7.3 : mêmes ttl / max_entries / hash_funcs.
-core.compute_atr = st.cache_data(
-    ttl=120, max_entries=512, show_spinner=False, hash_funcs={pd.DataFrame: _hash_df}
-)(core.compute_atr)
-core.compute_institutional_trend = st.cache_data(
-    ttl=120, max_entries=512, show_spinner=False, hash_funcs={pd.Series: _hash_series}
-)(core.compute_institutional_trend)
-core.find_strong_sr_zones = st.cache_data(
-    ttl=120, max_entries=256, show_spinner=False, hash_funcs={pd.DataFrame: _hash_df}
-)(core.find_strong_sr_zones)
+# ==============================================================================
+# [CACHE PATCH] — IDEMPOTENT (PATCH CACHE-1, audit-2 point 1).
+# Streamlit réexécute ce script à chaque interaction mais le module `core`
+# persiste dans sys.modules : sans garde, chaque rerun empile une couche de
+# wrapper st.cache_data supplémentaire (hachage de DataFrame en cascade).
+# Paramètres (ttl / max_entries / hash_funcs) STRICTEMENT identiques à ceux
+# d'avant le garde -> zéro changement de comportement. Les originaux sont
+# conservés dans core._CACHE_ORIGINALS pour dé-patcher sans redémarrer.
+# ==============================================================================
+if not getattr(core, "_CACHE_PATCHED", False):
+    core._CACHE_ORIGINALS = {
+        "compute_atr": core.compute_atr,
+        "compute_institutional_trend": core.compute_institutional_trend,
+        "find_strong_sr_zones": core.find_strong_sr_zones,
+    }
+    core.compute_atr = st.cache_data(
+        ttl=120, max_entries=512, show_spinner=False, hash_funcs={pd.DataFrame: _hash_df}
+    )(core.compute_atr)
+    core.compute_institutional_trend = st.cache_data(
+        ttl=120, max_entries=512, show_spinner=False, hash_funcs={pd.Series: _hash_series}
+    )(core.compute_institutional_trend)
+    core.find_strong_sr_zones = st.cache_data(
+        ttl=120, max_entries=256, show_spinner=False, hash_funcs={pd.DataFrame: _hash_df}
+    )(core.find_strong_sr_zones)
+    core._CACHE_PATCHED = True
 
 st.title("📡 Scanner Bluestar Supports et Resistances")
 st.caption(
@@ -132,17 +157,11 @@ with st.sidebar:
                 "```toml\n"
                 'OANDA_ACCESS_TOKEN = "..."\n'
                 'OANDA_ACCOUNT_ID = "101-004-..."\n'
-                'OANDA_ENV = "practice"\n'
+                'OANDA_ENV = "..."  (facultatif)\n'
                 "```\n"
                 "**Local** — `.streamlit/secrets.toml` (même contenu), ou variables "
                 "d'environnement de mêmes noms."
             )
-    st.caption(
-        f"Environnement : `{oanda_env_cfg}` (forcé)"
-        if oanda_env_cfg
-        else "Environnement : auto-détection (practice puis trade)"
-    )
-
     st.header("2. Sélection")
     select_all = st.checkbox(f"Tous les actifs ({len(ALL_SYMBOLS)})", value=True)
     symbols_to_scan = (
@@ -251,10 +270,6 @@ def _execute_scan(
             symbols_to_scan, access_token, account_id, min_touches, oanda_env=oanda_env
         )
     )
-    # PATCH ENV-2 : environnement RÉSOLU par le client, pas une variable d'env
-    # supposée. C'est ce qui rend `oanda_environment` non-null dans le JSON.
-    resolved_env = getattr(run_institutional_scan, "last_env", None) or oanda_env
-
     agg = _accumulate_scan_results(raw_results, progress_bar)
     conf_df = _compute_all_confluences(symbols_to_scan, agg, confluence_threshold)
     summaries = _build_summaries(symbols_to_scan, agg)
@@ -281,8 +296,8 @@ def _execute_scan(
         "missing_tfs_map": agg["missing_tfs_map"],
         "debug_map": agg["debug_map"],
         "bars_map": agg["bars_map"],
+        "spans_map": agg.get("spans_map"),
         "class_a_metrics": class_a_metrics,
-        "oanda_environment": resolved_env,
         "elapsed_s": round(time.perf_counter() - t0, 1),
     }
 
@@ -421,7 +436,7 @@ def _render_downloads(
             missing_tfs_map=res.get("missing_tfs_map"),
             anomalies=res.get("anomalies"),
             bars_map=res.get("bars_map"),
-            oanda_environment=res.get("oanda_environment"),
+            spans_map=res.get("spans_map"),
             calibration_profile_version=core.CALIBRATION_PROFILE_VERSION,
         )
         st.download_button(
@@ -437,10 +452,9 @@ def _render_downloads(
 
 if "scan_results" in st.session_state:
     res = st.session_state["scan_results"]
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     c1.metric("Durée du scan", f"{res.get('elapsed_s', '?')} s")
     c2.metric("Confluences", len(res["conf_full"]) if not res["conf_full"].empty else 0)
-    c3.metric("Environnement", res.get("oanda_environment") or "inconnu")
     _render_messages(res, show_debug)
     _render_confluences(res, max_dist_filter)
     _render_tf_tables(res, max_dist_filter)
